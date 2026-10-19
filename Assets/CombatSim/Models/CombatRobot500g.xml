@@ -1,0 +1,79 @@
+<mujoco model="CombatRobot500g">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.0004" gravity="0 0 -9.81" integrator="implicitfast"/>
+  <default>
+    <geom condim="3" solref="0.003 1" solimp="0.95 0.99 0.001"/>
+    <joint damping="0.0001"/>
+  </default>
+  <worldbody>
+    <geom name="floor" type="plane" size="1 1 0.02" friction="1.4 0.02 0.001" rgba="0.18 0.22 0.27 1"/>
+    <geom name="north_wall" type="box" pos="0 1.01 0.5" size="1.02 0.01 0.5" rgba="0.4 0.67 0.82 0.18"/>
+    <geom name="south_wall" type="box" pos="0 -1.01 0.5" size="1.02 0.01 0.5" rgba="0.4 0.67 0.82 0.18"/>
+    <geom name="east_wall" type="box" pos="1.01 0 0.5" size="0.01 1 0.5" rgba="0.4 0.67 0.82 0.18"/>
+    <geom name="west_wall" type="box" pos="-1.01 0 0.5" size="0.01 1 0.5" rgba="0.4 0.67 0.82 0.18"/>
+    <geom name="roof" type="box" pos="0 0 1.01" size="1.02 1.02 0.01" rgba="0.4 0.67 0.82 0.12"/>
+    <body name="Player_Robot" pos="-0.68 0 0.065">
+      <freejoint name="robot_free"/>
+      <geom name="chassis" type="box" size="0.17 0.13 0.045" mass="0.350" friction="0.7 0.02 0.001" rgba="0 0.68 0.86 1"/>
+      <body name="front_left_wheel" pos="0.105 0.145 -0.02">
+        <joint name="front_left_axle" type="hinge" axis="0 1 0"/>
+        <geom type="cylinder" size="0.045 0.0175" euler="1.57079632679 0 0" mass="0.0075" friction="0.8 0.02 0.001" rgba="0.12 0.13 0.16 1"/>
+      </body>
+      <body name="rear_left_wheel" pos="-0.105 0.145 -0.02">
+        <joint name="rear_left_axle" type="hinge" axis="0 1 0"/>
+        <geom type="cylinder" size="0.045 0.0175" euler="1.57079632679 0 0" mass="0.0075" friction="0.8 0.02 0.001" rgba="0.12 0.13 0.16 1"/>
+      </body>
+      <body name="front_right_wheel" pos="0.105 -0.145 -0.02">
+        <joint name="front_right_axle" type="hinge" axis="0 1 0"/>
+        <geom type="cylinder" size="0.045 0.0175" euler="1.57079632679 0 0" mass="0.0075" friction="0.8 0.02 0.001" rgba="0.12 0.13 0.16 1"/>
+      </body>
+      <body name="rear_right_wheel" pos="-0.105 -0.145 -0.02">
+        <joint name="rear_right_axle" type="hinge" axis="0 1 0"/>
+        <geom type="cylinder" size="0.045 0.0175" euler="1.57079632679 0 0" mass="0.0075" friction="0.8 0.02 0.001" rgba="0.12 0.13 0.16 1"/>
+      </body>
+      <body name="vertical_drum" pos="0.225 0 0.005">
+        <joint name="weapon_axle" type="hinge" axis="0 1 0" damping="0.0000001"/>
+        <!-- 80 mm diameter, 180 mm long steel drum core: 100 g. -->
+        <geom name="drum_core" type="cylinder" size="0.040 0.090" euler="1.57079632679 0 0" mass="0.100" friction="0.8 0.02 0.001" rgba="0.72 0.36 0.12 1"/>
+        <!-- Opposed impact teeth bring weapon mass to 120 g and create a 104 mm OD. -->
+        <geom name="drum_tooth_a" type="box" pos="0.0415 0 0" size="0.0105 0.090 0.0105" mass="0.010" friction="0.8 0.02 0.001" rgba="1 0.69 0.16 1"/>
+        <geom name="drum_tooth_b" type="box" pos="-0.0415 0 0" size="0.0105 0.090 0.0105" mass="0.010" friction="0.8 0.02 0.001" rgba="1 0.69 0.16 1"/>
+      </body>
+    </body>
+    <!-- Stationary 500 g target. Its unpowered joints let it roll and recoil
+         when hit, while the player robot remains the only controlled robot. -->
+    <body name="Target_Robot" pos="0.68 0 0.065" quat="0 0 0 1">
+      <freejoint name="target_free"/>
+      <geom name="target_chassis" type="box" size="0.17 0.13 0.045" mass="0.350" friction="0.7 0.02 0.001" rgba="0.82 0.16 0.14 1"/>
+      <body name="target_front_left_wheel" pos="0.105 0.145 -0.02">
+        <joint name="target_front_left_axle" type="hinge" axis="0 1 0"/>
+        <geom type="cylinder" size="0.045 0.0175" euler="1.57079632679 0 0" mass="0.0075" friction="0.8 0.02 0.001" rgba="0.12 0.13 0.16 1"/>
+      </body>
+      <body name="target_rear_left_wheel" pos="-0.105 0.145 -0.02">
+        <joint name="target_rear_left_axle" type="hinge" axis="0 1 0"/>
+        <geom type="cylinder" size="0.045 0.0175" euler="1.57079632679 0 0" mass="0.0075" friction="0.8 0.02 0.001" rgba="0.12 0.13 0.16 1"/>
+      </body>
+      <body name="target_front_right_wheel" pos="0.105 -0.145 -0.02">
+        <joint name="target_front_right_axle" type="hinge" axis="0 1 0"/>
+        <geom type="cylinder" size="0.045 0.0175" euler="1.57079632679 0 0" mass="0.0075" friction="0.8 0.02 0.001" rgba="0.12 0.13 0.16 1"/>
+      </body>
+      <body name="target_rear_right_wheel" pos="-0.105 -0.145 -0.02">
+        <joint name="target_rear_right_axle" type="hinge" axis="0 1 0"/>
+        <geom type="cylinder" size="0.045 0.0175" euler="1.57079632679 0 0" mass="0.0075" friction="0.8 0.02 0.001" rgba="0.12 0.13 0.16 1"/>
+      </body>
+      <body name="target_vertical_drum" pos="0.225 0 0.005">
+        <joint name="target_weapon_axle" type="hinge" axis="0 1 0" damping="0.00002"/>
+        <geom name="target_drum_core" type="cylinder" size="0.040 0.090" euler="1.57079632679 0 0" mass="0.100" friction="0.8 0.02 0.001" rgba="0.72 0.36 0.12 1"/>
+        <geom name="target_drum_tooth_a" type="box" pos="0.0415 0 0" size="0.0105 0.090 0.0105" mass="0.010" friction="0.8 0.02 0.001" rgba="1 0.69 0.16 1"/>
+        <geom name="target_drum_tooth_b" type="box" pos="-0.0415 0 0" size="0.0105 0.090 0.0105" mass="0.010" friction="0.8 0.02 0.001" rgba="1 0.69 0.16 1"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <velocity name="front_left_drive" joint="front_left_axle" kv="0.004" forcerange="-0.08 0.08"/>
+    <velocity name="rear_left_drive" joint="rear_left_axle" kv="0.004" forcerange="-0.08 0.08"/>
+    <velocity name="front_right_drive" joint="front_right_axle" kv="0.004" forcerange="-0.08 0.08"/>
+    <velocity name="rear_right_drive" joint="rear_right_axle" kv="0.004" forcerange="-0.08 0.08"/>
+    <velocity name="weapon_drive" joint="weapon_axle" kv="0.001" forcerange="-0.25 0.25"/>
+  </actuator>
+</mujoco>

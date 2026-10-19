@@ -6,6 +6,6 @@ EditorBuildSettings:
   serializedVersion: 2
   m_Scenes:
   - enabled: 1
-    path: Assets/Scenes/CombatArena.unity
-    guid: 6ae3c29c63b2fcf48be42043a29a9919
+    path: Assets/Scenes/CombatArenaMuJoCo.unity
+    guid: a2ea432e236dce142a04ecb4d1c64280
   m_configObjects: {}

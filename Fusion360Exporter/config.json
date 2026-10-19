@@ -1,0 +1,12 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "script",
+  "author": "CombatSim",
+  "description": {
+    "": "Export a Fusion 360 robot assembly as separate STL parts with a CombatSim material and mass manifest."
+  },
+  "version": "1.0.0",
+  "runOnStartup": false,
+  "supportedOS": "windows",
+  "editEnabled": true
+}

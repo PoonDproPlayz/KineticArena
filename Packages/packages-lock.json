@@ -1,6 +1,24 @@
 {
   "dependencies": {
+    "org.mujoco": {
+      "version": "file:org.mujoco",
+      "depth": 0,
+      "source": "embedded",
+      "dependencies": {}
+    },
+    "com.unity.modules.imageconversion": {
+      "version": "1.0.0",
+      "depth": 0,
+      "source": "builtin",
+      "dependencies": {}
+    },
     "com.unity.modules.physics": {
+      "version": "1.0.0",
+      "depth": 0,
+      "source": "builtin",
+      "dependencies": {}
+    },
+    "com.unity.modules.terrain": {
       "version": "1.0.0",
       "depth": 0,
       "source": "builtin",

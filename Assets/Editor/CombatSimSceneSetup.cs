@@ -13,7 +13,7 @@ namespace CombatSim.Editor
         private const string ScenePath = SceneFolder + "/CombatArena.unity";
         private const string MaterialFolder = "Assets/CombatSim/Materials";
 
-        [MenuItem("Tools/CombatSim/Create Starter Scene")]
+        [MenuItem("Tools/CombatSim/Create Legacy PhysX Reference Scene")]
         public static void CreateStarterScene()
         {
             if (!Application.isBatchMode
