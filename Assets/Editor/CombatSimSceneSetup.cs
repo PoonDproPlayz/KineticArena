@@ -76,6 +76,7 @@ namespace CombatSim.Editor
                 new Color32(255, 176, 40, 255),
                 0.16f,
                 0.08f);
+            PhysicsMaterial driveContactMaterial = GetOrCreateDriveContactMaterial();
 
             Scene scene = EditorSceneManager.NewScene(
                 NewSceneSetup.EmptyScene,
@@ -88,7 +89,7 @@ namespace CombatSim.Editor
             arena.markingMaterial = markingMaterial;
             arena.RebuildArena();
 
-            CreateRobot(robotMaterial, wheelMaterial, accentMaterial);
+            CreateRobot(robotMaterial, wheelMaterial, accentMaterial, driveContactMaterial);
             CreateLighting();
             CreateCamera();
 
@@ -151,10 +152,31 @@ namespace CombatSim.Editor
             return material;
         }
 
+        private static PhysicsMaterial GetOrCreateDriveContactMaterial()
+        {
+            const string assetPath = MaterialFolder + "/RobotDriveContact.physicMaterial";
+            PhysicsMaterial driveMaterial =
+                AssetDatabase.LoadAssetAtPath<PhysicsMaterial>(assetPath);
+            if (driveMaterial == null)
+            {
+                driveMaterial = new PhysicsMaterial("Robot Drive Contact");
+                AssetDatabase.CreateAsset(driveMaterial, assetPath);
+            }
+
+            driveMaterial.name = "Robot Drive Contact";
+            driveMaterial.staticFriction = 0f;
+            driveMaterial.dynamicFriction = 0f;
+            driveMaterial.frictionCombine = PhysicsMaterialCombine.Minimum;
+            driveMaterial.bounciness = 0f;
+            EditorUtility.SetDirty(driveMaterial);
+            return driveMaterial;
+        }
+
         private static void CreateRobot(
             Material chassisMaterial,
             Material wheelMaterial,
-            Material accentMaterial)
+            Material accentMaterial,
+            PhysicsMaterial driveContactMaterial)
         {
             GameObject robot = new GameObject("Player Robot");
             robot.transform.position = new Vector3(0f, 0.065f, 0f);
@@ -164,6 +186,7 @@ namespace CombatSim.Editor
             chassis.transform.SetParent(robot.transform, false);
             chassis.transform.localScale = new Vector3(0.36f, 0.09f, 0.30f);
             chassis.GetComponent<Renderer>().sharedMaterial = chassisMaterial;
+            chassis.GetComponent<Collider>().sharedMaterial = driveContactMaterial;
 
             GameObject frontMarker = GameObject.CreatePrimitive(PrimitiveType.Cube);
             frontMarker.name = "Front Marker";

@@ -46,8 +46,8 @@ namespace CombatSim
             throttle = Mathf.Clamp(throttle, -1f, 1f);
             steering = Mathf.Clamp(steering, -1f, 1f);
 
-            float leftInput = Mathf.Clamp(throttle + steering, -1f, 1f);
-            float rightInput = Mathf.Clamp(throttle - steering, -1f, 1f);
+            float leftInput = Mathf.Clamp(throttle - steering, -1f, 1f);
+            float rightInput = Mathf.Clamp(throttle + steering, -1f, 1f);
 
             ApplyTrackForce(-1f, leftInput);
             ApplyTrackForce(1f, rightInput);
@@ -98,7 +98,11 @@ namespace CombatSim
             }
 
             Vector3 sideDirection = Vector3.ProjectOnPlane(transform.right, groundHit.normal).normalized;
-            Vector3 pointVelocity = body.GetPointVelocity(groundHit.point);
+            Vector3 forcePoint = new Vector3(
+                groundHit.point.x,
+                body.worldCenterOfMass.y,
+                groundHit.point.z);
+            Vector3 pointVelocity = body.GetPointVelocity(forcePoint);
             float forwardSpeed = Vector3.Dot(pointVelocity, forward);
             float wheelRadiusMetres = Units.MillimetresToMetres(wheelRadiusMm);
             float targetAngularSpeed = input * driveWheelSpeedRpm * (2f * Mathf.PI / 60f);
@@ -119,7 +123,7 @@ namespace CombatSim
                 tractionLimit);
 
             Vector3 force = forward * driveForce + sideDirection * lateralForce;
-            body.AddForceAtPosition(force, groundHit.point);
+            body.AddForceAtPosition(force, forcePoint);
         }
     }
 }

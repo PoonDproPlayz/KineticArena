@@ -30,15 +30,15 @@ robot in the arena. Double-click the Game tab to maximize it if the preview is
 too small.
 
 - **W / S**: drive both sides forward / backward at the selected wheel RPM
-- **A / D**: reduce the left / right side RPM to turn; with no throttle they
-  drive in opposite directions and turn in place
+- **A / D**: turn left / right; with no throttle the tracks drive in opposite
+  directions and turn in place
 
 The drive wheels default to **424.4 RPM** with a **45 mm** radius, or about
 **2 m/s**. Steering uses differential drive: the inside side slows down instead
-of steering the robot like a car. The drive model applies forces at the left
-and right ground contact points, with force limited by the robot's weight and
-configured traction. It is a simple starting model, not a validated engineering
-simulator.
+of steering the robot like a car. The robot chassis uses a low-friction contact
+material so PhysX does not pin the robot in place or fight the drivetrain
+model; the drive controller applies its own traction-limited force at the
+tracks. It is a simple starting model, not a validated engineering simulator.
 
 ## Units and arena size
 
