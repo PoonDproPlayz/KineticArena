@@ -22,3 +22,5 @@ _unity_verify/
 .DS_Store
 Thumbs.db
 Desktop.ini
+/Standalone/build/
+/Standalone/.deps/
