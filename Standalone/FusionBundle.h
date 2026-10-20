@@ -5,6 +5,7 @@
 #include <array>
 #include <filesystem>
 #include <mutex>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,8 @@ class FusionBundle {
   void Draw(SDL_Window* window, bool& load_requested, bool& apply_requested);
   void DrawAxisSelectionControls();
   void SelectPart(int part_index);
+  void UpdateHover(int part_index, const std::array<double, 3>& hit);
+  bool SelectHoveredHole();
   void ClearSelection() { selected_part_ = -1; }
   bool PreviewVisible(int part_index) const;
   bool AxisPicking() const { return axis_picking_; }
@@ -62,6 +65,7 @@ class FusionBundle {
   const CadAssembly& Assembly(int index) const { return assemblies_.at(index); }
   void PickEdge(int part_index, const std::array<double, 3>& cad_point);
   int SelectedPart() const { return selected_part_; }
+  int HoveredPart() const { return hovered_part_; }
   std::array<double, 3> PreviewCenter() const;
   double PreviewDistance() const;
   void BindControls(const mjModel* model, std::vector<int>& left,
@@ -83,6 +87,9 @@ class FusionBundle {
   std::vector<CadAssembly> assemblies_;
   char path_buffer_[1024]{};
   int selected_part_ = -1;
+  int hovered_part_ = -1;
+  std::vector<std::array<double, 3>> hovered_loop_;
+  std::map<int, std::vector<std::vector<std::array<double, 3>>>> hole_cache_;
   bool axis_picking_ = false;
   int axis_assembly_ = 1;
   std::vector<std::array<double, 3>> axis_points_;

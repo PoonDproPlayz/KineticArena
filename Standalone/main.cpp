@@ -349,7 +349,7 @@ int main(int argc, char** argv) {
     ImGui::SameLine();
     ImGui::BeginChild("3D CAD preview", ImVec2(0, 0), ImGuiChildFlags_Borders);
     bundle.DrawAxisSelectionControls();
-    ImGui::TextWrapped("Click a part to select. In axis mode, click rim edges around a hole. Left drag: orbit and tilt. Right drag: pan. Scroll: zoom.");
+    ImGui::TextWrapped("Hover to highlight a part. In axis mode, hover a hole rim to highlight its complete loop, then click once. Left drag: orbit/tilt. Right drag: pan. Scroll: zoom.");
     if (setup_model) {
       if (ImGui::SmallButton("Reset view")) {
         const auto center = bundle.PreviewCenter();
@@ -382,15 +382,31 @@ int main(int argc, char** argv) {
         setup_model->geom_group[i] = bundle.PreviewVisible(i) ? 0 : 5;
       options.geomgroup[5] = 0;
       mjv_updateScene(setup_model, setup_data, &options, nullptr, &setup_camera, mjCAT_ALL, &setup_scene);
+      const ImVec2 canvas_min = ImGui::GetCursorScreenPos();
+      const ImVec2 mouse = ImGui::GetIO().MousePos;
+      const bool mouse_on_canvas = ImGui::IsWindowHovered() &&
+        mouse.x >= canvas_min.x && mouse.y >= canvas_min.y &&
+        mouse.x < canvas_min.x + preview_width && mouse.y < canvas_min.y + preview_height;
+      if (mouse_on_canvas && !ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
+          !ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+        mjtNum hit[3]; int geom_id = -1, flex_id = -1, skin_id = -1;
+        mjv_select(setup_model, setup_data, &options, double(preview_width)/preview_height,
+          (mouse.x-canvas_min.x)/preview_width, 1.0-(mouse.y-canvas_min.y)/preview_height,
+          &setup_scene, hit, &geom_id, &flex_id, &skin_id);
+        const char* picked = geom_id >= 0 ? mj_id2name(setup_model, mjOBJ_GEOM, geom_id) : nullptr;
+        const int part = picked && std::string(picked).rfind("cad_part_", 0) == 0 ?
+          std::stoi(std::string(picked).substr(9)) : -1;
+        bundle.UpdateHover(part, {hit[0], hit[1], hit[2]});
+      } else bundle.UpdateHover(-1, {});
       const int selected = bundle.SelectedPart();
-      if (selected >= 0) {
-        const std::string name = "cad_part_" + std::to_string(selected);
+      for (int highlight : {bundle.HoveredPart(), selected}) if (highlight >= 0) {
+        const std::string name = "cad_part_" + std::to_string(highlight);
         const int geom_id = mj_name2id(setup_model, mjOBJ_GEOM, name.c_str());
         for (int i = 0; i < setup_scene.ngeom; ++i)
           if (setup_scene.geoms[i].objtype == mjOBJ_GEOM && setup_scene.geoms[i].objid == geom_id) {
-            setup_scene.geoms[i].rgba[0] = 1.0f;
-            setup_scene.geoms[i].rgba[1] = 0.8f;
-            setup_scene.geoms[i].rgba[2] = 0.1f;
+            setup_scene.geoms[i].rgba[0] = highlight == selected ? 1.0f : 0.2f;
+            setup_scene.geoms[i].rgba[1] = highlight == selected ? 0.8f : 0.9f;
+            setup_scene.geoms[i].rgba[2] = highlight == selected ? 0.1f : 1.0f;
           }
       }
       bundle.AddSetupAxisMarkers(setup_scene);
@@ -428,18 +444,8 @@ int main(int argc, char** argv) {
         }
         if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
             ImGui::GetIO().MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] <= 16.0f) {
-          const ImVec2 mouse = ImGui::GetIO().MousePos;
-          // MuJoCo 3.3.7's mjv_select writes all three IDs, including on misses.
-          mjtNum hit[3]; int geom_id = -1, flex_id = -1, skin_id = -1;
-          mjv_select(setup_model, setup_data, &options, double(preview_width)/preview_height,
-            (mouse.x-image_min.x)/preview_width, 1.0-(mouse.y-image_min.y)/preview_height,
-            &setup_scene, hit, &geom_id, &flex_id, &skin_id);
-          const char* picked = geom_id >= 0 ? mj_id2name(setup_model, mjOBJ_GEOM, geom_id) : nullptr;
-          if (picked && std::string(picked).rfind("cad_part_", 0) == 0) {
-            const int part = std::stoi(std::string(picked).substr(9));
-            if (bundle.AxisPicking()) bundle.AddAxisPoint(part, {hit[0], hit[1], hit[2]});
-            else bundle.SelectPart(part);
-          }
+          if (bundle.AxisPicking()) bundle.SelectHoveredHole();
+          else if (bundle.HoveredPart() >= 0) bundle.SelectPart(bundle.HoveredPart());
         }
       }
     } else ImGui::TextWrapped("Load a Fusion manifest to preview and select its parts.");

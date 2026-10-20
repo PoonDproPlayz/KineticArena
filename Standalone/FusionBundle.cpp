@@ -195,6 +195,88 @@ bool SnapToFeatureEdge(const CadPart& part, Vec3 hit, Vec3& midpoint) {
   return true;
 }
 
+// Recover closed STL feature loops once per hovered part. Boundary loops are
+// useful for open bores; sharp dihedral loops cover watertight cylindrical bores.
+std::vector<std::vector<Vec3>> ReadFeatureLoops(const CadPart& part) {
+  using Key = std::array<long long, 3>;
+  using EdgeKey = std::pair<Key, Key>;
+  struct Edge { int faces = 0; Vec3 normal{}; double min_dot = 1; };
+  std::map<EdgeKey, Edge> edges;
+  std::map<Key, Vec3> positions;
+  std::ifstream file(part.absolute_file, std::ios::binary);
+  if (!file) return {};
+  file.seekg(80);
+  uint32_t count = 0; file.read(reinterpret_cast<char*>(&count), 4);
+  for (uint32_t t = 0; t < count && file; ++t) {
+    char triangle[50]; file.read(triangle, sizeof(triangle));
+    if (!file) break;
+    Vec3 v[3]; Key keys[3];
+    for (int i = 0; i < 3; ++i) {
+      float xyz[3]; std::memcpy(xyz, triangle + 12 + i*12, 12);
+      for (int k = 0; k < 3; ++k) keys[i][k] = std::llround(double(xyz[k])*10000.0);
+      v[i] = Add(part.position, Rotate(part.rotation,
+        Mul(Vec3{xyz[0], xyz[1], xyz[2]}, part.scale)));
+      positions[keys[i]] = v[i];
+    }
+    Vec3 normal = Cross(Sub(v[1], v[0]), Sub(v[2], v[0]));
+    const double size = Length(normal);
+    if (size < 1e-12) continue;
+    normal = Mul(normal, 1.0/size);
+    for (int i = 0; i < 3; ++i) {
+      const Key& a = keys[i]; const Key& b = keys[(i+1)%3];
+      if (a == b) continue;
+      Edge& edge = edges[{std::min(a,b), std::max(a,b)}];
+      if (edge.faces) edge.min_dot = std::min(edge.min_dot, Dot(edge.normal, normal));
+      else edge.normal = normal;
+      ++edge.faces;
+    }
+  }
+  std::vector<std::vector<Vec3>> loops;
+  for (int mode = 0; mode < 2; ++mode) {
+    std::map<Key, std::vector<Key>> graph;
+    for (const auto& [key, edge] : edges)
+      if ((mode == 0 && edge.faces == 1) ||
+          (mode == 1 && edge.faces == 2 && edge.min_dot < 0.9063)) {
+        graph[key.first].push_back(key.second);
+        graph[key.second].push_back(key.first);
+      }
+    std::set<Key> seen;
+    for (const auto& [start, adjacent] : graph) {
+      if (seen.count(start) || adjacent.size() != 2) continue;
+      std::vector<Key> chain;
+      Key current = start, previous{};
+      bool closed = false;
+      for (size_t step = 0; step <= graph.size(); ++step) {
+        if (seen.count(current)) { closed = current == start; break; }
+        auto found = graph.find(current);
+        if (found == graph.end() || found->second.size() != 2) break;
+        seen.insert(current); chain.push_back(current);
+        const auto& neighbors = found->second;
+        Key next = chain.size() == 1 || neighbors[0] != previous ? neighbors[0] : neighbors[1];
+        previous = current; current = next;
+      }
+      if (closed && chain.size() >= 6) {
+        std::vector<Vec3> loop;
+        for (const Key& key : chain) loop.push_back(positions.at(key));
+        loops.push_back(std::move(loop));
+      }
+    }
+  }
+  return loops;
+}
+
+double DistanceToLoop(const std::vector<Vec3>& loop, Vec3 hit) {
+  double nearest = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < loop.size(); ++i) {
+    const Vec3 a = loop[i], delta = Sub(loop[(i+1)%loop.size()], a);
+    const double length2 = Dot(delta, delta);
+    if (length2 < 1e-16) continue;
+    nearest = std::min(nearest, Length(Sub(hit, Add(a, Mul(delta,
+      std::clamp(Dot(Sub(hit, a), delta)/length2, 0.0, 1.0))))));
+  }
+  return nearest;
+}
+
 struct MassProperties { double mass = 0; Vec3 center{}; Vec3 inertia{}; };
 MassProperties GroupMass(const std::vector<CadPart>& parts, int assembly, Vec3 origin) {
   MassProperties result;
@@ -335,7 +417,8 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
     const auto path = manifest_.string();
     std::snprintf(path_buffer_, sizeof(path_buffer_), "%s", path.c_str());
     error_.clear();
-    selected_part_ = -1; pick_message_.clear(); axis_points_.clear(); axis_picking_ = false;
+    selected_part_ = -1; hovered_part_ = -1; hovered_loop_.clear(); hole_cache_.clear();
+    pick_message_.clear(); axis_points_.clear(); axis_picking_ = false;
     axis_assembly_ = assemblies_.size() > 1 ? 1 : 0;
     return true;
   } catch (const std::exception& e) { error_ = e.what(); return false; }
@@ -562,6 +645,32 @@ void FusionBundle::SelectPart(int part_index) {
   pick_message_ = "Selected " + parts_[part_index].name + ". Choose its rigid assembly below.";
 }
 
+void FusionBundle::UpdateHover(int part_index, const std::array<double, 3>& hit) {
+  hovered_part_ = PreviewVisible(part_index) ? part_index : -1;
+  hovered_loop_.clear();
+  if (!axis_picking_ || hovered_part_ < 0 ||
+      parts_[hovered_part_].assembly != axis_assembly_) return;
+  auto [found, inserted] = hole_cache_.try_emplace(hovered_part_);
+  if (inserted) found->second = ReadFeatureLoops(parts_[hovered_part_]);
+  const double limit = std::max(0.002, 0.035*Length(Sub(
+    parts_[hovered_part_].max_bound, parts_[hovered_part_].min_bound)));
+  double nearest = limit;
+  for (const auto& loop : found->second) {
+    const double distance = DistanceToLoop(loop, hit);
+    if (distance < nearest) { nearest = distance; hovered_loop_ = loop; }
+  }
+}
+
+bool FusionBundle::SelectHoveredHole() {
+  if (!axis_picking_ || hovered_loop_.size() < 6) {
+    pick_message_ = "Move over a highlighted closed hole rim, then click it.";
+    return false;
+  }
+  selected_part_ = hovered_part_;
+  axis_points_ = hovered_loop_;
+  return FinishAxis();
+}
+
 bool FusionBundle::PreviewVisible(int part_index) const {
   return part_index >= 0 && part_index < int(parts_.size()) && parts_[part_index].preview_visible;
 }
@@ -574,7 +683,7 @@ void FusionBundle::StartAxis(int assembly) {
   }
   axis_assembly_ = assembly;
   axis_points_.clear(); axis_picking_ = true;
-  pick_message_ = "Click at least three points around one hole in the preview.";
+  pick_message_ = "Hover a hole rim until its complete loop lights up, then click once.";
 }
 
 bool FusionBundle::AddAxisPoint(int part_index, const std::array<double, 3>& cad_point,
@@ -743,6 +852,17 @@ void FusionBundle::AddAxisMarkers(const mjModel* model, const mjData* data, mjvS
 }
 
 void FusionBundle::AddSetupAxisMarkers(mjvScene& scene) const {
+  if (axis_picking_ && hovered_loop_.size() >= 3) {
+    const float hover_color[4] = {0.2f, 1.0f, 0.85f, 1.0f};
+    for (size_t i = 0; i < hovered_loop_.size() && scene.ngeom < scene.maxgeom; ++i) {
+      const auto& first = hovered_loop_[i];
+      const auto& second = hovered_loop_[(i+1)%hovered_loop_.size()];
+      mjtNum a[3] = {first[0], first[1], first[2]};
+      mjtNum b[3] = {second[0], second[1], second[2]};
+      mjv_initGeom(&scene.geoms[scene.ngeom], mjGEOM_LINE, nullptr, nullptr, nullptr, hover_color);
+      mjv_connector(&scene.geoms[scene.ngeom++], mjGEOM_LINE, 3, a, b);
+    }
+  }
   const float picked_color[4] = {0.25f, 1.0f, 0.3f, 1.0f};
   const mjtNum point_size[3] = {0.005, 0.005, 0.005};
   for (const auto& point : axis_points_) {
@@ -1005,6 +1125,6 @@ void FusionBundle::DrawAxisSelectionControls() {
     ImGui::SameLine();
     if (ImGui::Button("Cancel axis")) CancelAxis();
   }
-  ImGui::TextWrapped("Click around the hole rim in order. The fit uses those points to find its center and plane normal.");
+  ImGui::TextWrapped("Hover a closed hole rim to highlight its full edge loop, then click once to fit the axis.");
   if (!pick_message_.empty()) ImGui::TextWrapped("%s", pick_message_.c_str());
 }

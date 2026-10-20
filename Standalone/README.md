@@ -64,11 +64,11 @@ shoulder or south button. The GUI provides pause, reset and drive settings.
    without changing the physical assembly. **Deselect part** clears the
    selection. To place an axis through a polygonal hole, use **Axis target
    (weapon / wheel)** above the 3D preview to choose the exact weapon or wheel,
-   press **Select hole for chosen axis**, click at least three edges around the rim
-   in order, then press **Fit axis through hole**. Each click snaps to a nearby
-   STL crease or boundary edge. The tool fits a circle in the selected plane,
+   press **Select hole for chosen axis**, hover a closed rim until its complete
+   edge loop highlights, then click once. The tool follows connected STL
+   boundary or sharp crease edges and fits a circle in the selected plane,
    putting the rotation center at the circle center and
-   the axis normal to that plane. **Undo point** and **Cancel axis** are available.
+   the axis normal to that plane. **Cancel axis** is available.
    The center and direction can also be edited as XYZ values.
    Left drag in the preview orbits and tilts; right drag pans; scroll zooms.
    The preview remains in place while dragging. Yellow lines show weapon axes;
