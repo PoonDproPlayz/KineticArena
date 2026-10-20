@@ -7,10 +7,10 @@
   </default>
   <worldbody>
     <geom name="floor" type="plane" size="1 1 0.02" friction="1.4 0.02 0.001" rgba="0.18 0.22 0.27 1"/>
-    <geom name="north_wall" type="box" pos="0 1.01 0.5" size="1.02 0.01 0.5" rgba="0.4 0.67 0.82 0.18"/>
-    <geom name="south_wall" type="box" pos="0 -1.01 0.5" size="1.02 0.01 0.5" rgba="0.4 0.67 0.82 0.18"/>
-    <geom name="east_wall" type="box" pos="1.01 0 0.5" size="0.01 1 0.5" rgba="0.4 0.67 0.82 0.18"/>
-    <geom name="west_wall" type="box" pos="-1.01 0 0.5" size="0.01 1 0.5" rgba="0.4 0.67 0.82 0.18"/>
+    <geom name="north_wall" type="box" pos="0 1.05 0.5" size="1.02 0.05 0.5" margin="0.01" solref="0.001 1" solimp="0.99 0.999 0.001" rgba="0.4 0.67 0.82 0.18"/>
+    <geom name="south_wall" type="box" pos="0 -1.05 0.5" size="1.02 0.05 0.5" margin="0.01" solref="0.001 1" solimp="0.99 0.999 0.001" rgba="0.4 0.67 0.82 0.18"/>
+    <geom name="east_wall" type="box" pos="1.05 0 0.5" size="0.05 1 0.5" margin="0.01" solref="0.001 1" solimp="0.99 0.999 0.001" rgba="0.4 0.67 0.82 0.18"/>
+    <geom name="west_wall" type="box" pos="-1.05 0 0.5" size="0.05 1 0.5" margin="0.01" solref="0.001 1" solimp="0.99 0.999 0.001" rgba="0.4 0.67 0.82 0.18"/>
     <geom name="roof" type="box" pos="0 0 1.01" size="1.02 1.02 0.01" rgba="0.4 0.67 0.82 0.12"/>
     <body name="Player_Robot" pos="-0.68 0 0.065">
       <freejoint name="robot_free"/>

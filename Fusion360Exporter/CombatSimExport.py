@@ -6,6 +6,7 @@ The output directory contains Parts/*.stl and a manifest.json sidecar.
 """
 
 import json
+import math
 import os
 import re
 import struct
@@ -92,6 +93,8 @@ def _body_metadata(body):
     mass = 0.0
     volume = 0.0
     center = None
+    inertia_tensor = None
+    properties = None
     try:
         material = body.material or body.parentComponent.material
         if material:
@@ -107,7 +110,32 @@ def _body_metadata(body):
         center = [point.x * 0.01, point.y * 0.01, point.z * 0.01]
     except Exception:
         pass
-    return material_name, density, mass, volume, center
+    if properties:
+        try:
+            moments_ok, i1, i2, i3 = properties.getPrincipalMomentsOfInertia()
+            axes_ok, x_axis, y_axis, z_axis = properties.getPrincipalAxes()
+            moments = (float(i1), float(i2), float(i3))
+            axes = (
+                (float(x_axis.x), float(x_axis.y), float(x_axis.z)),
+                (float(y_axis.x), float(y_axis.y), float(y_axis.z)),
+                (float(z_axis.x), float(z_axis.y), float(z_axis.z)),
+            )
+            if moments_ok and axes_ok and all(value >= 0.0 for value in moments):
+                # Principal moments are about the body's center of mass.
+                # Build the centroidal tensor in native body coordinates;
+                # Fusion reports kg*cm^2, while the bundle uses kg*m^2.
+                matrix = [[sum(moments[k] * axes[k][row] * axes[k][col]
+                               for k in range(3)) * 0.0001
+                           for col in range(3)] for row in range(3)]
+                inertia_tensor = [matrix[0][0], matrix[1][1], matrix[2][2],
+                                  matrix[0][1], matrix[0][2], matrix[1][2]]
+                if not all(math.isfinite(value) for value in inertia_tensor):
+                    inertia_tensor = None
+        except Exception:
+            # Older/unsupported Fusion builds still export mass and COM;
+            # the importer can use its bounding-box inertia estimate.
+            pass
+    return material_name, density, mass, volume, center, inertia_tensor
 
 
 def _appearance_metadata(body, occurrence=None):
@@ -275,7 +303,7 @@ def _append_part(parts, export_manager, body, body_name, occurrence_path,
     filepath = os.path.join(folder, filename.replace("/", os.sep))
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     _export_body(export_manager, body, filepath, units, unit_to_meters)
-    material_name, density, mass, volume, center = _body_metadata(body)
+    material_name, density, mass, volume, center, inertia_tensor = _body_metadata(body)
     appearance = _appearance_metadata(body, occurrence)
     material_properties = _material_properties(body)
     transform_fields = _transform_data(transform)
@@ -289,6 +317,7 @@ def _append_part(parts, export_manager, body, body_name, occurrence_path,
         "massKg": mass,
         "volumeM3": volume,
         "centerOfMassLocalMeters": center,
+        "inertiaTensorLocalKgM2": inertia_tensor,
         "appearanceName": appearance["appearanceName"],
         "colorRgba": appearance["colorRgba"],
         "roughness": appearance["roughness"],
