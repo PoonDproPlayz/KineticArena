@@ -21,8 +21,15 @@ struct MotorSpec {
   double phase_resistance_ohm = 0.0;  // Optional terminal-to-terminal resistance.
   double esc_current_limit_a = 0.0;  // Optional per-motor phase-current limit.
   double gear_ratio = 1.0;             // Motor revolutions per output revolution.
+  std::string gear_ratio_text = "1:1"; // User-facing input:output form.
   double gearbox_efficiency = 1.0;    // Fraction, e.g. 0.9 for 90%.
 };
+
+double MotorNoLoadOutputRpm(const MotorSpec& motor, double battery_voltage);
+double MotorOutputTorque(const MotorSpec& motor, double battery_voltage,
+                         double desired_output_speed, double actual_output_speed);
+double EstimateMotorSpinupSeconds(const MotorSpec& motor, double battery_voltage,
+                                  double axis_inertia, double target_fraction = 0.9);
 
 struct CadPart {
   std::string name;
@@ -51,6 +58,7 @@ struct CadPart {
   bool has_fusion_inertia_tensor = false;
   int assembly = 0;  // -1 excludes this body.
   bool preview_visible = true;
+  bool collision_enabled = true;
 };
 
 struct CadAssembly {
@@ -89,6 +97,7 @@ class FusionBundle {
   int AssemblyCount() const { return int(assemblies_.size()); }
   int ForkCount() const;
   int PartCount() const { return int(parts_.size()); }
+  double EstimatedWeaponSpinupSeconds() const;
   const CadAssembly& Assembly(int index) const { return assemblies_.at(index); }
   void PickEdge(int part_index, const std::array<double, 3>& cad_point);
   int SelectedPart() const { return selected_part_; }
@@ -102,6 +111,8 @@ class FusionBundle {
   void BindControls(const mjModel* model, std::vector<std::pair<int, double>>& left,
                     std::vector<std::pair<int, double>>& right,
                     std::vector<int>& weapon, std::map<int, MotorSpec>& motor_models,
+                    std::map<int, MotorSpec>& weapon_motor_models,
+                    std::map<int, int>& manual_velocity_actuators,
                     double& battery_voltage) const;
   void PickFace(int part_index, const std::array<double, 3>& cad_point);
   void AddAxisMarkers(const mjModel* model, const mjData* data, mjvScene& scene) const;

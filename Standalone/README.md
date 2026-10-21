@@ -19,8 +19,8 @@ request Windows administrator approval for the C++ tools. It is safe to rerun
 after an interrupted install. To build without launching, add `-NoRun`.
 
 After setup, double-click `Run CombatSim.bat` in the project root whenever you
-want to start the app. It launches the existing build without installing or
-downloading anything.
+want to start the app. It builds changed source before launch, so it does not
+keep opening an older executable. It does not install or download anything.
 
 ### Manual build
 
@@ -38,13 +38,32 @@ CMake fetches SDL3 and Dear ImGui at configure time. `MUJOCO_ROOT` must contain
 `include/mujoco/mujoco.h`, `lib/mujoco.lib` and `bin/mujoco.dll`.
 
 The 0.4 ms model timestep is independent of display frame rate. The app opens
-to a Home screen with **Practice drive** and **Configure bot** entry points; a
-persistent top navigation bar switches between Home, Drive, and Bot workshop.
+to a Home screen with **Practice drive**, **Configure bot**, and **Controller
+mixing** buttons; a persistent top navigation bar switches between Home,
+Drive, and Bot workshop. Drive also has a **Controller mixer** button.
 W/S drive, A/D turn, and Space spins the weapon; a gamepad uses the left stick
-and left shoulder or south button. The Drive screen provides pause, reset, an
-editable wheel target from 0 to 5,000 RPM, weapon target and spin-up settings,
-and live telemetry showing actual weapon RPM plus each wheel's actual RPM and
-left/right side averages.
+and left shoulder or south button. Controller mixing opens a setup window for
+raw USB joysticks, up to 16 configurable axis/button input channels, and a
+mix for each drive motor group and weapon. Each input mix line has editable
+weight, offset, and expo; the response graph follows the selected live channel
+with a moving dot while the other inputs stay at their current values. Its
+default RC tank/elevon mix is left = Ch1 - Ch2, right = Ch1 + Ch2, weapon =
+Ch3; axis reverse and deadzone are adjustable, and live channel meters help
+identify which stick or button is which. Mixer settings save on each change
+and app exit in the app's user preferences, independently of and retained
+across loaded robots. The Drive screen provides
+pause, reset, a
+motor-derived wheel speed estimate, an optional manual wheel target from 0 to
+5,000 RPM, and live telemetry showing actual weapon RPM plus each wheel's RPM
+and left/right side averages. Weapon motor configuration is in Bot workshop;
+when enabled, its RPM comes from the motor model and assembly inertia. Each
+driven wheel also reports **GRIP**, **SLIPPING**,
+or **AIRBORNE**, with measured tread speed relative to the floor at its contact
+patch. Drag the Drive sidebar's right edge to reveal more of its fixed-size
+content. The Bot workshop divider does the same for the setup panel beside the
+robot preview. Text wrapping and control widths stay fixed as either panel is
+resized; narrow panels clip content until widened. The layout updates when the
+resize handle is released.
 
 The arena stays at 2,500 Hz. Its transparent side walls now use a 10 cm thick
 collision volume, a 1 cm early contact margin, and a stiffer contact response;
@@ -52,6 +71,17 @@ the inner wall faces remain at the same 2 m arena boundary. This reduces high
 speed penetration without spending four times more simulation work per second.
 
 ### Bot-specific motor torque
+
+In the Drive tab, full throttle now uses each side's motor-derived no-load
+wheel speed, calculated from `Kv x battery voltage / gear ratio`. The displayed
+estimate comes from the motor and battery inputs; loaded RPM then emerges from
+the torque model and simulated wheel load. If a side has no motor model, the
+legacy 424 RPM target is used and the UI says motor data is missing.
+
+For a forced-speed check, enable **Manual wheel RPM override** and enter a
+target such as 4000 RPM. That uses a separate speed servo and bypasses the
+drive motor torque model, so it is useful for testing but does not represent
+realistic motor-limited driving.
 
 In **Bot workshop**, open **Drive motor settings** and assign wheel assemblies
 to a motor group. Wheels driven by the same physical motor use the same group;
@@ -61,25 +91,37 @@ group and each motor's Kv
 (RPM/V), and peak current per motor (A), plus the robot battery pack's nominal
 voltage. Those are the core inputs. Kv gives the speed/torque constant, so the
 simulator estimates motor torque from current and converts it through the
-configured gear ratio. Phase-to-phase resistance and an ESC phase-current cap
+configured gear ratio. The same Kv, pack voltage, and gear ratio determine the
+displayed no-load output RPM. Phase-to-phase resistance and an ESC phase-current cap
 are optional; leave either at 0 if unknown. The model then uses a current-
 limited linear motor curve. Peak current is treated as torque-producing motor
 current. The simulator does not model winding temperature or reduce torque
 after a peak-current burst, so it can sustain the peak torque indefinitely. A
 catalog value that means battery input current is only an approximation.
 
-The weapon remains on the RPM controller for now. Weapon motor torque and
-spin-up based on its assembly moment of inertia are future work.
+The **Weapon motor settings** section configures motors for weapon assemblies.
+Enter motor count, Kv, peak current, battery voltage, and gearing. With its
+torque model enabled, holding the weapon control applies motor torque; the
+imported assembly inertia determines acceleration and spin-up. The displayed
+no-load RPM is `Kv x battery voltage / gear ratio`. Releasing the control
+removes motor drive and the weapon coasts under simulated mechanical losses.
+With the model disabled, the existing target-RPM and spin-up controls remain
+available. Bot workshop and Drive show an estimated 0-to-90% no-load spin-up
+time calculated from the motor torque curve and the weapon's inertia about its
+selected axis. The estimate does not include battery sag, impacts, or thermal
+derating. These settings persist with the bot setup and remain enabled after
+reloading it.
 
 Shared motor groups share torque but do not yet impose chain, belt, differential,
 or other rigid wheel-speed coupling. Each wheel joint remains independently
 simulated.
 
-The default 1:1 gear ratio and 100% efficiency are explicit assumptions. If a
-motor has a gearbox, enter motor RPM divided by output RPM as its ratio; this
-changes both output speed and torque. Efficiency can remain at 100% until a
-better value is available. A LiPo pack's nominal voltage can be estimated as
-3.7 V times its cell count. These settings are saved in
+Gear ratios use **input:output** notation, such as `16:1` or `3:2`; the
+simulator uses input RPM divided by output RPM. Older numeric ratio settings
+still load and are written in colon format when the setup is saved. The default `1:1`
+ratio and 100% efficiency are explicit assumptions. Efficiency can remain at
+100% until a better value is available. A LiPo pack's nominal voltage can be
+estimated as 3.7 V times its cell count. These settings are saved in
 `combatsim_setup.json` with the bot. When the model is disabled, the assembly
 continues to use the legacy prescribed-speed actuator.
 
@@ -128,7 +170,9 @@ continues to use the legacy prescribed-speed actuator.
    in the top navigation to enter the arena, then use the drive panel to pause
    or reset. **Save setup** writes `combatsim_setup.json` beside the
    Fusion manifest; the part grouping, pivots, axes, mass overrides, colors,
-   friction edits, and preview visibility load again next time. Every body has a **Weight (g)**
+   friction edits, collision toggles, and preview visibility load again next time. Flexible
+   wire and cable bodies start with **Use for collisions** off because their rigid STL
+   hulls can snag the floor; they remain visible and keep their mass. Every body has a **Weight (g)**
    field; enter a manual weight there or press **Use Fusion** to restore its
    exported value. The main window reports left and right wheel-joint counts;
    turning in place requires at least one drive assembly on each side.
@@ -158,3 +202,27 @@ To validate an import without opening a window:
 ```powershell
 .\Standalone\build\Release\CombatSimStandalone.exe --validate-bundle C:\path\to\bundle\manifest.json
 ```
+
+To check that the stock robot tracks straight under a forward command, run:
+
+```powershell
+.\Standalone\build\Release\CombatSimStandalone.exe --test-straight-drive
+```
+
+This runs the stock `CombatRobot500g.xml` for one simulated second with only
+the robot and floor colliding, then reports lateral drift, yaw change, and
+individual wheel RPM. An optional XML path can be supplied, but this check
+requires the stock actuator and body names. Add `--arena` to start at the
+normal spawn points and include arena and opponent collisions; this reports
+the result without treating collision-driven yaw as a drivetrain test failure.
+
+To test a saved CAD bot's forward drive using its motor, wheel, and axis setup,
+run:
+
+```powershell
+.\Standalone\build\Release\CombatSimStandalone.exe --test-straight-drive-bundle C:\path\to\bundle\manifest.json
+```
+
+This generates the model beside the manifest, disables arena and opponent
+collisions for the test, then reports chassis yaw, each wheel's RPM, and its
+floor grip/slip status after one simulated second.

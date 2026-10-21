@@ -5,10 +5,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -87,6 +89,75 @@ std::string Number(double value) {
   std::ostringstream s; s.imbue(std::locale::classic()); s << std::setprecision(12) << value;
   return s.str();
 }
+std::string FormatGearRatio(double ratio) {
+  if (!std::isfinite(ratio) || ratio <= 0.0) return "1:1";
+  if (ratio > 1e6) return Number(ratio) + ":1";
+  for (int denominator = 1; denominator <= 64; ++denominator) {
+    const int numerator = static_cast<int>(std::round(ratio * denominator));
+    if (numerator > 0 && std::abs(ratio -
+        static_cast<double>(numerator) / denominator) <= 1e-7 * std::max(1.0, ratio))
+      return std::to_string(numerator) + ":" + std::to_string(denominator);
+  }
+  return Number(ratio) + ":1";
+}
+bool ParseGearRatio(const std::string& text, double& ratio) {
+  const size_t separator = text.find(':');
+  if (separator == std::string::npos || text.find(':', separator + 1) != std::string::npos)
+    return false;
+  auto parse_positive = [](std::string value, double& parsed) {
+    const size_t begin = value.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) return false;
+    const size_t end = value.find_last_not_of(" \t\r\n");
+    value = value.substr(begin, end - begin + 1);
+    try {
+      size_t consumed = 0;
+      parsed = std::stod(value, &consumed);
+      return consumed == value.size() && std::isfinite(parsed) && parsed > 0.0;
+    } catch (...) { return false; }
+  };
+  double input = 0.0, output = 0.0;
+  if (!parse_positive(text.substr(0, separator), input) ||
+      !parse_positive(text.substr(separator + 1), output)) return false;
+  ratio = input / output;
+  return std::isfinite(ratio) && ratio > 0.0;
+}
+void DrawGearRatioInput(int key, MotorSpec& motor) {
+  static std::map<int, std::array<char, 64>> buffers;
+  static std::map<int, std::string> last_valid_text;
+  auto& buffer = buffers[key];
+  auto& last_valid = last_valid_text[key];
+  if (last_valid != motor.gear_ratio_text) {
+    std::snprintf(buffer.data(), buffer.size(), "%s", motor.gear_ratio_text.c_str());
+    last_valid = motor.gear_ratio_text;
+  }
+  ImGui::TextWrapped("Gear ratio (input:output)");
+  ImGui::SetNextItemWidth(std::min(240.0f, ImGui::GetContentRegionAvail().x));
+  ImGui::InputText("##gear_ratio", buffer.data(), buffer.size());
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Enter motor input RPM : output RPM, for example 16:1 or 3:2.");
+  double ratio = 0.0;
+  if (ParseGearRatio(buffer.data(), ratio)) {
+    motor.gear_ratio = ratio;
+    motor.gear_ratio_text = buffer.data();
+    last_valid = motor.gear_ratio_text;
+  } else {
+    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f),
+                       "Use positive input:output values, such as 16:1 or 3:2.");
+  }
+}
+void DrawMotorIntInput(const char* label, int* value) {
+  ImGui::TextWrapped("%s", label);
+  ImGui::SetNextItemWidth(std::min(180.0f, ImGui::GetContentRegionAvail().x));
+  const std::string id = std::string("##") + label;
+  ImGui::InputInt(id.c_str(), value);
+}
+void DrawMotorDoubleInput(const char* label, double* value, double step,
+                          double step_fast, const char* format) {
+  ImGui::TextWrapped("%s", label);
+  ImGui::SetNextItemWidth(std::min(180.0f, ImGui::GetContentRegionAvail().x));
+  const std::string id = std::string("##") + label;
+  ImGui::InputDouble(id.c_str(), value, step, step_fast, format);
+}
 const char* KindLabel(AssemblyKind kind) {
   switch (kind) {
     case AssemblyKind::Frame: return "Frame";
@@ -109,6 +180,18 @@ void Include(Vec3 point, Vec3& low, Vec3& high) {
   for (int i = 0; i < 3; ++i) { low[i] = std::min(low[i], point[i]); high[i] = std::max(high[i], point[i]); }
 }
 bool ValidMass(double value) { return std::isfinite(value) && value > 0.0; }
+bool FlexiblePartPath(const CadPart& part) {
+  auto has_flexible_name = [](const std::string& name) {
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    return lower.find("wire") != std::string::npos ||
+      lower.find("cable") != std::string::npos;
+  };
+  if (has_flexible_name(part.name)) return true;
+  return std::any_of(part.occurrence_path.begin(), part.occurrence_path.end(), has_flexible_name);
+}
 Mat3 UnpackTensor(const std::array<double, 6>& p) {
   return {p[0], p[3], p[4], p[3], p[1], p[5], p[4], p[5], p[2]};
 }
@@ -364,6 +447,84 @@ MassProperties GroupMass(const std::vector<CadPart>& parts, int assembly, Vec3 o
   result.center = Sub(result.center, origin);
   return result;
 }
+double MomentAboutAxis(const MassProperties& properties, Vec3 axis) {
+  const double axis_length = Length(axis);
+  if (!std::isfinite(axis_length) || axis_length <= 1e-10 || properties.mass <= 0.0)
+    return 0.0;
+  axis = Mul(axis, 1.0 / axis_length);
+  double centered_moment = 0.0;
+  for (int row = 0; row < 3; ++row)
+    for (int column = 0; column < 3; ++column)
+      centered_moment += axis[row] * properties.inertia[row * 3 + column] * axis[column];
+  const double along_axis = Dot(properties.center, axis);
+  const double parallel_axis = properties.mass *
+    std::max(0.0, Dot(properties.center, properties.center) - along_axis * along_axis);
+  const double total = centered_moment + parallel_axis;
+  return std::isfinite(total) && total > 0.0 ? total : 0.0;
+}
+}
+
+double MotorNoLoadOutputRpm(const MotorSpec& motor, double battery_voltage) {
+  if (!motor.enabled || !std::isfinite(battery_voltage) || battery_voltage <= 0.0 ||
+      !std::isfinite(motor.kv_rpm_per_volt) || motor.kv_rpm_per_volt <= 0.0 ||
+      !std::isfinite(motor.gear_ratio) || motor.gear_ratio <= 0.0)
+    return 0.0;
+  return motor.kv_rpm_per_volt * battery_voltage / motor.gear_ratio;
+}
+
+double MotorOutputTorque(const MotorSpec& motor, double battery_voltage,
+                         double desired_output_speed, double actual_output_speed) {
+  if (!motor.enabled || !std::isfinite(battery_voltage) || battery_voltage <= 0.0 ||
+      !std::isfinite(motor.kv_rpm_per_volt) || motor.kv_rpm_per_volt <= 0.0 ||
+      !std::isfinite(motor.peak_current_a) || motor.peak_current_a <= 0.0 ||
+      !std::isfinite(motor.phase_resistance_ohm) || motor.phase_resistance_ohm < 0.0 ||
+      !std::isfinite(motor.esc_current_limit_a) || motor.esc_current_limit_a < 0.0 ||
+      !std::isfinite(motor.gear_ratio) || motor.gear_ratio <= 0.0 ||
+      !std::isfinite(motor.gearbox_efficiency) || motor.gearbox_efficiency <= 0.0 ||
+      motor.gearbox_efficiency > 1.0 || motor.motor_count <= 0 ||
+      !std::isfinite(desired_output_speed) || !std::isfinite(actual_output_speed)) return 0.0;
+  constexpr double pi = 3.14159265358979323846;
+  const double motor_speed_constant = motor.kv_rpm_per_volt * 2.0 * pi / 60.0;
+  const double motor_no_load_speed = motor_speed_constant * battery_voltage;
+  if (motor_no_load_speed <= 0.0) return 0.0;
+  const double output_no_load_speed = motor_no_load_speed / motor.gear_ratio;
+  const double duty = std::clamp(desired_output_speed / output_no_load_speed, -1.0, 1.0);
+  const double motor_speed = actual_output_speed * motor.gear_ratio;
+  double current_limit = motor.peak_current_a;
+  if (motor.esc_current_limit_a > 0.0)
+    current_limit = std::min(current_limit, motor.esc_current_limit_a);
+  double current = 0.0;
+  if (motor.phase_resistance_ohm > 1e-9) {
+    const double back_emf = motor_speed / motor_speed_constant;
+    current = (duty * battery_voltage - back_emf) / motor.phase_resistance_ohm;
+    current = std::clamp(current, -current_limit, current_limit);
+  } else {
+    const double normalized_speed = motor_speed / motor_no_load_speed;
+    current = std::clamp(duty - normalized_speed, -1.0, 1.0) * current_limit;
+  }
+  const double torque_constant = 1.0 / motor_speed_constant;
+  return torque_constant * current * motor.gear_ratio *
+    motor.gearbox_efficiency * motor.motor_count;
+}
+
+double EstimateMotorSpinupSeconds(const MotorSpec& motor, double battery_voltage,
+                                  double axis_inertia, double target_fraction) {
+  if (!std::isfinite(axis_inertia) || axis_inertia <= 0.0 ||
+      !std::isfinite(target_fraction) || target_fraction <= 0.0 || target_fraction >= 1.0)
+    return 0.0;
+  constexpr double pi = 3.14159265358979323846;
+  constexpr int integration_steps = 1000;
+  const double free_speed = MotorNoLoadOutputRpm(motor, battery_voltage) * 2.0 * pi / 60.0;
+  if (!std::isfinite(free_speed) || free_speed <= 0.0) return 0.0;
+  const double speed_step = target_fraction * free_speed / integration_steps;
+  double seconds = 0.0;
+  for (int step = 0; step < integration_steps; ++step) {
+    const double midpoint_speed = (step + 0.5) * speed_step;
+    const double torque = MotorOutputTorque(motor, battery_voltage, free_speed, midpoint_speed);
+    if (!std::isfinite(torque) || torque <= 1e-12) return 0.0;
+    seconds += axis_inertia * speed_step / torque;
+  }
+  return std::isfinite(seconds) && seconds > 0.0 ? seconds : 0.0;
 }
 
 bool FusionBundle::Load(const std::filesystem::path& manifest) {
@@ -402,6 +563,9 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
       if (item.contains("occurrencePath") && item.at("occurrencePath").is_array())
         part.occurrence_path = item.at("occurrencePath").get<std::vector<std::string>>();
       else part.occurrence_path = {item.value("bodyName", std::string("Root"))};
+      // Flexible wire/cable STLs are poor rigid collision shapes. Their convex
+      // hulls can extend below the chassis and act like unintended floor feet.
+      part.collision_enabled = !FlexiblePartPath(part);
       part.density = item.value("densityKgPerM3", 0.0);
       part.mass = item.value("massKg", 0.0);
       if (part.mass <= 0 && item.contains("volumeM3") && part.density > 0)
@@ -499,7 +663,14 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
               "peakCurrentA", motor.value("ratedCurrentA", 0.0));
             group.motor.phase_resistance_ohm = motor.value("phaseResistanceOhm", 0.0);
             group.motor.esc_current_limit_a = motor.value("escCurrentLimitA", 0.0);
-            group.motor.gear_ratio = motor.value("gearRatio", 1.0);
+            if (motor.contains("gearRatio") && motor.at("gearRatio").is_string()) {
+              group.motor.gear_ratio_text = motor.at("gearRatio").get<std::string>();
+              if (!ParseGearRatio(group.motor.gear_ratio_text, group.motor.gear_ratio))
+                throw std::runtime_error("Invalid input:output gear ratio for: " + group.name);
+            } else {
+              group.motor.gear_ratio = motor.value("gearRatio", 1.0);
+              group.motor.gear_ratio_text = FormatGearRatio(group.motor.gear_ratio);
+            }
             group.motor.gearbox_efficiency = motor.value("gearboxEfficiency", 1.0);
           }
           if (group.kind == AssemblyKind::LeftWheel ||
@@ -514,7 +685,8 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
             used_drive_groups.insert(group.motor.drive_group);
           } else {
             group.motor.drive_group = -1;
-            group.motor.enabled = false;
+            if (group.kind != AssemblyKind::Weapon)
+              group.motor.enabled = false;
           }
           groups.push_back(group);
         }
@@ -532,6 +704,7 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
           part.friction = override.value("frictionEstimate", part.friction);
           part.color = ReadArray<4>(override, "colorRgba", part.color);
           part.preview_visible = override.value("previewVisible", true);
+          part.collision_enabled = override.value("collisionEnabled", part.collision_enabled);
         }
       }
     }
@@ -583,7 +756,7 @@ bool FusionBundle::Save() {
                                         {"peakCurrentA", g.motor.peak_current_a},
                                         {"phaseResistanceOhm", g.motor.phase_resistance_ohm},
                                         {"escCurrentLimitA", g.motor.esc_current_limit_a},
-                                        {"gearRatio", g.motor.gear_ratio},
+                                        {"gearRatio", g.motor.gear_ratio_text},
                                         {"gearboxEfficiency", g.motor.gearbox_efficiency}}}});
     }
     state["partAssignments"] = json::object();
@@ -592,7 +765,8 @@ bool FusionBundle::Save() {
       state["partAssignments"][part.file] = part.assembly;
       state["partOverrides"][part.file] = {{"massKg", part.mass},
         {"frictionEstimate", part.friction}, {"colorRgba", part.color},
-        {"previewVisible", part.preview_visible}};
+        {"previewVisible", part.preview_visible},
+        {"collisionEnabled", part.collision_enabled}};
     }
     std::ofstream output(manifest_.parent_path() / "combatsim_setup.json", std::ios::trunc);
     if (!output) throw std::runtime_error("Cannot write combatsim_setup.json beside the manifest.");
@@ -772,7 +946,9 @@ bool FusionBundle::Generate(std::filesystem::path& output) {
       xml << "<geom name=\"cad_part_" << i << "\" type=\"mesh\" mesh=\"cad_mesh_" << i
           << "\" pos=\"" << Text(Sub(p.position, origin)) << "\" quat=\"" << Text4(p.rotation)
           << "\" mass=\"0\" friction=\"" << Number(p.friction)
-          << " 0.02 0.001\" rgba=\"" << Text4(p.color) << "\"/>\n";
+          << " 0.02 0.001\" rgba=\"" << Text4(p.color) << "\"";
+      if (!p.collision_enabled) xml << " contype=\"0\" conaffinity=\"0\"";
+      xml << "/>\n";
     };
     for (size_t i = 0; i < parts_.size(); ++i) if (parts_[i].assembly == 0) geom(i, {});
     for (size_t group = 1; group < assemblies_.size(); ++group) {
@@ -834,10 +1010,11 @@ bool FusionBundle::Generate(std::filesystem::path& output) {
           GroupMass(parts_, int(group), a.pivot).mass <= 0) continue;
       const bool drive_assembly = a.kind == AssemblyKind::LeftWheel ||
                                   a.kind == AssemblyKind::RightWheel;
-      const bool use_motor_model = drive_assembly && a.motor.enabled;
+      const bool weapon_assembly = a.kind == AssemblyKind::Weapon;
+      const bool use_motor_model = (drive_assembly || weapon_assembly) && a.motor.enabled;
       if (use_motor_model &&
           (!std::isfinite(battery_voltage_) || battery_voltage_ <= 0.0 ||
-           a.motor.drive_group < 0 || a.motor.drive_group > 7 ||
+           (drive_assembly && (a.motor.drive_group < 0 || a.motor.drive_group > 7)) ||
            a.motor.motor_count < 1 || a.motor.motor_count > 32 ||
            !std::isfinite(a.motor.kv_rpm_per_volt) || a.motor.kv_rpm_per_volt <= 0.0 ||
            !std::isfinite(a.motor.peak_current_a) || a.motor.peak_current_a <= 0.0 ||
@@ -852,6 +1029,10 @@ bool FusionBundle::Generate(std::filesystem::path& output) {
       if (use_motor_model) {
         xml << "<motor name=\"cad_assembly_" << group << "_drive\" joint=\"cad_joint_"
             << group << "\"/><!-- torque-controlled motor model -->\n";
+        if (drive_assembly)
+          xml << "<velocity name=\"cad_assembly_" << group
+              << "_manual_drive\" joint=\"cad_joint_" << group
+              << "\" kv=\"0.004\" forcerange=\"-2 2\"/>\n";
       } else {
         xml << "<velocity name=\"cad_assembly_" << group << "_drive\" joint=\"cad_joint_" << group
             << "\" kv=\"" << Number(gain) << "\" forcerange=\"-" << Number(force)
@@ -874,8 +1055,12 @@ void FusionBundle::BindControls(const mjModel* model,
                                 std::vector<std::pair<int, double>>& right,
                                 std::vector<int>& weapon,
                                 std::map<int, MotorSpec>& motor_models,
+                                std::map<int, MotorSpec>& weapon_motor_models,
+                                std::map<int, int>& manual_velocity_actuators,
                                 double& battery_voltage) const {
   motor_models.clear();
+  weapon_motor_models.clear();
+  manual_velocity_actuators.clear();
   battery_voltage = battery_voltage_;
   for (size_t group = 1; group < assemblies_.size(); ++group) {
     const auto kind = assemblies_[group].kind;
@@ -883,7 +1068,12 @@ void FusionBundle::BindControls(const mjModel* model,
     const int id = mj_name2id(model, mjOBJ_ACTUATOR, name.c_str());
     if (id < 0) continue;
     if (kind == AssemblyKind::LeftWheel || kind == AssemblyKind::RightWheel) {
-      if (assemblies_[group].motor.enabled) motor_models[id] = assemblies_[group].motor;
+      if (assemblies_[group].motor.enabled) {
+        motor_models[id] = assemblies_[group].motor;
+        const auto manual_name = "cad_assembly_" + std::to_string(group) + "_manual_drive";
+        const int manual_id = mj_name2id(model, mjOBJ_ACTUATOR, manual_name.c_str());
+        if (manual_id >= 0) manual_velocity_actuators[id] = manual_id;
+      }
       Vec3 axis = assemblies_[group].axis;
       const double axis_length = Length(axis);
       double forward_sign = 1.0;
@@ -898,8 +1088,30 @@ void FusionBundle::BindControls(const mjModel* model,
       if (kind == AssemblyKind::LeftWheel) left.emplace_back(id, forward_sign);
       if (kind == AssemblyKind::RightWheel) right.emplace_back(id, forward_sign);
     }
-    if (kind == AssemblyKind::Weapon) weapon.push_back(id);
+    if (kind == AssemblyKind::Weapon) {
+      weapon.push_back(id);
+      if (assemblies_[group].motor.enabled)
+        weapon_motor_models[id] = assemblies_[group].motor;
+    }
   }
+}
+
+double FusionBundle::EstimatedWeaponSpinupSeconds() const {
+  bool found_weapon = false;
+  double slowest_seconds = 0.0;
+  for (size_t i = 1; i < assemblies_.size(); ++i) {
+    const auto& assembly = assemblies_[i];
+    if (assembly.kind != AssemblyKind::Weapon) continue;
+    found_weapon = true;
+    if (!assembly.motor.enabled) return 0.0;
+    const MassProperties properties = GroupMass(parts_, int(i), assembly.pivot);
+    const double inertia = MomentAboutAxis(properties, assembly.axis);
+    const double seconds = EstimateMotorSpinupSeconds(
+      assembly.motor, battery_voltage_, inertia);
+    if (!std::isfinite(seconds) || seconds <= 0.0) return 0.0;
+    slowest_seconds = std::max(slowest_seconds, seconds);
+  }
+  return found_weapon ? slowest_seconds : 0.0;
 }
 
 void FusionBundle::PickFace(int part_index, const std::array<double, 3>& cad_point) {
@@ -1243,6 +1455,9 @@ void FusionBundle::DrawPart(size_t index) {
   const std::string label = part.name + "##part";
   if (ImGui::TreeNode(label.c_str())) {
     ImGui::Checkbox("Show in preview", &part.preview_visible);
+    ImGui::Checkbox("Use for collisions", &part.collision_enabled);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Disable collision for flexible wires/cables or decorative meshes that should not push on the arena floor. The part stays visible and keeps its mass.");
     ImGui::TextWrapped("STL: %s", part.file.c_str());
     ImGui::TextWrapped("Fusion material: %s", part.material.c_str());
     if (!part.appearance.empty()) ImGui::TextWrapped("Appearance: %s", part.appearance.c_str());
@@ -1381,16 +1596,15 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
     ImGui::TextWrapped("Export the design from Fusion, then enter its manifest.json path above.");
     return;
   }
-  ImGui::Text("%s: %d STL bodies", design_name_.c_str(), int(parts_.size()));
+  ImGui::TextWrapped("%s: %d STL bodies", design_name_.c_str(), int(parts_.size()));
   ImGui::SeparatorText("Bot powertrain");
-  ImGui::SetNextItemWidth(180);
-  ImGui::InputDouble("Battery voltage (V)", &battery_voltage_, 0.1, 1.0, "%.2f");
+  DrawMotorDoubleInput("Battery voltage (V)", &battery_voltage_, 0.1, 1.0, "%.2f");
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip("Use the battery pack's nominal voltage. For a LiPo pack, cell count x 3.7 V is a reasonable nominal value.");
   if (!std::isfinite(battery_voltage_) || battery_voltage_ < 0.0) battery_voltage_ = 0.0;
-  ImGui::TextDisabled("Per motor: Kv and peak current. Pack voltage is also required; settings save with this bot.");
+  ImGui::TextWrapped("Per motor: Kv and peak current. Pack voltage is also required; settings save with this bot.");
   if (ImGui::TreeNodeEx("Drive motor settings", ImGuiTreeNodeFlags_DefaultOpen)) {
-    ImGui::TextWrapped("Assign wheels driven by the same physical motor to the same group. The group's available torque is shared evenly across its wheel assemblies. Wheel-speed linkages are not constrained yet, so chain/belt coupling is approximate. Weapon control stays RPM-based for now.");
+    ImGui::TextWrapped("Assign wheels driven by the same physical motor to the same group. The group's available torque is shared evenly across its wheel assemblies. Wheel-speed linkages are not constrained yet, so chain/belt coupling is approximate.");
     static const char* motor_group_labels[] = {
       "Motor A", "Motor B", "Motor C", "Motor D",
       "Motor E", "Motor F", "Motor G", "Motor H"};
@@ -1404,7 +1618,10 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
       const int old_drive_group = group.motor.drive_group;
       const char* current_group = old_drive_group >= 0 && old_drive_group < 8
         ? motor_group_labels[old_drive_group] : "Select motor group";
-      if (ImGui::BeginCombo("Driven by", current_group)) {
+      ImGui::TextWrapped("%s (%s)", group.name.c_str(), KindLabel(group.kind));
+      ImGui::TextDisabled("Motor group");
+      ImGui::SetNextItemWidth(240.0f);
+      if (ImGui::BeginCombo("##driven_by", current_group)) {
         for (int candidate = 0; candidate < 8; ++candidate) {
           if (!ImGui::Selectable(motor_group_labels[candidate],
                                  group.motor.drive_group == candidate))
@@ -1423,8 +1640,6 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
         }
         ImGui::EndCombo();
       }
-      ImGui::SameLine();
-      ImGui::Text("%s (%s)", group.name.c_str(), KindLabel(group.kind));
       ImGui::PopID();
     }
     if (has_drive_wheels) {
@@ -1444,50 +1659,46 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
             ++member_count;
         ImGui::PushID(1000 + owner.motor.drive_group);
         const bool default_open = shown_groups.size() == 1;
-        const bool open = ImGui::TreeNodeEx("##motor_group_spec",
+        const bool open = ImGui::TreeNodeEx(motor_group_labels[owner.motor.drive_group],
           default_open ? ImGuiTreeNodeFlags_DefaultOpen : ImGuiTreeNodeFlags_None);
-        ImGui::SameLine();
-        ImGui::Text("%s (%d wheel assemblies)",
-          motor_group_labels[owner.motor.drive_group], member_count);
         if (open) {
+          ImGui::TextWrapped("Torque is shared across %d wheel assemblies.", member_count);
           ImGui::Checkbox("Enable wheel torque model", &owner.motor.enabled);
-          ImGui::SetNextItemWidth(180);
-          ImGui::InputInt("Physical motors in group", &owner.motor.motor_count);
+          DrawMotorIntInput("Physical motors in group", &owner.motor.motor_count);
           owner.motor.motor_count = std::clamp(owner.motor.motor_count, 1, 32);
-          ImGui::SetNextItemWidth(180);
-          ImGui::InputDouble("Motor Kv (RPM/V)", &owner.motor.kv_rpm_per_volt, 1.0, 10.0, "%.1f");
-          ImGui::SetNextItemWidth(180);
-          ImGui::InputDouble("Peak current per motor (A)", &owner.motor.peak_current_a, 0.1, 1.0, "%.2f");
+          DrawMotorDoubleInput("Motor Kv (RPM/V)", &owner.motor.kv_rpm_per_volt,
+                               1.0, 10.0, "%.1f");
+          DrawMotorDoubleInput("Peak current per motor (A)", &owner.motor.peak_current_a,
+                               0.1, 1.0, "%.2f");
           if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Used as the peak torque-producing current cap. The model does not simulate motor heating or thermal derating.");
-          ImGui::SetNextItemWidth(180);
-          ImGui::InputDouble("Gear ratio (motor:wheel)", &owner.motor.gear_ratio,
-                             0.1, 1.0, "%.3f");
+          DrawGearRatioInput(1000 + owner.motor.drive_group, owner.motor);
           if (ImGui::TreeNode("Optional motor and gearbox settings")) {
             double phase_resistance_milliohm = owner.motor.phase_resistance_ohm * 1000.0;
-            ImGui::SetNextItemWidth(180);
-            if (ImGui::InputDouble("Phase-to-phase resistance (mOhm)",
-                                   &phase_resistance_milliohm, 1.0, 10.0, "%.2f"))
+            ImGui::TextWrapped("Phase-to-phase resistance (mOhm)");
+            ImGui::SetNextItemWidth(std::min(180.0f, ImGui::GetContentRegionAvail().x));
+            if (ImGui::InputDouble("##phase_resistance", &phase_resistance_milliohm,
+                                   1.0, 10.0, "%.2f"))
               owner.motor.phase_resistance_ohm = phase_resistance_milliohm / 1000.0;
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip("Optional. Enter resistance measured across two motor leads.");
-            ImGui::SetNextItemWidth(180);
-            ImGui::InputDouble("ESC phase-current limit per motor (A)",
-                               &owner.motor.esc_current_limit_a, 0.1, 1.0, "%.2f");
+            DrawMotorDoubleInput("ESC phase-current limit per motor (A)",
+                                 &owner.motor.esc_current_limit_a, 0.1, 1.0, "%.2f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip("Optional. Enter only if the ESC specification identifies phase/motor current; otherwise leave 0.");
             double efficiency_percent = owner.motor.gearbox_efficiency * 100.0;
-            ImGui::SetNextItemWidth(180);
-            if (ImGui::InputDouble("Gearbox efficiency (%)", &efficiency_percent,
+            ImGui::TextWrapped("Gearbox efficiency (%)");
+            ImGui::SetNextItemWidth(std::min(180.0f, ImGui::GetContentRegionAvail().x));
+            if (ImGui::InputDouble("##gearbox_efficiency", &efficiency_percent,
                                    1.0, 5.0, "%.1f"))
               owner.motor.gearbox_efficiency = efficiency_percent / 100.0;
             owner.motor.gearbox_efficiency = std::clamp(owner.motor.gearbox_efficiency, 1e-3, 1.0);
-            ImGui::TextDisabled("Defaults: 0 resistance, no extra ESC cap, 1:1 ratio, 100%% efficiency.");
+            ImGui::TextWrapped("Defaults: 0 resistance, no extra ESC cap, 1:1 ratio, 100%% efficiency.");
             ImGui::TreePop();
           }
           if (battery_voltage_ > 0.0 && owner.motor.kv_rpm_per_volt > 0.0 &&
               owner.motor.gear_ratio > 0.0)
-            ImGui::Text("Estimated wheel no-load speed: %.0f RPM",
+            ImGui::TextWrapped("Estimated wheel no-load speed: %.0f RPM",
               owner.motor.kv_rpm_per_volt * battery_voltage_ / owner.motor.gear_ratio);
           const MotorSpec shared_spec = owner.motor;
           for (size_t member = 1; member < assemblies_.size(); ++member)
@@ -1501,7 +1712,71 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
       }
     }
     if (!has_drive_wheels)
-      ImGui::TextDisabled("Set an assembly type to Left wheel or Right wheel below to configure it here.");
+      ImGui::TextWrapped("Set an assembly type to Left wheel or Right wheel below to configure it here.");
+    ImGui::TreePop();
+  }
+  if (ImGui::TreeNodeEx("Weapon motor settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::TextWrapped("Weapon spin-up and speed are driven by motor torque and the weapon assembly's inertia. Configure the motor, battery, and input:output gearing here.");
+    bool has_weapon = false;
+    for (size_t i = 1; i < assemblies_.size(); ++i) {
+      auto& weapon = assemblies_[i];
+      if (weapon.kind != AssemblyKind::Weapon) continue;
+      has_weapon = true;
+      ImGui::PushID(2000 + int(i));
+      ImGui::TextWrapped("%s", weapon.name.c_str());
+      ImGui::Separator();
+      ImGui::Checkbox("Enable weapon torque model", &weapon.motor.enabled);
+      DrawMotorIntInput("Physical motors in weapon assembly", &weapon.motor.motor_count);
+      weapon.motor.motor_count = std::clamp(weapon.motor.motor_count, 1, 32);
+      DrawMotorDoubleInput("Motor Kv (RPM/V)", &weapon.motor.kv_rpm_per_volt,
+                           1.0, 10.0, "%.1f");
+      DrawMotorDoubleInput("Peak current per motor (A)", &weapon.motor.peak_current_a,
+                           0.1, 1.0, "%.2f");
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Used as the peak torque-producing current cap. Motor heating and thermal derating are not simulated.");
+      DrawGearRatioInput(20000 + int(i), weapon.motor);
+      if (ImGui::TreeNode("Optional motor and gearbox settings")) {
+        double phase_resistance_milliohm = weapon.motor.phase_resistance_ohm * 1000.0;
+        ImGui::TextWrapped("Phase-to-phase resistance (mOhm)");
+        ImGui::SetNextItemWidth(std::min(180.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::InputDouble("##phase_resistance", &phase_resistance_milliohm,
+                               1.0, 10.0, "%.2f"))
+          weapon.motor.phase_resistance_ohm = phase_resistance_milliohm / 1000.0;
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Optional. Enter resistance measured across two motor leads.");
+        DrawMotorDoubleInput("ESC phase-current limit per motor (A)",
+                             &weapon.motor.esc_current_limit_a, 0.1, 1.0, "%.2f");
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Optional. Enter only if the ESC specification identifies phase/motor current; otherwise leave 0.");
+        double efficiency_percent = weapon.motor.gearbox_efficiency * 100.0;
+        ImGui::TextWrapped("Gearbox efficiency (%)");
+        ImGui::SetNextItemWidth(std::min(180.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::InputDouble("##gearbox_efficiency", &efficiency_percent,
+                               1.0, 5.0, "%.1f"))
+          weapon.motor.gearbox_efficiency = efficiency_percent / 100.0;
+        weapon.motor.gearbox_efficiency = std::clamp(weapon.motor.gearbox_efficiency, 1e-3, 1.0);
+        ImGui::TextWrapped("Defaults: 0 resistance, no extra ESC cap, 1:1 ratio, 100%% efficiency.");
+        ImGui::TreePop();
+      }
+      if (battery_voltage_ > 0.0 && weapon.motor.kv_rpm_per_volt > 0.0 &&
+          weapon.motor.gear_ratio > 0.0)
+        ImGui::TextWrapped("Estimated weapon no-load speed: %.0f RPM",
+          weapon.motor.kv_rpm_per_volt * battery_voltage_ / weapon.motor.gear_ratio);
+      if (weapon.motor.enabled) {
+        const MassProperties properties = GroupMass(parts_, int(i), weapon.pivot);
+        const double inertia = MomentAboutAxis(properties, weapon.axis);
+        const double spinup_seconds = EstimateMotorSpinupSeconds(
+          weapon.motor, battery_voltage_, inertia);
+        if (spinup_seconds > 0.0)
+          ImGui::TextWrapped("Estimated 0-to-90%% no-load spin-up: %.2f s", spinup_seconds);
+        else
+          ImGui::TextWrapped("Enter valid battery and motor data and assign weapon bodies to estimate spin-up.");
+        ImGui::TextWrapped("Estimate uses the selected axis and modeled assembly inertia; it excludes battery sag, impacts, and thermal derating.");
+      }
+      ImGui::PopID();
+    }
+    if (!has_weapon)
+      ImGui::TextWrapped("Assign at least one body group to a Weapon assembly to configure its motor.");
     ImGui::TreePop();
   }
   if (selected_part_ >= 0 && selected_part_ < int(parts_.size())) {
@@ -1646,7 +1921,7 @@ void FusionBundle::DrawAxisSelectionControls() {
   ImGui::SeparatorText("Select rotation axis");
   const char* axis_name = axis_assembly_ > 0 && axis_assembly_ < int(assemblies_.size()) ?
     assemblies_[axis_assembly_].name.c_str() : "Choose assembly";
-  ImGui::SetNextItemWidth(std::max(180.0f, ImGui::GetContentRegionAvail().x * 0.65f));
+  ImGui::SetNextItemWidth(260.0f);
   if (ImGui::BeginCombo("Axis target (weapon / wheel / fork)", axis_name)) {
     for (size_t i = 1; i < assemblies_.size(); ++i) {
       if (assemblies_[i].kind == AssemblyKind::Fixed) continue;

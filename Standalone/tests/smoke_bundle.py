@@ -76,6 +76,12 @@ def smoke_directory(workdir=None):
 
 
 def main(exe, workdir=None):
+    result = subprocess.run([str(exe), "--test-input-mixer"], text=True, capture_output=True)
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
     result = subprocess.run([str(exe), "--test-drive-mix"], text=True, capture_output=True)
     print(result.stdout, end="")
     print(result.stderr, end="", file=sys.stderr)
@@ -152,14 +158,14 @@ def main(exe, workdir=None):
             "batteryVoltage": 11.1,
             "assemblies": [{"name": n, "kind": k, "pivotMeters": pivot,
                             "axis": axis,
-                            "motor": {"enabled": n in ("FL", "RL"),
+                            "motor": {"enabled": n in ("FL", "RL", "Weapon"),
                                       "driveGroup": (0 if n in ("FL", "RL") else
                                                      1 if n == "FR" else
                                                      2 if n == "RR" else -1),
                                       "motorCount": 1, "kvRpmPerVolt": 1000.0,
                                       "peakCurrentA": 10.0,
                                       "phaseResistanceOhm": 1.11,
-                                      "escCurrentLimitA": 8.0, "gearRatio": 2.0,
+                                      "escCurrentLimitA": 8.0, "gearRatio": "3:2",
                                       "gearboxEfficiency": 0.9}}
                            for pivot, (n, k, axis) in zip(pivots, groups)],
             "partAssignments": assignments}), encoding="utf-8")
@@ -170,6 +176,35 @@ def main(exe, workdir=None):
         if result.returncode:
             raise SystemExit(result.returncode)
         assert "Shared motor spin test passed: 2 wheel assemblies" in result.stdout
+        assert "Manual speed override passed: 4000 RPM target reached" in result.stdout
+        assert "7400 RPM no-load" in result.stdout
+
+        result = subprocess.run([str(exe), "--test-weapon-motor", str(root / "manifest.json")],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        assert "Weapon torque spin-up passed" in result.stdout
+        assert "estimated 0-to-90% time" in result.stdout
+        assert "7400 RPM no-load" in result.stdout
+
+        # Legacy setup files stored a numeric motor-speed reduction. It must
+        # still load with the same input:output value and no-load estimate.
+        setup_path = root / "combatsim_setup.json"
+        setup = json.loads(setup_path.read_text(encoding="utf-8"))
+        for assembly in setup["assemblies"]:
+            if "motor" in assembly:
+                assembly["motor"]["gearRatio"] = 1.5
+        setup_path.write_text(json.dumps(setup), encoding="utf-8")
+        result = subprocess.run([str(exe), "--test-weapon-motor", str(root / "manifest.json")],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        assert "7400 RPM no-load" in result.stdout
+        print("Legacy numeric gear ratio loaded as 3:2")
 
         result = subprocess.run([str(exe), "--validate-bundle", str(root / "manifest.json")],
                                 text=True, capture_output=True)
@@ -189,17 +224,19 @@ def main(exe, workdir=None):
         print("Both-side turn mapping and fitted-axis direction normalization passed")
         print("Passive fork hinge, gravity swing, and main-frame contact passed")
         generated = (root / "combatsim_generated.xml").read_text(encoding="utf-8")
-        assert generated.count('<velocity name="cad_assembly_') == 3
-        assert generated.count('<motor name="cad_assembly_') == 2
+        assert generated.count('<velocity name="cad_assembly_') == 4
+        assert generated.count('<motor name="cad_assembly_') == 3
+        assert '<motor name="cad_assembly_1_drive" joint="cad_joint_1"/>' in generated
         assert '<motor name="cad_assembly_2_drive" joint="cad_joint_2"/>' in generated
         assert '<motor name="cad_assembly_3_drive" joint="cad_joint_3"/>' in generated
-        assert '<velocity name="cad_assembly_1_drive" joint="cad_joint_1"' in generated
+        assert '<velocity name="cad_assembly_2_manual_drive" joint="cad_joint_2"' in generated
+        assert '<velocity name="cad_assembly_3_manual_drive" joint="cad_joint_3"' in generated
         assert 'cad_part_2' in generated  # blade shares the weapon joint
         model = ET.fromstring(generated)
         assert abs(float(model.find("option").attrib["timestep"]) - 0.0004) < 1e-12
         assert model.find(".//motor[@name='cad_assembly_2_drive']") is not None
         assert model.find(".//motor[@name='cad_assembly_3_drive']") is not None
-        assert model.find(".//velocity[@name='cad_assembly_1_drive']") is not None
+        assert model.find(".//motor[@name='cad_assembly_1_drive']") is not None
         east_wall = model.find(".//geom[@name='east_wall']")
         assert east_wall is not None
         assert east_wall.attrib["pos"].split()[0] == "1.05"
