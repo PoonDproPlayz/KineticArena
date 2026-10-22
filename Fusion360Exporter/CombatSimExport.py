@@ -21,6 +21,14 @@ def _safe_name(value):
     return value or "Part"
 
 
+def _mesh_filename(index, part_name):
+    # Fusion occurrence paths can be hundreds of characters deep. Keep the
+    # physical mesh path short; occurrencePath in the manifest still carries
+    # the complete assembly tree for the editor.
+    short_name = _safe_name(part_name)[:64].rstrip("._") or "Part"
+    return "Parts/{:04d}_{}.stl".format(index, short_name)
+
+
 def _unit_to_meters(unit_name):
     unit = str(unit_name).lower().replace('"', "").strip()
     table = {
@@ -298,8 +306,7 @@ def _append_part(parts, export_manager, body, body_name, occurrence_path,
     if not body.isSolid:
         return
     part_name = body.name
-    path_folder = "/".join(_safe_name(name) for name in occurrence_path) or "Root"
-    filename = "Parts/{}/{:04d}_{}.stl".format(path_folder, index, _safe_name(part_name))
+    filename = _mesh_filename(index, part_name)
     filepath = os.path.join(folder, filename.replace("/", os.sep))
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     _export_body(export_manager, body, filepath, units, unit_to_meters)

@@ -41,8 +41,9 @@ The 0.4 ms model timestep is independent of display frame rate. The app opens
 to a Home screen with **Practice drive**, **Configure bot**, and **Controller
 mixing** buttons; a persistent top navigation bar switches between Home,
 Drive, and Bot workshop. Drive also has a **Controller mixer** button.
-W/S drive, A/D turn, and Space spins the weapon; a gamepad uses the left stick
-and left shoulder or south button. Controller mixing opens a setup window for
+W/S drive and A/D turn the main bot; Space spins its weapon. I/K drive and J/L
+turn the opponent; M spins its weapon. A gamepad uses the left stick and left
+shoulder or south button to control the main bot. Controller mixing opens a setup window for
 raw USB joysticks, up to 16 configurable axis/button input channels, and a
 mix for each drive motor group and weapon. Each input mix line has editable
 weight, offset, and expo; the response graph follows the selected live channel
@@ -59,7 +60,9 @@ and left/right side averages. Weapon motor configuration is in Bot workshop;
 when enabled, its RPM comes from the motor model and assembly inertia. Each
 driven wheel also reports **GRIP**, **SLIPPING**,
 or **AIRBORNE**, with measured tread speed relative to the floor at its contact
-patch. Drag the Drive sidebar's right edge to reveal more of its fixed-size
+patch. Torque-mode wheel commands ramp to a new target over 0.30 seconds to
+reduce abrupt launch and reversal loads; the manual wheel RPM override remains
+direct. Drag the Drive sidebar's right edge to reveal more of its fixed-size
 content. The Bot workshop divider does the same for the setup panel beside the
 robot preview. Text wrapping and control widths stay fixed as either panel is
 resized; narrow panels clip content until widened. The layout updates when the
@@ -73,10 +76,11 @@ speed penetration without spending four times more simulation work per second.
 ### Bot-specific motor torque
 
 In the Drive tab, full throttle now uses each side's motor-derived no-load
-wheel speed, calculated from `Kv x battery voltage / gear ratio`. The displayed
-estimate comes from the motor and battery inputs; loaded RPM then emerges from
-the torque model and simulated wheel load. If a side has no motor model, the
-legacy 424 RPM target is used and the UI says motor data is missing.
+wheel speed, calculated from Kv or the motor's RPM-at-voltage rating, the pack
+voltage, and the gearbox ratio. The displayed estimate comes from the motor and
+battery inputs; loaded RPM then emerges from the torque model and simulated
+wheel load. If a side has no motor model, the legacy 424 RPM target is used and
+the UI says motor data is missing.
 
 For a forced-speed check, enable **Manual wheel RPM override** and enter a
 target such as 4000 RPM. That uses a separate speed servo and bypasses the
@@ -87,24 +91,33 @@ In **Bot workshop**, open **Drive motor settings** and assign wheel assemblies
 to a motor group. Wheels driven by the same physical motor use the same group;
 the group's torque is divided evenly across those wheel assemblies. Enable the
 wheel torque model for the group, then enter the total number of motors in that
-group and each motor's Kv
-(RPM/V), and peak current per motor (A), plus the robot battery pack's nominal
-voltage. Those are the core inputs. Kv gives the speed/torque constant, so the
-simulator estimates motor torque from current and converts it through the
-configured gear ratio. The same Kv, pack voltage, and gear ratio determine the
-displayed no-load output RPM. Phase-to-phase resistance and an ESC phase-current cap
-are optional; leave either at 0 if unknown. The model then uses a current-
-limited linear motor curve. Peak current is treated as torque-producing motor
-current. The simulator does not model winding temperature or reduce torque
-after a peak-current burst, so it can sustain the peak torque indefinitely. A
-catalog value that means battery input current is only an approximation.
+group and each motor's peak current per motor (A), plus the robot battery
+pack's nominal voltage. Choose **Brushless (BLDC)** or **Brushed DC**, then
+enter either Kv (RPM/V) or a published motor speed and its test voltage. The
+RPM-at-voltage option is treated as no-load speed and scaled with pack voltage;
+use a no-load rating when the manufacturer provides one. Both forms derive the
+same equivalent speed/torque constant for the model. Phase-to-phase resistance
+for brushless motors, armature resistance for brushed motors, and the motor
+controller's current limit are optional; leave unknown values at 0. Without a
+resistance value, the simulator uses a current-limited approximate motor curve.
+Peak current is treated as torque-producing motor current. The simulator does
+not model winding temperature or reduce torque after a peak-current burst, so
+it can sustain the peak torque indefinitely. A catalog value that means
+battery input current is only an approximation.
+
+The **Drive layout** selector supports 2WD and 4WD. In 2WD, choose the front or
+rear axle; only that axle's left and right wheel assemblies enter MuJoCo. The
+other axle's assignments and motor settings remain saved, and switching back
+to 4WD restores the stored assemblies. Each wheel assembly has a **Wheel
+position** field so imported or custom layouts can be assigned to the correct
+axle.
 
 The **Weapon motor settings** section configures motors for weapon assemblies.
-Enter motor count, Kv, peak current, battery voltage, and gearing. With its
-torque model enabled, holding the weapon control applies motor torque; the
-imported assembly inertia determines acceleration and spin-up. The displayed
-no-load RPM is `Kv x battery voltage / gear ratio`. Releasing the control
-removes motor drive and the weapon coasts under simulated mechanical losses.
+Enter motor count, speed data (Kv or RPM at voltage), peak current, battery
+voltage, and gearing. With its torque model enabled, holding the weapon control
+applies motor torque; the imported assembly inertia determines acceleration
+and spin-up. Releasing the control removes motor drive and the weapon coasts
+under simulated mechanical losses.
 With the model disabled, the existing target-RPM and spin-up controls remain
 available. Bot workshop and Drive show an estimated 0-to-90% no-load spin-up
 time calculated from the motor torque curve and the weapon's inertia about its
@@ -176,8 +189,10 @@ continues to use the legacy prescribed-speed actuator.
    field; enter a manual weight there or press **Use Fusion** to restore its
    exported value. The main window reports left and right wheel-joint counts;
    turning in place requires at least one drive assembly on each side.
-   Wheel-axis signs are normalized so a fitted hole normal pointing either
-   direction still produces the expected forward/reverse motion.
+    Wheel-axis signs are normalized so a fitted hole normal pointing either
+    direction still produces the expected forward/reverse motion. CAD spawn
+    heading is inferred from the assigned left/right wheel layout so the
+    player faces the opponent and an imported opponent faces the player.
 
 The app writes `combatsim_generated.xml` beside the manifest when previewing.
 Included bodies require a positive mass. Rotating assemblies combine each
@@ -225,4 +240,14 @@ run:
 
 This generates the model beside the manifest, disables arena and opponent
 collisions for the test, then reports chassis yaw, each wheel's RPM, and its
-floor grip/slip status after one simulated second.
+floor grip/slip status after one simulated second. It also reports chassis and
+fork floor contacts during the settling and powered portions separately.
+
+Main-frame geoms, fixed structural parts, and gravity-hinged or named fork
+geoms use an overdamped MuJoCo floor-contact response (`solref="0.02 2"`).
+MuJoCo applies this through explicit floor-only contact pairs, preserving the
+normal response for bot-to-bot impacts. Each part keeps its collision toggle;
+the editable friction estimate is retained for fork contacts and the regular
+floor friction mix is retained for the chassis. Assign forks to a gravity-
+driven module when the real fork can pivot; leave them on the frame when they
+are fixed.

@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <locale>
@@ -25,6 +26,47 @@ using json = nlohmann::json;
 using Vec3 = std::array<double, 3>;
 using Quat = std::array<double, 4>;
 using Mat3 = std::array<double, 9>;
+
+std::filesystem::path NativePath(const std::filesystem::path& value) {
+#if defined(_WIN32)
+  const auto original = value.native();
+  if (original.rfind(L"\\\\?\\", 0) == 0) return value.lexically_normal();
+  auto absolute = std::filesystem::absolute(value).lexically_normal();
+  const auto native = absolute.native();
+  if (native.rfind(L"\\\\?\\", 0) == 0) return absolute;
+  if (native.rfind(L"\\\\", 0) == 0)
+    return std::filesystem::path(L"\\\\?\\UNC\\" + native.substr(2));
+  return std::filesystem::path(L"\\\\?\\" + native);
+#else
+  return value;
+#endif
+}
+
+std::string AssetPath(const std::filesystem::path& value) {
+#if defined(_WIN32)
+  return value.u8string();
+#else
+  return value.generic_string();
+#endif
+}
+
+std::string AssetReference(const std::filesystem::path& value,
+                           const std::filesystem::path& bundle_root) {
+  const auto relative = value.lexically_relative(bundle_root);
+  if (relative.empty() || *relative.begin() == "..") return AssetPath(value);
+  return relative.generic_u8string();
+}
+
+std::string MeshCacheId(const std::filesystem::path& manifest) {
+  std::ostringstream bundle_id;
+  bundle_id << std::hex << std::hash<std::string>{}(manifest.u8string());
+  return bundle_id.str();
+}
+
+std::filesystem::path ShortMeshCachePath(const std::filesystem::path& cache_root,
+                                         size_t index) {
+  return cache_root / ("mesh_" + std::to_string(index) + ".stl");
+}
 
 Vec3 Add(Vec3 a, Vec3 b) { return {a[0]+b[0], a[1]+b[1], a[2]+b[2]}; }
 Vec3 Sub(Vec3 a, Vec3 b) { return {a[0]-b[0], a[1]-b[1], a[2]-b[2]}; }
@@ -141,7 +183,7 @@ void DrawGearRatioInput(int key, MotorSpec& motor) {
     motor.gear_ratio_text = buffer.data();
     last_valid = motor.gear_ratio_text;
   } else {
-    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f),
+    ImGui::TextColored(ImVec4(1.00f, 0.42f, 0.44f, 1.0f),
                        "Use positive input:output values, such as 16:1 or 3:2.");
   }
 }
@@ -176,6 +218,66 @@ AssemblyKind ParseKind(const std::string& kind) {
   if (kind == "Gravity fork") return AssemblyKind::GravityFork;
   return AssemblyKind::Fixed;
 }
+bool IsWheelKind(AssemblyKind kind) {
+  return kind == AssemblyKind::LeftWheel || kind == AssemblyKind::RightWheel;
+}
+const char* MotorTypeLabel(MotorType type) {
+  return type == MotorType::Brushed ? "Brushed DC" : "Brushless (BLDC)";
+}
+MotorType ParseMotorType(const std::string& type) {
+  return type == "brushed" ? MotorType::Brushed : MotorType::Brushless;
+}
+const char* MotorTypeKey(MotorType type) {
+  return type == MotorType::Brushed ? "brushed" : "brushless";
+}
+const char* MotorSpeedInputLabel(MotorSpeedInput input) {
+  return input == MotorSpeedInput::RatedRpmAtVoltage ? "Rated RPM at voltage" : "Kv (RPM/V)";
+}
+MotorSpeedInput ParseMotorSpeedInput(const std::string& input) {
+  return input == "ratedRpmAtVoltage" ? MotorSpeedInput::RatedRpmAtVoltage : MotorSpeedInput::Kv;
+}
+const char* MotorSpeedInputKey(MotorSpeedInput input) {
+  return input == MotorSpeedInput::RatedRpmAtVoltage ? "ratedRpmAtVoltage" : "kv";
+}
+void DrawMotorSpeedInputs(int id, MotorSpec& motor) {
+  ImGui::PushID(id);
+  if (ImGui::BeginCombo("Motor type", MotorTypeLabel(motor.type))) {
+    for (const auto type : {MotorType::Brushless, MotorType::Brushed})
+      if (ImGui::Selectable(MotorTypeLabel(type), motor.type == type)) motor.type = type;
+    ImGui::EndCombo();
+  }
+  if (ImGui::BeginCombo("Speed specification", MotorSpeedInputLabel(motor.speed_input))) {
+    for (const auto input : {MotorSpeedInput::Kv, MotorSpeedInput::RatedRpmAtVoltage})
+      if (ImGui::Selectable(MotorSpeedInputLabel(input), motor.speed_input == input))
+        motor.speed_input = input;
+    ImGui::EndCombo();
+  }
+  if (motor.speed_input == MotorSpeedInput::RatedRpmAtVoltage) {
+    DrawMotorDoubleInput("Motor speed (RPM)", &motor.rated_rpm, 10.0, 100.0, "%.0f");
+    DrawMotorDoubleInput("Speed rating voltage (V)", &motor.rated_voltage,
+                         0.1, 1.0, "%.2f");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Enter the motor's published speed and its test voltage. The simulator treats this as no-load speed and scales it with pack voltage.");
+  } else {
+    DrawMotorDoubleInput("Motor Kv (RPM/V)", &motor.kv_rpm_per_volt,
+                         1.0, 10.0, "%.1f");
+  }
+  ImGui::PopID();
+}
+const char* MotorResistanceLabel(MotorType type) {
+  return type == MotorType::Brushed ? "Armature resistance (mOhm)" :
+    "Phase-to-phase resistance (mOhm)";
+}
+const char* MotorCurrentLimitLabel(MotorType type) {
+  return type == MotorType::Brushed ? "Motor controller current limit per motor (A)" :
+    "ESC phase-current limit per motor (A)";
+}
+std::string Lower(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
 void Include(Vec3 point, Vec3& low, Vec3& high) {
   for (int i = 0; i < 3; ++i) { low[i] = std::min(low[i], point[i]); high[i] = std::max(high[i], point[i]); }
 }
@@ -191,6 +293,17 @@ bool FlexiblePartPath(const CadPart& part) {
   };
   if (has_flexible_name(part.name)) return true;
   return std::any_of(part.occurrence_path.begin(), part.occurrence_path.end(), has_flexible_name);
+}
+bool ForkPartPath(const CadPart& part) {
+  auto has_fork_name = [](const std::string& name) {
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    return lower.find("fork") != std::string::npos;
+  };
+  if (has_fork_name(part.name)) return true;
+  return std::any_of(part.occurrence_path.begin(), part.occurrence_path.end(), has_fork_name);
 }
 Mat3 UnpackTensor(const std::array<double, 6>& p) {
   return {p[0], p[3], p[4], p[3], p[1], p[5], p[4], p[5], p[2]};
@@ -412,7 +525,10 @@ double DistanceToLoop(const std::vector<Vec3>& loop, Vec3 hit) {
 struct MassProperties { double mass = 0; Vec3 center{}; Mat3 inertia{}; };
 MassProperties GroupMass(const std::vector<CadPart>& parts, int assembly, Vec3 origin) {
   MassProperties result;
-  for (const auto& part : parts) if (part.assembly == assembly && ValidMass(part.mass)) {
+  const auto included = [assembly](const CadPart& part) {
+    return assembly == -2 ? part.assembly >= 0 : part.assembly == assembly;
+  };
+  for (const auto& part : parts) if (included(part) && ValidMass(part.mass)) {
     const Vec3 center = part.has_fusion_center_of_mass ?
       part.center_of_mass : Mul(Add(part.min_bound, part.max_bound), 0.5);
     result.center = Add(result.center, Mul(center, part.mass));
@@ -421,7 +537,7 @@ MassProperties GroupMass(const std::vector<CadPart>& parts, int assembly, Vec3 o
   if (result.mass <= 0) return result;
   result.center = Mul(result.center, 1.0 / result.mass);
   const Vec3 inertia_center = result.center;
-  for (const auto& part : parts) if (part.assembly == assembly && ValidMass(part.mass)) {
+  for (const auto& part : parts) if (included(part) && ValidMass(part.mass)) {
     const Vec3 center = part.has_fusion_center_of_mass ?
       part.center_of_mass : Mul(Add(part.min_bound, part.max_bound), 0.5);
     const Vec3 offset = Sub(center, inertia_center);
@@ -447,6 +563,39 @@ MassProperties GroupMass(const std::vector<CadPart>& parts, int assembly, Vec3 o
   result.center = Sub(result.center, origin);
   return result;
 }
+Vec3 NativeDriveHeading(const std::vector<CadPart>& parts,
+                        const std::vector<CadAssembly>& assemblies,
+                        const FusionBundle& bundle) {
+  Vec3 left_center{}, right_center{};
+  int left_count = 0, right_count = 0;
+  for (size_t group = 1; group < assemblies.size(); ++group) {
+    if (!bundle.AssemblyEnabled(int(group))) continue;
+    const auto& assembly = assemblies[group];
+    if (GroupMass(parts, int(group), assembly.pivot).mass <= 0.0) continue;
+    if (assembly.kind == AssemblyKind::LeftWheel) {
+      left_center = Add(left_center, assembly.pivot);
+      ++left_count;
+    } else if (assembly.kind == AssemblyKind::RightWheel) {
+      right_center = Add(right_center, assembly.pivot);
+      ++right_count;
+    }
+  }
+  if (left_count == 0 || right_count == 0) return {1, 0, 0};
+  left_center = Mul(left_center, 1.0 / left_count);
+  right_center = Mul(right_center, 1.0 / right_count);
+  Vec3 lateral = Sub(right_center, left_center);
+  lateral[2] = 0.0;
+  Vec3 heading = Cross({0, 0, 1}, lateral);
+  heading[2] = 0.0;
+  const double length = Length(heading);
+  if (length <= 1e-6) return {1, 0, 0};
+  return Mul(heading, 1.0 / length);
+}
+Quat FacingQuaternion(Vec3 local_heading, double target_yaw) {
+  const double local_yaw = std::atan2(local_heading[1], local_heading[0]);
+  const double yaw = target_yaw - local_yaw;
+  return {std::cos(yaw * 0.5), 0, 0, std::sin(yaw * 0.5)};
+}
 double MomentAboutAxis(const MassProperties& properties, Vec3 axis) {
   const double axis_length = Length(axis);
   if (!std::isfinite(axis_length) || axis_length <= 1e-10 || properties.mass <= 0.0)
@@ -464,18 +613,31 @@ double MomentAboutAxis(const MassProperties& properties, Vec3 axis) {
 }
 }
 
+double MotorKvRpmPerVolt(const MotorSpec& motor) {
+  if (motor.speed_input == MotorSpeedInput::RatedRpmAtVoltage) {
+    if (!std::isfinite(motor.rated_rpm) || motor.rated_rpm <= 0.0 ||
+        !std::isfinite(motor.rated_voltage) || motor.rated_voltage <= 0.0)
+      return 0.0;
+    return motor.rated_rpm / motor.rated_voltage;
+  }
+  return std::isfinite(motor.kv_rpm_per_volt) && motor.kv_rpm_per_volt > 0.0
+    ? motor.kv_rpm_per_volt : 0.0;
+}
+
 double MotorNoLoadOutputRpm(const MotorSpec& motor, double battery_voltage) {
+  const double kv = MotorKvRpmPerVolt(motor);
   if (!motor.enabled || !std::isfinite(battery_voltage) || battery_voltage <= 0.0 ||
-      !std::isfinite(motor.kv_rpm_per_volt) || motor.kv_rpm_per_volt <= 0.0 ||
+      kv <= 0.0 ||
       !std::isfinite(motor.gear_ratio) || motor.gear_ratio <= 0.0)
     return 0.0;
-  return motor.kv_rpm_per_volt * battery_voltage / motor.gear_ratio;
+  return kv * battery_voltage / motor.gear_ratio;
 }
 
 double MotorOutputTorque(const MotorSpec& motor, double battery_voltage,
                          double desired_output_speed, double actual_output_speed) {
+  const double kv = MotorKvRpmPerVolt(motor);
   if (!motor.enabled || !std::isfinite(battery_voltage) || battery_voltage <= 0.0 ||
-      !std::isfinite(motor.kv_rpm_per_volt) || motor.kv_rpm_per_volt <= 0.0 ||
+      kv <= 0.0 ||
       !std::isfinite(motor.peak_current_a) || motor.peak_current_a <= 0.0 ||
       !std::isfinite(motor.phase_resistance_ohm) || motor.phase_resistance_ohm < 0.0 ||
       !std::isfinite(motor.esc_current_limit_a) || motor.esc_current_limit_a < 0.0 ||
@@ -484,7 +646,7 @@ double MotorOutputTorque(const MotorSpec& motor, double battery_voltage,
       motor.gearbox_efficiency > 1.0 || motor.motor_count <= 0 ||
       !std::isfinite(desired_output_speed) || !std::isfinite(actual_output_speed)) return 0.0;
   constexpr double pi = 3.14159265358979323846;
-  const double motor_speed_constant = motor.kv_rpm_per_volt * 2.0 * pi / 60.0;
+  const double motor_speed_constant = kv * 2.0 * pi / 60.0;
   const double motor_no_load_speed = motor_speed_constant * battery_voltage;
   if (motor_no_load_speed <= 0.0) return 0.0;
   const double output_no_load_speed = motor_no_load_speed / motor.gear_ratio;
@@ -536,17 +698,52 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
       throw std::runtime_error("Manifest has no parts array.");
     std::vector<CadPart> loaded;
     std::vector<std::string> missing;
-    const auto folder = std::filesystem::weakly_canonical(manifest.parent_path());
+    const auto folder = std::filesystem::weakly_canonical(NativePath(manifest.parent_path()));
     const double default_scale = source.value("unitToMeters", 0.001);
     for (const auto& item : source.at("parts")) {
       CadPart part;
       part.file = item.at("file").get<std::string>();
-      const auto path = std::filesystem::weakly_canonical(folder / std::filesystem::path(part.file));
-      const auto relative = path.lexically_relative(folder);
-      if (relative.empty() || *relative.begin() == ".." || path.extension() != ".stl")
+      const std::filesystem::path relative_file(part.file);
+      if (relative_file.empty() || relative_file.is_absolute() ||
+          relative_file.has_root_name() || relative_file.has_root_directory())
         throw std::runtime_error("Unsafe or unsupported mesh path: " + part.file);
-      if (!std::filesystem::is_regular_file(path)) { missing.push_back(part.file); continue; }
-      part.absolute_file = path;
+      const auto normalized_relative = relative_file.lexically_normal();
+      if (normalized_relative.empty() || *normalized_relative.begin() == "..")
+        throw std::runtime_error("Unsafe or unsupported mesh path: " + part.file);
+      const auto resolved_path = std::filesystem::weakly_canonical(
+        NativePath(folder / normalized_relative));
+      const auto relative = resolved_path.lexically_relative(folder);
+      if (relative.empty() || *relative.begin() == ".." || resolved_path.extension() != ".stl")
+        throw std::runtime_error("Unsafe or unsupported mesh path: " + part.file);
+      // weakly_canonical strips the Win32 extended-length prefix, so restore it
+      // before filesystem checks and all later STL reads.
+      const auto native_path = NativePath(resolved_path);
+      if (!std::filesystem::is_regular_file(native_path)) {
+        missing.push_back(part.file); continue;
+      }
+      part.absolute_file = resolved_path;
+#if defined(_WIN32)
+      if (resolved_path.native().size() > 240) {
+        const auto cache_id = MeshCacheId(manifest);
+        auto cached_path = ShortMeshCachePath(
+          folder / "Parts" / "_CombatSimCache" / cache_id, loaded.size());
+        try {
+          std::filesystem::create_directories(cached_path.parent_path());
+          std::filesystem::copy_file(native_path, cached_path,
+            std::filesystem::copy_options::overwrite_existing);
+        } catch (const std::filesystem::filesystem_error&) {
+          // Read-only bundles can still be imported; keep their copied meshes
+          // in the user's short system temp directory for this session.
+          cached_path = ShortMeshCachePath(
+            std::filesystem::temp_directory_path() / "CombatSim" / cache_id,
+            loaded.size());
+          std::filesystem::create_directories(cached_path.parent_path());
+          std::filesystem::copy_file(native_path, cached_path,
+            std::filesystem::copy_options::overwrite_existing);
+        }
+        part.absolute_file = cached_path;
+      }
+#endif
       part.name = item.value("partName", std::string("Part"));
       part.material = item.value("materialName", std::string("Unknown"));
       part.appearance = item.value("appearanceName", std::string());
@@ -606,7 +803,8 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
       }
       if (item.contains("colorRgba") && item.at("colorRgba").is_array())
         part.color = ReadArray<4>(item, "colorRgba", part.color);
-      ReadStlBounds(path, part.scale, part.position, part.rotation, part.min_bound, part.max_bound);
+      ReadStlBounds(part.absolute_file, part.scale, part.position, part.rotation,
+                    part.min_bound, part.max_bound);
       loaded.push_back(std::move(part));
     }
     if (!missing.empty()) {
@@ -622,6 +820,10 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
                                     {"Rear left wheel", AssemblyKind::LeftWheel, {}, {0, 1, 0}},
                                     {"Front right wheel", AssemblyKind::RightWheel, {}, {0, 1, 0}},
                                     {"Rear right wheel", AssemblyKind::RightWheel, {}, {0, 1, 0}}};
+    groups[2].wheel_position = "front";
+    groups[3].wheel_position = "rear";
+    groups[4].wheel_position = "front";
+    groups[5].wheel_position = "rear";
     int default_drive_group = 0;
     for (size_t i = 1; i < groups.size(); ++i) {
       if (groups[i].kind == AssemblyKind::LeftWheel ||
@@ -632,12 +834,20 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
     }
     const auto saved = folder / "combatsim_setup.json";
     battery_voltage_ = 0.0;
+    drive_layout_ = DriveLayout::FourWheel;
+    two_wd_axle_ = "front";
     int saved_axis_assembly = 1;
+    bool saved_drive_layout_defined = false;
     if (std::filesystem::is_regular_file(saved)) {
       std::ifstream state_stream(saved);
       const json state = json::parse(state_stream);
       saved_axis_assembly = state.value("axisAssembly", 1);
       battery_voltage_ = state.value("batteryVoltage", 0.0);
+      const std::string saved_drive_layout = state.value("driveLayout", std::string());
+      saved_drive_layout_defined = !saved_drive_layout.empty();
+      drive_layout_ = saved_drive_layout == "2WD" ? DriveLayout::TwoWheel :
+        saved_drive_layout == "4WD" ? DriveLayout::FourWheel : DriveLayout::FourWheel;
+      two_wd_axle_ = state.value("twoWdAxle", std::string("front")) == "rear" ? "rear" : "front";
       if (state.contains("assemblies") && state.at("assemblies").is_array()) {
         groups.resize(1);
         std::set<int> used_drive_groups;
@@ -649,19 +859,26 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
           group.axis = ReadArray<3>(node, "axis", {0, 1, 0});
           group.fork_range_degrees = ReadArray<2>(node, "forkRangeDegrees", {-90, 90});
           group.fork_collides_with_frame = node.value("forkCollidesWithFrame", true);
+          group.wheel_position = node.value("wheelPosition", std::string());
           bool has_saved_drive_group = false;
           if (node.contains("motor") && node.at("motor").is_object()) {
             const auto& motor = node.at("motor");
             group.motor.enabled = motor.value("enabled", false);
+            group.motor.type = ParseMotorType(motor.value("motorType", std::string("brushless")));
+            group.motor.speed_input = ParseMotorSpeedInput(
+              motor.value("speedInput", std::string("kv")));
             if (motor.contains("driveGroup")) {
               group.motor.drive_group = motor.value("driveGroup", -1);
               has_saved_drive_group = true;
             }
             group.motor.motor_count = motor.value("motorCount", 1);
             group.motor.kv_rpm_per_volt = motor.value("kvRpmPerVolt", 0.0);
+            group.motor.rated_rpm = motor.value("ratedRpm", 0.0);
+            group.motor.rated_voltage = motor.value("ratedVoltage", 0.0);
             group.motor.peak_current_a = motor.value(
               "peakCurrentA", motor.value("ratedCurrentA", 0.0));
-            group.motor.phase_resistance_ohm = motor.value("phaseResistanceOhm", 0.0);
+            group.motor.phase_resistance_ohm = motor.value(
+              "armatureResistanceOhm", motor.value("phaseResistanceOhm", 0.0));
             group.motor.esc_current_limit_a = motor.value("escCurrentLimitA", 0.0);
             if (motor.contains("gearRatio") && motor.at("gearRatio").is_string()) {
               group.motor.gear_ratio_text = motor.at("gearRatio").get<std::string>();
@@ -708,6 +925,32 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
         }
       }
     }
+    // Keep legacy wheel sets usable: infer axle position from old assembly names,
+    // then assign stable front/rear roles to any remaining side wheel groups.
+    for (const AssemblyKind side : {AssemblyKind::LeftWheel, AssemblyKind::RightWheel}) {
+      std::vector<int> wheel_groups;
+      for (size_t i = 1; i < groups.size(); ++i) {
+        if (groups[i].kind != side) continue;
+        wheel_groups.push_back(int(i));
+        if (!groups[i].wheel_position.empty()) continue;
+        const std::string lower_name = Lower(groups[i].name);
+        if (lower_name.find("front") != std::string::npos) groups[i].wheel_position = "front";
+        else if (lower_name.find("rear") != std::string::npos) groups[i].wheel_position = "rear";
+      }
+      for (size_t ordinal = 0; ordinal < wheel_groups.size(); ++ordinal) {
+        auto& group = groups[wheel_groups[ordinal]];
+        if (!group.wheel_position.empty()) continue;
+        if (wheel_groups.size() == 1) group.wheel_position = "single";
+        else if (ordinal == 0) group.wheel_position = "front";
+        else if (ordinal == 1) group.wheel_position = "rear";
+        else group.wheel_position = "other";
+      }
+    }
+    if (!saved_drive_layout_defined) {
+      size_t wheel_groups = 0;
+      for (size_t i = 1; i < groups.size(); ++i) if (IsWheelKind(groups[i].kind)) ++wheel_groups;
+      drive_layout_ = wheel_groups <= 2 ? DriveLayout::TwoWheel : DriveLayout::FourWheel;
+    }
     for (auto& part : loaded) if (part.assembly < -1 || part.assembly >= int(groups.size())) part.assembly = 0;
     manifest_ = std::filesystem::weakly_canonical(manifest);
     design_name_ = source.value("designName", std::string("Fusion bot"));
@@ -720,11 +963,12 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
     pick_message_.clear(); axis_points_.clear(); axis_picking_ = false;
     axis_assembly_ = (saved_axis_assembly > 0 &&
                       saved_axis_assembly < int(assemblies_.size()) &&
-                      assemblies_[saved_axis_assembly].kind != AssemblyKind::Fixed) ?
+                      assemblies_[saved_axis_assembly].kind != AssemblyKind::Fixed &&
+                      AssemblyEnabled(saved_axis_assembly)) ?
       saved_axis_assembly : 0;
     if (axis_assembly_ == 0) {
       for (size_t i = 1; i < assemblies_.size(); ++i)
-        if (assemblies_[i].kind != AssemblyKind::Fixed) {
+        if (assemblies_[i].kind != AssemblyKind::Fixed && AssemblyEnabled(int(i))) {
           axis_assembly_ = int(i);
           break;
         }
@@ -733,12 +977,114 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
   } catch (const std::exception& e) { error_ = e.what(); return false; }
 }
 
+bool FusionBundle::AssemblyEnabled(int assembly) const {
+  if (assembly <= 0 || assembly >= int(assemblies_.size())) return false;
+  const auto& group = assemblies_[assembly];
+  if (!IsWheelKind(group.kind) || drive_layout_ == DriveLayout::FourWheel) return true;
+  int selected_axle_group = -1;
+  int single_group = -1;
+  for (size_t i = 1; i < assemblies_.size(); ++i) {
+    if (assemblies_[i].kind != group.kind) continue;
+    if (assemblies_[i].wheel_position == two_wd_axle_ && selected_axle_group < 0)
+      selected_axle_group = int(i);
+    else if (assemblies_[i].wheel_position == "single" && single_group < 0)
+      single_group = int(i);
+  }
+  return assembly == (selected_axle_group >= 0 ? selected_axle_group : single_group);
+}
+
+bool FusionBundle::PartIncludedInSimulation(int part_index) const {
+  if (part_index < 0 || part_index >= int(parts_.size())) return false;
+  const int assembly = parts_[part_index].assembly;
+  return assembly == 0 || AssemblyEnabled(assembly);
+}
+
+void FusionBundle::SetTwoWheelDriveAxle(const std::string& axle) {
+  two_wd_axle_ = axle == "rear" ? "rear" : "front";
+  if (axis_assembly_ > 0 && axis_assembly_ < int(assemblies_.size()) &&
+      AssemblyEnabled(axis_assembly_)) return;
+  axis_picking_ = false;
+  axis_points_.clear();
+  hovered_loop_.clear();
+  axis_assembly_ = 0;
+  for (size_t i = 1; i < assemblies_.size(); ++i) {
+    if (assemblies_[i].kind != AssemblyKind::Fixed && AssemblyEnabled(int(i))) {
+      axis_assembly_ = int(i);
+      break;
+    }
+  }
+}
+
+void FusionBundle::SetWheelDriveLayout(DriveLayout layout) {
+  if (layout == DriveLayout::TwoWheel) {
+    drive_layout_ = layout;
+    if (axis_assembly_ <= 0 || axis_assembly_ >= int(assemblies_.size()) ||
+        !AssemblyEnabled(axis_assembly_)) SetTwoWheelDriveAxle(two_wd_axle_);
+    return;
+  }
+  for (const auto side : {AssemblyKind::LeftWheel, AssemblyKind::RightWheel}) {
+    std::vector<int> side_groups;
+    bool have_front = false, have_rear = false;
+    for (size_t i = 1; i < assemblies_.size(); ++i) {
+      if (assemblies_[i].kind != side) continue;
+      side_groups.push_back(int(i));
+      have_front = have_front || assemblies_[i].wheel_position == "front";
+      have_rear = have_rear || assemblies_[i].wheel_position == "rear";
+    }
+    for (int index : side_groups) {
+      auto& group = assemblies_[index];
+      if (group.wheel_position == "single") {
+        group.wheel_position = two_wd_axle_;
+        have_front = have_front || group.wheel_position == "front";
+        have_rear = have_rear || group.wheel_position == "rear";
+      }
+    }
+    if (side_groups.empty()) {
+      CadAssembly wheel;
+      wheel.kind = side;
+      wheel.name = side == AssemblyKind::LeftWheel ? "Left wheel" : "Right wheel";
+      wheel.wheel_position = two_wd_axle_;
+      wheel.motor.drive_group = 0;
+      assemblies_.push_back(wheel);
+      side_groups.push_back(int(assemblies_.size()) - 1);
+      have_front = two_wd_axle_ == "front";
+      have_rear = two_wd_axle_ == "rear";
+    }
+    if (!have_front || !have_rear) {
+      const std::string missing_position = !have_front ? "front" : "rear";
+      CadAssembly wheel;
+      wheel.kind = side;
+      wheel.wheel_position = missing_position;
+      wheel.name = (missing_position == "front" ? "Front " : "Rear ") +
+        std::string(side == AssemblyKind::LeftWheel ? "left wheel" : "right wheel");
+      int drive_group = 0;
+      for (size_t i = 1; i < assemblies_.size(); ++i)
+        if (IsWheelKind(assemblies_[i].kind))
+          drive_group = std::max(drive_group, assemblies_[i].motor.drive_group + 1);
+      wheel.motor.drive_group = std::min(drive_group, 7);
+      assemblies_.push_back(wheel);
+    }
+  }
+  drive_layout_ = DriveLayout::FourWheel;
+  if (axis_assembly_ <= 0 || axis_assembly_ >= int(assemblies_.size()) ||
+      assemblies_[axis_assembly_].kind == AssemblyKind::Fixed) {
+    axis_assembly_ = 0;
+    for (size_t i = 1; i < assemblies_.size(); ++i)
+      if (assemblies_[i].kind != AssemblyKind::Fixed) {
+        axis_assembly_ = int(i);
+        break;
+      }
+  }
+}
+
 bool FusionBundle::Save() {
   try {
     if (!HasBundle()) throw std::runtime_error("Load a Fusion manifest first.");
     json state;
     state["schemaVersion"] = 1;
     state["designName"] = design_name_;
+    state["driveLayout"] = drive_layout_ == DriveLayout::TwoWheel ? "2WD" : "4WD";
+    state["twoWdAxle"] = two_wd_axle_;
     state["axisAssembly"] = axis_assembly_;
     state["batteryVoltage"] = battery_voltage_;
     state["assemblies"] = json::array();
@@ -748,13 +1094,19 @@ bool FusionBundle::Save() {
                                       {"pivotMeters", g.pivot}, {"axis", g.axis},
                                       {"forkRangeDegrees", g.fork_range_degrees},
                                       {"forkCollidesWithFrame", g.fork_collides_with_frame},
+                                      {"wheelPosition", g.wheel_position},
                                       {"motor", {
                                         {"enabled", g.motor.enabled},
+                                        {"motorType", MotorTypeKey(g.motor.type)},
+                                        {"speedInput", MotorSpeedInputKey(g.motor.speed_input)},
                                         {"driveGroup", g.motor.drive_group},
                                         {"motorCount", g.motor.motor_count},
                                         {"kvRpmPerVolt", g.motor.kv_rpm_per_volt},
+                                        {"ratedRpm", g.motor.rated_rpm},
+                                        {"ratedVoltage", g.motor.rated_voltage},
                                         {"peakCurrentA", g.motor.peak_current_a},
                                         {"phaseResistanceOhm", g.motor.phase_resistance_ohm},
+                                        {"armatureResistanceOhm", g.motor.phase_resistance_ohm},
                                         {"escCurrentLimitA", g.motor.esc_current_limit_a},
                                         {"gearRatio", g.motor.gear_ratio_text},
                                         {"gearboxEfficiency", g.motor.gearbox_efficiency}}}});
@@ -781,6 +1133,13 @@ int FusionBundle::ForkCount() const {
   return int(std::count_if(assemblies_.begin(), assemblies_.end(), [](const CadAssembly& assembly) {
     return assembly.kind == AssemblyKind::GravityFork;
   }));
+}
+bool FusionBundle::IsForkPart(int part_index) const {
+  if (part_index < 0 || part_index >= int(parts_.size())) return false;
+  const auto& part = parts_[part_index];
+  if (part.assembly >= 0 && part.assembly < int(assemblies_.size()) &&
+      assemblies_[part.assembly].kind == AssemblyKind::GravityFork) return true;
+  return ForkPartPath(part);
 }
 
 bool FusionBundle::SetForkCount(int requested) {
@@ -886,7 +1245,8 @@ bool FusionBundle::GeneratePreview(std::filesystem::path& output) {
     xml << "<mujoco model=\"CAD setup\"><asset>\n";
     for (size_t i = 0; i < parts_.size(); ++i) {
       const auto& part = parts_[i];
-      xml << "<mesh name=\"cad_mesh_" << i << "\" file=\"" << Escape(part.file)
+      xml << "<mesh name=\"cad_mesh_" << i << "\" file=\""
+          << Escape(AssetReference(part.absolute_file, manifest_.parent_path()))
           << "\" scale=\"" << Text({part.scale, part.scale, part.scale}) << "\"/>\n";
     }
     xml << "</asset><worldbody><body name=\"CAD_Preview\">\n";
@@ -906,30 +1266,53 @@ bool FusionBundle::GeneratePreview(std::filesystem::path& output) {
   } catch (const std::exception& e) { error_ = e.what(); return false; }
 }
 
-bool FusionBundle::Generate(std::filesystem::path& output) {
+bool FusionBundle::Generate(std::filesystem::path& output, const FusionBundle* opponent) {
   try {
     if (!HasBundle()) throw std::runtime_error("Load a Fusion manifest first.");
-    for (const auto& part : parts_) if (part.assembly >= 0 && !ValidMass(part.mass))
-      throw std::runtime_error("Set a positive mass for included body: " + part.name + " (" + part.file + ")");
+    for (size_t i = 0; i < parts_.size(); ++i)
+      if (PartIncludedInSimulation(int(i)) && !ValidMass(parts_[i].mass))
+        throw std::runtime_error("Set a positive mass for included body: " + parts_[i].name +
+                                 " (" + parts_[i].file + ")");
+    const bool has_opponent = opponent && opponent->HasBundle();
+    if (has_opponent) {
+      for (size_t i = 0; i < opponent->parts_.size(); ++i)
+        if (opponent->PartIncludedInSimulation(int(i)) && !ValidMass(opponent->parts_[i].mass))
+          throw std::runtime_error("Set a positive mass for included opponent body: " +
+            opponent->parts_[i].name + " (" + opponent->parts_[i].file + ")");
+      if (!ValidMass(GroupMass(opponent->parts_, 0, {}).mass))
+        throw std::runtime_error("Assign at least one opponent body to Main frame with a positive mass.");
+    }
     const auto frame = GroupMass(parts_, 0, {});
     if (!ValidMass(frame.mass)) throw std::runtime_error("Assign at least one body with Fusion mass to Main frame.");
     Vec3 low, high;
     low.fill(std::numeric_limits<double>::infinity()); high.fill(-std::numeric_limits<double>::infinity());
-    for (const auto& part : parts_) if (part.assembly >= 0) {
+    for (size_t i = 0; i < parts_.size(); ++i) if (PartIncludedInSimulation(int(i))) {
+      const auto& part = parts_[i];
       Include(part.min_bound, low, high); Include(part.max_bound, low, high);
     }
     const Vec3 center = Mul(Add(low, high), 0.5);
-    const Vec3 spawn{-0.62-center[0], -center[1], 0.012-low[2]};
+    const Quat player_heading = FacingQuaternion(NativeDriveHeading(parts_, assemblies_, *this), 0.0);
+    const Vec3 rotated_center = Rotate(player_heading, center);
+    const Vec3 spawn{-0.62 - rotated_center[0], -rotated_center[1], 0.012 - low[2]};
     std::ostringstream xml; xml.imbue(std::locale::classic());
     xml << "<mujoco model=\"" << Escape(design_name_) << "\">\n"
         << "<compiler angle=\"radian\" autolimits=\"true\"/>\n"
         << "<option timestep=\"0.0004\" gravity=\"0 0 -9.81\" integrator=\"implicitfast\"/>\n"
         << "<asset>\n";
-    for (size_t i = 0; i < parts_.size(); ++i) if (parts_[i].assembly >= 0) {
+    for (size_t i = 0; i < parts_.size(); ++i) if (PartIncludedInSimulation(int(i))) {
       const auto& part = parts_[i];
-      xml << "<mesh name=\"cad_mesh_" << i << "\" file=\"" << Escape(part.file)
+      xml << "<mesh name=\"cad_mesh_" << i << "\" file=\""
+          << Escape(AssetReference(part.absolute_file, manifest_.parent_path()))
           << "\" scale=\"" << Text({part.scale, part.scale, part.scale}) << "\"/>\n";
     }
+    if (has_opponent) for (size_t i = 0; i < opponent->parts_.size(); ++i)
+      if (opponent->PartIncludedInSimulation(int(i))) {
+        const auto& part = opponent->parts_[i];
+        xml << "<mesh name=\"opponent_mesh_" << i << "\" file=\""
+            << Escape(AssetPath(part.absolute_file))
+            << "\" scale=\""
+            << Text({part.scale, part.scale, part.scale}) << "\"/>\n";
+      }
     xml << "</asset>\n<worldbody>\n"
         << "<geom name=\"floor\" type=\"plane\" size=\"1 1 0.02\" friction=\"1.4 0.02 0.001\" rgba=\"0.18 0.22 0.27 1\"/>\n"
         << "<geom name=\"north_wall\" type=\"box\" pos=\"0 1.05 0.5\" size=\"1.02 0.05 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.4 0.67 0.82 0.18\"/>\n"
@@ -937,7 +1320,8 @@ bool FusionBundle::Generate(std::filesystem::path& output) {
         << "<geom name=\"east_wall\" type=\"box\" pos=\"1.05 0 0.5\" size=\"0.05 1 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.4 0.67 0.82 0.18\"/>\n"
         << "<geom name=\"west_wall\" type=\"box\" pos=\"-1.05 0 0.5\" size=\"0.05 1 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.4 0.67 0.82 0.18\"/>\n"
         << "<geom name=\"roof\" type=\"box\" pos=\"0 0 1.01\" size=\"1.02 1.02 0.01\" rgba=\"0.4 0.67 0.82 0.12\"/>\n"
-        << "<body name=\"Player_Robot\" pos=\"" << Text(spawn) << "\">\n"
+        << "<body name=\"Player_Robot\" pos=\"" << Text(spawn)
+        << "\" quat=\"" << Text4(player_heading) << "\">\n"
         << "<freejoint name=\"robot_free\"/>\n"
         << "<inertial pos=\"" << Text(frame.center) << "\" mass=\"" << Number(frame.mass)
         << "\" fullinertia=\"" << TextInertia(frame.inertia) << "\"/>\n";
@@ -952,6 +1336,7 @@ bool FusionBundle::Generate(std::filesystem::path& output) {
     };
     for (size_t i = 0; i < parts_.size(); ++i) if (parts_[i].assembly == 0) geom(i, {});
     for (size_t group = 1; group < assemblies_.size(); ++group) {
+      if (!AssemblyEnabled(int(group))) continue;
       const auto& a = assemblies_[group];
       const auto props = GroupMass(parts_, int(group), a.pivot);
       if (props.mass <= 0) continue;
@@ -980,21 +1365,120 @@ bool FusionBundle::Generate(std::filesystem::path& output) {
       for (size_t i = 0; i < parts_.size(); ++i) if (parts_[i].assembly == int(group)) geom(i, a.pivot);
       xml << "</body>\n";
     }
-    xml << "</body>\n"
-        << "<body name=\"Target_Robot\" pos=\"0.55 0 0.08\" quat=\"0 0 0 1\">"
-        << "<freejoint/><geom name=\"target_chassis\" type=\"box\" size=\"0.17 0.13 0.045\" mass=\"0.5\" rgba=\"0.82 0.16 0.14 1\"/>"
-        << "</body>\n</worldbody>\n<contact>\n";
+    xml << "</body>\n";
+    if (has_opponent) {
+      Vec3 opponent_low, opponent_high;
+      opponent_low.fill(std::numeric_limits<double>::infinity());
+      opponent_high.fill(-std::numeric_limits<double>::infinity());
+      for (const auto& part : opponent->parts_) if (part.assembly >= 0) {
+        Include(part.min_bound, opponent_low, opponent_high);
+        Include(part.max_bound, opponent_low, opponent_high);
+      }
+      const Vec3 opponent_origin{
+        (opponent_low[0] + opponent_high[0]) * 0.5,
+        (opponent_low[1] + opponent_high[1]) * 0.5,
+        opponent_low[2]};
+      const auto opponent_frame = GroupMass(opponent->parts_, 0, opponent_origin);
+      const Quat opponent_heading = FacingQuaternion(
+        NativeDriveHeading(opponent->parts_, opponent->assemblies_, *opponent),
+        3.14159265358979323846);
+      xml << "<body name=\"Target_Robot\" pos=\"0.55 0 0.012\" quat=\""
+          << Text4(opponent_heading) << "\">\n"
+          << "<freejoint name=\"target_free\"/>\n"
+          << "<inertial pos=\"" << Text(opponent_frame.center) << "\" mass=\""
+          << Number(opponent_frame.mass) << "\" fullinertia=\""
+          << TextInertia(opponent_frame.inertia) << "\"/>\n";
+      auto opponent_geom = [&](size_t i, Vec3 local_origin) {
+        const auto& part = opponent->parts_[i];
+        xml << "<geom name=\"opponent_part_" << i << "\" type=\"mesh\" mesh=\"opponent_mesh_"
+            << i << "\" pos=\"" << Text(Sub(part.position, local_origin)) << "\" quat=\""
+            << Text4(part.rotation) << "\" mass=\"0\" friction=\"" << Number(part.friction)
+            << " 0.02 0.001\" rgba=\"" << Text4(part.color) << "\"";
+        if (!part.collision_enabled) xml << " contype=\"0\" conaffinity=\"0\"";
+        xml << "/>\n";
+      };
+      for (size_t i = 0; i < opponent->parts_.size(); ++i)
+        if (opponent->parts_[i].assembly == 0) opponent_geom(i, opponent_origin);
+      for (size_t group = 1; group < opponent->assemblies_.size(); ++group) {
+        if (!opponent->AssemblyEnabled(int(group))) continue;
+        const auto& assembly = opponent->assemblies_[group];
+        const auto properties = GroupMass(opponent->parts_, int(group), assembly.pivot);
+        if (properties.mass <= 0) continue;
+        xml << "<body name=\"opponent_assembly_" << group << "\" pos=\""
+            << Text(Sub(assembly.pivot, opponent_origin)) << "\">\n"
+            << "<inertial pos=\"" << Text(properties.center) << "\" mass=\""
+            << Number(properties.mass) << "\" fullinertia=\""
+            << TextInertia(properties.inertia) << "\"/>\n";
+        if (assembly.kind != AssemblyKind::Fixed) {
+          Vec3 axis = assembly.axis;
+          const double length = Length(axis);
+          if (length < 1e-8)
+            throw std::runtime_error("Opponent rotation axis cannot be zero: " + assembly.name);
+          axis = Mul(axis, 1.0 / length);
+          xml << "<joint name=\"opponent_joint_" << group
+              << "\" type=\"hinge\" axis=\"" << Text(axis) << "\" damping=\""
+              << Number(assembly.kind == AssemblyKind::GravityFork ? 0.02 : 0.00001) << "\"";
+          if (assembly.kind == AssemblyKind::GravityFork) {
+            if (!std::isfinite(assembly.fork_range_degrees[0]) ||
+                !std::isfinite(assembly.fork_range_degrees[1]) ||
+                assembly.fork_range_degrees[0] >= assembly.fork_range_degrees[1])
+              throw std::runtime_error("Opponent fork travel limits must be finite and lower < upper: " + assembly.name);
+            constexpr double degrees_to_radians = 3.14159265358979323846 / 180.0;
+            xml << " limited=\"true\" range=\""
+                << Number(assembly.fork_range_degrees[0] * degrees_to_radians) << ' '
+                << Number(assembly.fork_range_degrees[1] * degrees_to_radians) << "\"";
+          }
+          xml << "/>\n";
+        }
+        for (size_t i = 0; i < opponent->parts_.size(); ++i)
+          if (opponent->parts_[i].assembly == int(group))
+            opponent_geom(i, assembly.pivot);
+        xml << "</body>\n";
+      }
+      xml << "</body>\n";
+    } else {
+      xml << "<body name=\"Target_Robot\" pos=\"0.55 0 0.08\" quat=\"0 0 0 1\">"
+          << "<freejoint/><geom name=\"target_chassis\" type=\"box\" size=\"0.17 0.13 0.045\" mass=\"0.5\" rgba=\"0.82 0.16 0.14 1\"/>"
+          << "</body>\n";
+    }
+    xml << "</worldbody>\n<contact>\n";
+    // Chassis, fixed structural parts, and forks can all scrape the floor.
+    // Override only those floor contacts so drive wheels and weapon impacts
+    // keep their normal contact response against other robot parts.
+    auto add_floor_scrape_pairs = [&](const FusionBundle& robot, const char* prefix) {
+      for (size_t i = 0; i < robot.parts_.size(); ++i) {
+        const auto& part = robot.parts_[i];
+        if (!robot.PartIncludedInSimulation(int(i)) || !part.collision_enabled) continue;
+        const bool is_fork = robot.IsForkPart(int(i));
+        const bool is_frame = part.assembly == 0;
+        const bool is_fixed_structure = part.assembly > 0 &&
+          size_t(part.assembly) < robot.assemblies_.size() &&
+          robot.assemblies_[part.assembly].kind == AssemblyKind::Fixed;
+        if (!is_frame && !is_fixed_structure && !is_fork) continue;
+        // Match MuJoCo's usual equal-priority floor/geom friction mix for the
+        // frame. Forks retain their explicit CAD friction estimate.
+        const double friction = is_fork ? part.friction : std::max(1.4, part.friction);
+        xml << "<pair geom1=\"floor\" geom2=\"" << prefix << i
+            << "\" condim=\"3\" friction=\"" << Number(friction)
+            << " 0.02 0.001\" solref=\"0.02 2\"/>\n";
+      }
+    };
+    add_floor_scrape_pairs(*this, "cad_part_");
+    if (has_opponent) add_floor_scrape_pairs(*opponent, "opponent_part_");
     // A fork is a child hinge of Player_Robot. MuJoCo filters parent-child
     // contacts by default, so explicitly pair each fork geom with each main-
     // frame geom to provide physical contact without changing other filters.
     for (size_t group = 1; group < assemblies_.size(); ++group) {
+      if (!AssemblyEnabled(int(group))) continue;
       if (assemblies_[group].kind != AssemblyKind::GravityFork ||
           !assemblies_[group].fork_collides_with_frame ||
           GroupMass(parts_, int(group), assemblies_[group].pivot).mass <= 0) continue;
       for (size_t fork_part = 0; fork_part < parts_.size(); ++fork_part) {
-        if (parts_[fork_part].assembly != int(group)) continue;
+        if (parts_[fork_part].assembly != int(group) ||
+            !parts_[fork_part].collision_enabled) continue;
         for (size_t frame_part = 0; frame_part < parts_.size(); ++frame_part) {
-          if (parts_[frame_part].assembly != 0) continue;
+          if (parts_[frame_part].assembly != 0 ||
+              !parts_[frame_part].collision_enabled) continue;
           const double friction = std::sqrt(std::max(0.0, parts_[fork_part].friction) *
                                             std::max(0.0, parts_[frame_part].friction));
           xml << "<pair geom1=\"cad_part_" << fork_part << "\" geom2=\"cad_part_"
@@ -1003,8 +1487,34 @@ bool FusionBundle::Generate(std::filesystem::path& output) {
         }
       }
     }
+    if (has_opponent) {
+      // MuJoCo excludes contacts between a fork and its parent frame by default.
+      // Pair configured opponent fork geoms with the opponent frame explicitly.
+      for (size_t group = 1; group < opponent->assemblies_.size(); ++group) {
+        if (!opponent->AssemblyEnabled(int(group))) continue;
+        const auto& fork = opponent->assemblies_[group];
+        if (fork.kind != AssemblyKind::GravityFork || !fork.fork_collides_with_frame ||
+            GroupMass(opponent->parts_, int(group), fork.pivot).mass <= 0) continue;
+        for (size_t fork_part = 0; fork_part < opponent->parts_.size(); ++fork_part) {
+          if (opponent->parts_[fork_part].assembly != int(group) ||
+              !opponent->parts_[fork_part].collision_enabled) continue;
+          for (size_t frame_part = 0; frame_part < opponent->parts_.size(); ++frame_part) {
+            if (opponent->parts_[frame_part].assembly != 0 ||
+                !opponent->parts_[frame_part].collision_enabled) continue;
+            const double friction = std::sqrt(
+              std::max(0.0, opponent->parts_[fork_part].friction) *
+              std::max(0.0, opponent->parts_[frame_part].friction));
+            xml << "<pair geom1=\"opponent_part_" << fork_part
+                << "\" geom2=\"opponent_part_" << frame_part
+                << "\" condim=\"3\" friction=\"" << Number(friction)
+                << " 0.02 0.001\" solref=\"0.003 1\"/>\n";
+          }
+        }
+      }
+    }
     xml << "</contact>\n<actuator>\n";
     for (size_t group = 1; group < assemblies_.size(); ++group) {
+      if (!AssemblyEnabled(int(group))) continue;
       const auto& a = assemblies_[group];
       if (a.kind == AssemblyKind::Fixed || a.kind == AssemblyKind::GravityFork ||
           GroupMass(parts_, int(group), a.pivot).mass <= 0) continue;
@@ -1016,7 +1526,7 @@ bool FusionBundle::Generate(std::filesystem::path& output) {
           (!std::isfinite(battery_voltage_) || battery_voltage_ <= 0.0 ||
            (drive_assembly && (a.motor.drive_group < 0 || a.motor.drive_group > 7)) ||
            a.motor.motor_count < 1 || a.motor.motor_count > 32 ||
-           !std::isfinite(a.motor.kv_rpm_per_volt) || a.motor.kv_rpm_per_volt <= 0.0 ||
+           MotorKvRpmPerVolt(a.motor) <= 0.0 ||
            !std::isfinite(a.motor.peak_current_a) || a.motor.peak_current_a <= 0.0 ||
            !std::isfinite(a.motor.phase_resistance_ohm) || a.motor.phase_resistance_ohm < 0.0 ||
            !std::isfinite(a.motor.esc_current_limit_a) || a.motor.esc_current_limit_a < 0.0 ||
@@ -1039,6 +1549,46 @@ bool FusionBundle::Generate(std::filesystem::path& output) {
             << ' ' << Number(force) << "\"/>\n";
       }
     }
+    if (has_opponent) {
+      for (size_t group = 1; group < opponent->assemblies_.size(); ++group) {
+        if (!opponent->AssemblyEnabled(int(group))) continue;
+        const auto& assembly = opponent->assemblies_[group];
+        if (assembly.kind == AssemblyKind::Fixed || assembly.kind == AssemblyKind::GravityFork ||
+            GroupMass(opponent->parts_, int(group), assembly.pivot).mass <= 0) continue;
+        const bool drive_assembly = assembly.kind == AssemblyKind::LeftWheel ||
+                                    assembly.kind == AssemblyKind::RightWheel;
+        const bool weapon_assembly = assembly.kind == AssemblyKind::Weapon;
+        const bool use_motor_model = (drive_assembly || weapon_assembly) && assembly.motor.enabled;
+        if (use_motor_model &&
+            (!std::isfinite(opponent->battery_voltage_) || opponent->battery_voltage_ <= 0.0 ||
+             (drive_assembly && (assembly.motor.drive_group < 0 || assembly.motor.drive_group > 7)) ||
+             assembly.motor.motor_count < 1 || assembly.motor.motor_count > 32 ||
+             MotorKvRpmPerVolt(assembly.motor) <= 0.0 ||
+             !std::isfinite(assembly.motor.peak_current_a) || assembly.motor.peak_current_a <= 0.0 ||
+             !std::isfinite(assembly.motor.phase_resistance_ohm) || assembly.motor.phase_resistance_ohm < 0.0 ||
+             !std::isfinite(assembly.motor.esc_current_limit_a) || assembly.motor.esc_current_limit_a < 0.0 ||
+             !std::isfinite(assembly.motor.gear_ratio) || assembly.motor.gear_ratio <= 0.0 ||
+             !std::isfinite(assembly.motor.gearbox_efficiency) ||
+             assembly.motor.gearbox_efficiency <= 0.0 || assembly.motor.gearbox_efficiency > 1.0))
+          throw std::runtime_error("Invalid opponent motor settings or missing battery voltage for: " + assembly.name);
+        const double force = assembly.kind == AssemblyKind::Weapon ? 0.25 : 0.08;
+        const double gain = assembly.kind == AssemblyKind::Weapon ? 0.001 : 0.004;
+        if (use_motor_model) {
+          xml << "<motor name=\"opponent_assembly_" << group
+              << "_drive\" joint=\"opponent_joint_" << group
+              << "\"/><!-- opponent torque-controlled motor model -->\n";
+          if (drive_assembly)
+            xml << "<velocity name=\"opponent_assembly_" << group
+                << "_manual_drive\" joint=\"opponent_joint_" << group
+                << "\" kv=\"0.004\" forcerange=\"-2 2\"/>\n";
+        } else {
+          xml << "<velocity name=\"opponent_assembly_" << group
+              << "_drive\" joint=\"opponent_joint_" << group << "\" kv=\""
+              << Number(gain) << "\" forcerange=\"-" << Number(force)
+              << ' ' << Number(force) << "\"/>\n";
+        }
+      }
+    }
     xml << "</actuator>\n</mujoco>\n";
     output = manifest_.parent_path() / "combatsim_generated.xml";
     std::ofstream file(output, std::ios::trunc);
@@ -1057,20 +1607,23 @@ void FusionBundle::BindControls(const mjModel* model,
                                 std::map<int, MotorSpec>& motor_models,
                                 std::map<int, MotorSpec>& weapon_motor_models,
                                 std::map<int, int>& manual_velocity_actuators,
-                                double& battery_voltage) const {
+                                double& battery_voltage, bool opponent) const {
   motor_models.clear();
   weapon_motor_models.clear();
   manual_velocity_actuators.clear();
   battery_voltage = battery_voltage_;
+  const std::string actuator_prefix = opponent ? "opponent_assembly_" : "cad_assembly_";
+  const Vec3 drive_heading = NativeDriveHeading(parts_, assemblies_, *this);
   for (size_t group = 1; group < assemblies_.size(); ++group) {
+    if (!AssemblyEnabled(int(group))) continue;
     const auto kind = assemblies_[group].kind;
-    const auto name = "cad_assembly_" + std::to_string(group) + "_drive";
+    const auto name = actuator_prefix + std::to_string(group) + "_drive";
     const int id = mj_name2id(model, mjOBJ_ACTUATOR, name.c_str());
     if (id < 0) continue;
     if (kind == AssemblyKind::LeftWheel || kind == AssemblyKind::RightWheel) {
       if (assemblies_[group].motor.enabled) {
         motor_models[id] = assemblies_[group].motor;
-        const auto manual_name = "cad_assembly_" + std::to_string(group) + "_manual_drive";
+        const auto manual_name = actuator_prefix + std::to_string(group) + "_manual_drive";
         const int manual_id = mj_name2id(model, mjOBJ_ACTUATOR, manual_name.c_str());
         if (manual_id >= 0) manual_velocity_actuators[id] = manual_id;
       }
@@ -1079,10 +1632,10 @@ void FusionBundle::BindControls(const mjModel* model,
       double forward_sign = 1.0;
       if (axis_length > 1e-8) {
         axis = Mul(axis, 1.0/axis_length);
-        // Forward body motion requires the wheel's bottom contact patch to
-        // move backward. A positive hinge target must preserve that relation
-        // when a fitted hole normal points in either direction.
-        const double forward_speed = Dot(Cross(axis, {0, 0, -1}), {1, 0, 0});
+        // Forward body motion opposes the wheel's bottom-contact velocity.
+        // Derive forward from the assigned left/right wheel layout so a CAD
+        // model whose native forward axis is Y is handled like an X-forward bot.
+        const double forward_speed = Dot(Cross(axis, {0, 0, -1}), drive_heading);
         if (std::abs(forward_speed) > 1e-6) forward_sign = forward_speed > 0 ? -1.0 : 1.0;
       }
       if (kind == AssemblyKind::LeftWheel) left.emplace_back(id, forward_sign);
@@ -1153,10 +1706,9 @@ void FusionBundle::SelectPart(int part_index) {
 
 void FusionBundle::UpdateHover(int part_index, const std::array<double, 3>& hit) {
   const bool valid_part = PreviewVisible(part_index);
-  const bool valid_axis_part = valid_part && parts_[part_index].assembly == axis_assembly_;
-  // Axis mode is deliberately restricted to the bodies in its target assembly.
+  // The axis target is independent of the CAD part supplying the reference hole.
   // This also prevents the body hover highlight from competing with the rim cue.
-  hovered_part_ = axis_picking_ ? (valid_axis_part ? part_index : -1) :
+  hovered_part_ = axis_picking_ ? (valid_part ? part_index : -1) :
                                   (valid_part ? part_index : -1);
   hovered_loop_.clear();
   if (!axis_picking_ || hovered_part_ < 0) return;
@@ -1177,7 +1729,8 @@ void FusionBundle::UpdateHover(int part_index, const std::array<double, 3>& hit)
   if (hovered_loop_.empty())
     pick_message_ = "Move closer to a closed rim on " + parts_[hovered_part_].name + ".";
   else
-    pick_message_ = "Rim highlighted on " + parts_[hovered_part_].name + ". Click once to fit the axis.";
+    pick_message_ = "Rim highlighted on " + parts_[hovered_part_].name +
+                    ". Click to fit " + assemblies_[axis_assembly_].name + " axis.";
 }
 
 bool FusionBundle::SelectHoveredHole() {
@@ -1195,7 +1748,7 @@ bool FusionBundle::PreviewVisible(int part_index) const {
 }
 
 void FusionBundle::StartAxis(int assembly) {
-  if (assembly <= 0 || assembly >= int(assemblies_.size()) ||
+  if (assembly <= 0 || assembly >= int(assemblies_.size()) || !AssemblyEnabled(assembly) ||
       assemblies_[assembly].kind == AssemblyKind::Fixed) {
     pick_message_ = "Choose a weapon, wheel, or gravity-fork assembly for the rotation axis.";
     return;
@@ -1212,8 +1765,8 @@ bool FusionBundle::AddAxisPoint(int part_index, const std::array<double, 3>& cad
   if (!axis_picking_ || part_index < 0 || part_index >= int(parts_.size())) return false;
   selected_part_ = part_index;
   if (axis_assembly_ <= 0 || axis_assembly_ >= int(assemblies_.size()) ||
-      parts_[part_index].assembly != axis_assembly_) {
-    pick_message_ = "Assign this part to the chosen axis assembly before selecting its hole.";
+      !AssemblyEnabled(axis_assembly_)) {
+    pick_message_ = "Choose a rotating assembly to receive the fitted axis.";
     return false;
   }
   Vec3 point = cad_point;
@@ -1228,7 +1781,8 @@ bool FusionBundle::AddAxisPoint(int part_index, const std::array<double, 3>& cad
     }
   axis_points_.push_back(point);
   pick_message_ = "Hole outline: " + std::to_string(axis_points_.size()) +
-                  " points. Click around the rim, then press Fit axis through hole.";
+                  " points. Reference part stays assigned as-is; click around the rim, "
+                  "then press Fit axis through hole.";
   return true;
 }
 
@@ -1290,8 +1844,10 @@ bool FusionBundle::FinishAxis() {
   auto& assembly = assemblies_[axis_assembly_];
   assembly.pivot = center;
   assembly.axis = normal;
-  pick_message_ = "Fitted " + assembly.name + " axis through the hole center using " +
-                  std::to_string(axis_points_.size()) + " points.";
+  pick_message_ = "Fitted " + assembly.name + " axis at (" +
+    std::to_string(center[0]) + ", " + std::to_string(center[1]) + ", " +
+    std::to_string(center[2]) + ") m; direction (" + std::to_string(normal[0]) + ", " +
+    std::to_string(normal[1]) + ", " + std::to_string(normal[2]) + "). Click Apply and preview to rebuild the simulation.";
   axis_points_.clear(); axis_picking_ = false;
   return true;
 }
@@ -1341,7 +1897,18 @@ void FusionBundle::PickEdge(int part_index, const std::array<double, 3>& cad_poi
 }
 
 void FusionBundle::AddAxisMarkers(const mjModel* model, const mjData* data, mjvScene& scene) const {
+  auto append_geom = [&]() -> mjvGeom* {
+    if (scene.ngeom >= scene.maxgeom || !scene.geoms || !scene.geomorder) return nullptr;
+    const int index = scene.ngeom++;
+    scene.geomorder[index] = index;
+    mjvGeom& geom = scene.geoms[index];
+    geom.objtype = mjOBJ_UNKNOWN;
+    geom.objid = -1;
+    geom.category = mjCAT_DECOR;
+    return &geom;
+  };
   for (size_t group = 1; group < assemblies_.size(); ++group) {
+    if (!AssemblyEnabled(int(group))) continue;
     const auto& assembly = assemblies_[group];
     const bool assigned = std::any_of(parts_.begin(), parts_.end(), [group](const CadPart& part) {
       return part.assembly == int(group);
@@ -1367,17 +1934,30 @@ void FusionBundle::AddAxisMarkers(const mjModel* model, const mjData* data, mjvS
     const float fork_color[4] = {0.8f, 0.35f, 1.0f, 1.0f};
     const float* color = assembly.kind == AssemblyKind::Weapon ? weapon_color :
       (assembly.kind == AssemblyKind::GravityFork ? fork_color : wheel_color);
-    mjv_initGeom(&scene.geoms[scene.ngeom], mjGEOM_LINE, nullptr, nullptr, nullptr, color);
-    mjv_connector(&scene.geoms[scene.ngeom++], mjGEOM_LINE, 3, start, end);
+    if (mjvGeom* line = append_geom()) {
+      mjv_initGeom(line, mjGEOM_LINE, nullptr, nullptr, nullptr, color);
+      mjv_connector(line, mjGEOM_LINE, 3, start, end);
+    }
     const mjtNum size[3] = {0.009, 0.009, 0.009};
-    mjv_initGeom(&scene.geoms[scene.ngeom++], mjGEOM_SPHERE, size, origin, nullptr, color);
+    if (mjvGeom* marker = append_geom())
+      mjv_initGeom(marker, mjGEOM_SPHERE, size, origin, nullptr, color);
   }
 }
 
 void FusionBundle::AddSetupAxisMarkers(mjvScene& scene,
                                        std::array<double, 3> camera_position) const {
+  auto append_geom = [&]() -> mjvGeom* {
+    if (scene.ngeom >= scene.maxgeom || !scene.geoms || !scene.geomorder) return nullptr;
+    const int index = scene.ngeom++;
+    scene.geomorder[index] = index;
+    mjvGeom& geom = scene.geoms[index];
+    geom.objtype = mjOBJ_UNKNOWN;
+    geom.objid = -1;
+    geom.category = mjCAT_DECOR;
+    return &geom;
+  };
   if (axis_picking_ && hovered_loop_.size() >= 3) {
-    const float hover_color[4] = {0.15f, 1.0f, 0.9f, 1.0f};
+    const float hover_color[4] = {0.16f, 1.0f, 0.28f, 1.0f};
     Vec3 loop_center{};
     for (const auto& point : hovered_loop_) loop_center = Add(loop_center, point);
     loop_center = Mul(loop_center, 1.0 / hovered_loop_.size());
@@ -1386,7 +1966,7 @@ void FusionBundle::AddSetupAxisMarkers(mjvScene& scene,
     if (camera_distance > 1e-9) {
       const auto& part = parts_[hovered_part_];
       const double size = Length(Sub(part.max_bound, part.min_bound));
-      const double offset = std::clamp(size * 0.0015, 0.00005, 0.0003);
+      const double offset = std::clamp(size * 0.0025, 0.0001, 0.0005);
       toward_camera = Mul(toward_camera, offset / camera_distance);
     } else {
       toward_camera = {};
@@ -1396,8 +1976,10 @@ void FusionBundle::AddSetupAxisMarkers(mjvScene& scene,
       const auto second = Add(hovered_loop_[(i+1)%hovered_loop_.size()], toward_camera);
       mjtNum a[3] = {first[0], first[1], first[2]};
       mjtNum b[3] = {second[0], second[1], second[2]};
-      mjv_initGeom(&scene.geoms[scene.ngeom], mjGEOM_LINE, nullptr, nullptr, nullptr, hover_color);
-      mjv_connector(&scene.geoms[scene.ngeom++], mjGEOM_LINE, 4, a, b);
+      if (mjvGeom* line = append_geom()) {
+        mjv_initGeom(line, mjGEOM_LINE, nullptr, nullptr, nullptr, hover_color);
+        mjv_connector(line, mjGEOM_LINE, 7, a, b);
+      }
     }
   }
   const float picked_color[4] = {0.25f, 1.0f, 0.3f, 1.0f};
@@ -1405,23 +1987,29 @@ void FusionBundle::AddSetupAxisMarkers(mjvScene& scene,
   for (const auto& point : axis_points_) {
     if (scene.ngeom >= scene.maxgeom) break;
     mjtNum pos[3] = {point[0], point[1], point[2]};
-    mjv_initGeom(&scene.geoms[scene.ngeom++], mjGEOM_SPHERE, point_size, pos, nullptr, picked_color);
+    if (mjvGeom* marker = append_geom())
+      mjv_initGeom(marker, mjGEOM_SPHERE, point_size, pos, nullptr, picked_color);
   }
   for (size_t i = 1; i < axis_points_.size() && scene.ngeom < scene.maxgeom; ++i) {
     mjtNum a[3] = {axis_points_[i-1][0], axis_points_[i-1][1], axis_points_[i-1][2]};
     mjtNum b[3] = {axis_points_[i][0], axis_points_[i][1], axis_points_[i][2]};
-    mjv_initGeom(&scene.geoms[scene.ngeom], mjGEOM_LINE, nullptr, nullptr, nullptr, picked_color);
-    mjv_connector(&scene.geoms[scene.ngeom++], mjGEOM_LINE, 2, a, b);
+    if (mjvGeom* line = append_geom()) {
+      mjv_initGeom(line, mjGEOM_LINE, nullptr, nullptr, nullptr, picked_color);
+      mjv_connector(line, mjGEOM_LINE, 2, a, b);
+    }
   }
   if (axis_points_.size() >= 3 && scene.ngeom < scene.maxgeom) {
     const auto& last = axis_points_.back();
     const auto& first = axis_points_.front();
     mjtNum a[3] = {last[0], last[1], last[2]};
     mjtNum b[3] = {first[0], first[1], first[2]};
-    mjv_initGeom(&scene.geoms[scene.ngeom], mjGEOM_LINE, nullptr, nullptr, nullptr, picked_color);
-    mjv_connector(&scene.geoms[scene.ngeom++], mjGEOM_LINE, 2, a, b);
+    if (mjvGeom* line = append_geom()) {
+      mjv_initGeom(line, mjGEOM_LINE, nullptr, nullptr, nullptr, picked_color);
+      mjv_connector(line, mjGEOM_LINE, 2, a, b);
+    }
   }
   for (size_t group = 1; group < assemblies_.size(); ++group) {
+    if (!AssemblyEnabled(int(group))) continue;
     const auto& assembly = assemblies_[group];
     const bool assigned = std::any_of(parts_.begin(), parts_.end(), [group](const CadPart& part) {
       return part.assembly == int(group);
@@ -1442,10 +2030,13 @@ void FusionBundle::AddSetupAxisMarkers(mjvScene& scene,
     const float fork_color[4] = {0.8f, 0.35f, 1.0f, 1.0f};
     const float* color = assembly.kind == AssemblyKind::Weapon ? weapon_color :
       (assembly.kind == AssemblyKind::GravityFork ? fork_color : wheel_color);
-    mjv_initGeom(&scene.geoms[scene.ngeom], mjGEOM_LINE, nullptr, nullptr, nullptr, color);
-    mjv_connector(&scene.geoms[scene.ngeom++], mjGEOM_LINE, 3, start, end);
+    if (mjvGeom* line = append_geom()) {
+      mjv_initGeom(line, mjGEOM_LINE, nullptr, nullptr, nullptr, color);
+      mjv_connector(line, mjGEOM_LINE, 3, start, end);
+    }
     const mjtNum size[3] = {0.009, 0.009, 0.009};
-    mjv_initGeom(&scene.geoms[scene.ngeom++], mjGEOM_SPHERE, size, center, nullptr, color);
+    if (mjvGeom* marker = append_geom())
+      mjv_initGeom(marker, mjGEOM_SPHERE, size, center, nullptr, color);
   }
 }
 
@@ -1602,7 +2193,28 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip("Use the battery pack's nominal voltage. For a LiPo pack, cell count x 3.7 V is a reasonable nominal value.");
   if (!std::isfinite(battery_voltage_) || battery_voltage_ < 0.0) battery_voltage_ = 0.0;
-  ImGui::TextWrapped("Per motor: Kv and peak current. Pack voltage is also required; settings save with this bot.");
+  ImGui::TextWrapped("Per motor, enter either Kv or a published RPM and voltage, plus peak current. Detailed electrical specs can be left blank; the pack voltage is required.");
+  const char* layout_label = drive_layout_ == DriveLayout::TwoWheel ? "2WD" : "4WD";
+  if (ImGui::BeginCombo("Drive layout", layout_label)) {
+    if (ImGui::Selectable("2WD", drive_layout_ == DriveLayout::TwoWheel))
+      SetWheelDriveLayout(DriveLayout::TwoWheel);
+    if (ImGui::Selectable("4WD", drive_layout_ == DriveLayout::FourWheel))
+      SetWheelDriveLayout(DriveLayout::FourWheel);
+    ImGui::EndCombo();
+  }
+  if (drive_layout_ == DriveLayout::TwoWheel) {
+    const char* axle_label = two_wd_axle_ == "rear" ? "Rear axle" : "Front axle";
+    if (ImGui::BeginCombo("Driven axle", axle_label)) {
+      if (ImGui::Selectable("Front axle", two_wd_axle_ == "front"))
+        SetTwoWheelDriveAxle("front");
+      if (ImGui::Selectable("Rear axle", two_wd_axle_ == "rear"))
+        SetTwoWheelDriveAxle("rear");
+      ImGui::EndCombo();
+    }
+    ImGui::TextWrapped("Only the selected axle's left and right wheel assemblies are simulated. The other axle stays saved and returns when you switch to 4WD.");
+  } else {
+    ImGui::TextWrapped("4WD simulates the assigned front and rear left/right wheel assemblies.");
+  }
   if (ImGui::TreeNodeEx("Drive motor settings", ImGuiTreeNodeFlags_DefaultOpen)) {
     ImGui::TextWrapped("Assign wheels driven by the same physical motor to the same group. The group's available torque is shared evenly across its wheel assemblies. Wheel-speed linkages are not constrained yet, so chain/belt coupling is approximate.");
     static const char* motor_group_labels[] = {
@@ -1613,6 +2225,7 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
       auto& group = assemblies_[i];
       if (group.kind != AssemblyKind::LeftWheel && group.kind != AssemblyKind::RightWheel)
         continue;
+      if (!AssemblyEnabled(int(i))) continue;
       has_drive_wheels = true;
       ImGui::PushID(int(i));
       const int old_drive_group = group.motor.drive_group;
@@ -1631,6 +2244,7 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
             if (other == i || assemblies_[other].kind == AssemblyKind::Fixed ||
                 (assemblies_[other].kind != AssemblyKind::LeftWheel &&
                  assemblies_[other].kind != AssemblyKind::RightWheel) ||
+                !AssemblyEnabled(int(other)) ||
                 assemblies_[other].motor.drive_group != candidate)
               continue;
             group.motor = assemblies_[other].motor;
@@ -1648,13 +2262,15 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
       for (size_t i = 1; i < assemblies_.size(); ++i) {
         auto& owner = assemblies_[i];
         if ((owner.kind != AssemblyKind::LeftWheel && owner.kind != AssemblyKind::RightWheel) ||
-            owner.motor.drive_group < 0 || owner.motor.drive_group >= 8 ||
-            !shown_groups.insert(owner.motor.drive_group).second)
+            !AssemblyEnabled(int(i)) || owner.motor.drive_group < 0 || owner.motor.drive_group >= 8 ||
+            shown_groups.count(owner.motor.drive_group))
           continue;
+        shown_groups.insert(owner.motor.drive_group);
         int member_count = 0;
         for (size_t member = 1; member < assemblies_.size(); ++member)
           if ((assemblies_[member].kind == AssemblyKind::LeftWheel ||
                assemblies_[member].kind == AssemblyKind::RightWheel) &&
+              AssemblyEnabled(int(member)) &&
               assemblies_[member].motor.drive_group == owner.motor.drive_group)
             ++member_count;
         ImGui::PushID(1000 + owner.motor.drive_group);
@@ -1666,8 +2282,7 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
           ImGui::Checkbox("Enable wheel torque model", &owner.motor.enabled);
           DrawMotorIntInput("Physical motors in group", &owner.motor.motor_count);
           owner.motor.motor_count = std::clamp(owner.motor.motor_count, 1, 32);
-          DrawMotorDoubleInput("Motor Kv (RPM/V)", &owner.motor.kv_rpm_per_volt,
-                               1.0, 10.0, "%.1f");
+          DrawMotorSpeedInputs(11000 + owner.motor.drive_group, owner.motor);
           DrawMotorDoubleInput("Peak current per motor (A)", &owner.motor.peak_current_a,
                                0.1, 1.0, "%.2f");
           if (ImGui::IsItemHovered())
@@ -1675,17 +2290,17 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
           DrawGearRatioInput(1000 + owner.motor.drive_group, owner.motor);
           if (ImGui::TreeNode("Optional motor and gearbox settings")) {
             double phase_resistance_milliohm = owner.motor.phase_resistance_ohm * 1000.0;
-            ImGui::TextWrapped("Phase-to-phase resistance (mOhm)");
+            ImGui::TextWrapped("%s", MotorResistanceLabel(owner.motor.type));
             ImGui::SetNextItemWidth(std::min(180.0f, ImGui::GetContentRegionAvail().x));
-            if (ImGui::InputDouble("##phase_resistance", &phase_resistance_milliohm,
+            if (ImGui::InputDouble("##motor_resistance", &phase_resistance_milliohm,
                                    1.0, 10.0, "%.2f"))
               owner.motor.phase_resistance_ohm = phase_resistance_milliohm / 1000.0;
             if (ImGui::IsItemHovered())
-              ImGui::SetTooltip("Optional. Enter resistance measured across two motor leads.");
-            DrawMotorDoubleInput("ESC phase-current limit per motor (A)",
+              ImGui::SetTooltip("Optional. Leave at 0 if the motor datasheet does not list it; the current-limited approximate torque model still works.");
+            DrawMotorDoubleInput(MotorCurrentLimitLabel(owner.motor.type),
                                  &owner.motor.esc_current_limit_a, 0.1, 1.0, "%.2f");
             if (ImGui::IsItemHovered())
-              ImGui::SetTooltip("Optional. Enter only if the ESC specification identifies phase/motor current; otherwise leave 0.");
+              ImGui::SetTooltip("Optional. Enter the controller's motor-current limit if known; otherwise leave 0.");
             double efficiency_percent = owner.motor.gearbox_efficiency * 100.0;
             ImGui::TextWrapped("Gearbox efficiency (%)");
             ImGui::SetNextItemWidth(std::min(180.0f, ImGui::GetContentRegionAvail().x));
@@ -1693,17 +2308,17 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
                                    1.0, 5.0, "%.1f"))
               owner.motor.gearbox_efficiency = efficiency_percent / 100.0;
             owner.motor.gearbox_efficiency = std::clamp(owner.motor.gearbox_efficiency, 1e-3, 1.0);
-            ImGui::TextWrapped("Defaults: 0 resistance, no extra ESC cap, 1:1 ratio, 100%% efficiency.");
+            ImGui::TextWrapped("Defaults: resistance and controller limit 0 (unknown), 1:1 ratio, 100%% efficiency.");
             ImGui::TreePop();
           }
-          if (battery_voltage_ > 0.0 && owner.motor.kv_rpm_per_volt > 0.0 &&
-              owner.motor.gear_ratio > 0.0)
-            ImGui::TextWrapped("Estimated wheel no-load speed: %.0f RPM",
-              owner.motor.kv_rpm_per_volt * battery_voltage_ / owner.motor.gear_ratio);
+          const double wheel_no_load_rpm = MotorNoLoadOutputRpm(owner.motor, battery_voltage_);
+          if (wheel_no_load_rpm > 0.0)
+            ImGui::TextWrapped("Estimated wheel no-load speed: %.0f RPM", wheel_no_load_rpm);
           const MotorSpec shared_spec = owner.motor;
           for (size_t member = 1; member < assemblies_.size(); ++member)
             if ((assemblies_[member].kind == AssemblyKind::LeftWheel ||
                  assemblies_[member].kind == AssemblyKind::RightWheel) &&
+                AssemblyEnabled(int(member)) &&
                 assemblies_[member].motor.drive_group == owner.motor.drive_group)
               assemblies_[member].motor = shared_spec;
           ImGui::TreePop();
@@ -1728,8 +2343,7 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
       ImGui::Checkbox("Enable weapon torque model", &weapon.motor.enabled);
       DrawMotorIntInput("Physical motors in weapon assembly", &weapon.motor.motor_count);
       weapon.motor.motor_count = std::clamp(weapon.motor.motor_count, 1, 32);
-      DrawMotorDoubleInput("Motor Kv (RPM/V)", &weapon.motor.kv_rpm_per_volt,
-                           1.0, 10.0, "%.1f");
+      DrawMotorSpeedInputs(21000 + int(i), weapon.motor);
       DrawMotorDoubleInput("Peak current per motor (A)", &weapon.motor.peak_current_a,
                            0.1, 1.0, "%.2f");
       if (ImGui::IsItemHovered())
@@ -1737,17 +2351,17 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
       DrawGearRatioInput(20000 + int(i), weapon.motor);
       if (ImGui::TreeNode("Optional motor and gearbox settings")) {
         double phase_resistance_milliohm = weapon.motor.phase_resistance_ohm * 1000.0;
-        ImGui::TextWrapped("Phase-to-phase resistance (mOhm)");
+        ImGui::TextWrapped("%s", MotorResistanceLabel(weapon.motor.type));
         ImGui::SetNextItemWidth(std::min(180.0f, ImGui::GetContentRegionAvail().x));
-        if (ImGui::InputDouble("##phase_resistance", &phase_resistance_milliohm,
+        if (ImGui::InputDouble("##motor_resistance", &phase_resistance_milliohm,
                                1.0, 10.0, "%.2f"))
           weapon.motor.phase_resistance_ohm = phase_resistance_milliohm / 1000.0;
         if (ImGui::IsItemHovered())
-          ImGui::SetTooltip("Optional. Enter resistance measured across two motor leads.");
-        DrawMotorDoubleInput("ESC phase-current limit per motor (A)",
+          ImGui::SetTooltip("Optional. Leave at 0 if the motor datasheet does not list it; the current-limited approximate torque model still works.");
+        DrawMotorDoubleInput(MotorCurrentLimitLabel(weapon.motor.type),
                              &weapon.motor.esc_current_limit_a, 0.1, 1.0, "%.2f");
         if (ImGui::IsItemHovered())
-          ImGui::SetTooltip("Optional. Enter only if the ESC specification identifies phase/motor current; otherwise leave 0.");
+          ImGui::SetTooltip("Optional. Enter the controller's motor-current limit if known; otherwise leave 0.");
         double efficiency_percent = weapon.motor.gearbox_efficiency * 100.0;
         ImGui::TextWrapped("Gearbox efficiency (%)");
         ImGui::SetNextItemWidth(std::min(180.0f, ImGui::GetContentRegionAvail().x));
@@ -1755,13 +2369,12 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
                                1.0, 5.0, "%.1f"))
           weapon.motor.gearbox_efficiency = efficiency_percent / 100.0;
         weapon.motor.gearbox_efficiency = std::clamp(weapon.motor.gearbox_efficiency, 1e-3, 1.0);
-        ImGui::TextWrapped("Defaults: 0 resistance, no extra ESC cap, 1:1 ratio, 100%% efficiency.");
+        ImGui::TextWrapped("Defaults: resistance and controller limit 0 (unknown), 1:1 ratio, 100%% efficiency.");
         ImGui::TreePop();
       }
-      if (battery_voltage_ > 0.0 && weapon.motor.kv_rpm_per_volt > 0.0 &&
-          weapon.motor.gear_ratio > 0.0)
-        ImGui::TextWrapped("Estimated weapon no-load speed: %.0f RPM",
-          weapon.motor.kv_rpm_per_volt * battery_voltage_ / weapon.motor.gear_ratio);
+      const double weapon_no_load_rpm = MotorNoLoadOutputRpm(weapon.motor, battery_voltage_);
+      if (weapon_no_load_rpm > 0.0)
+        ImGui::TextWrapped("Estimated weapon no-load speed: %.0f RPM", weapon_no_load_rpm);
       if (weapon.motor.enabled) {
         const MassProperties properties = GroupMass(parts_, int(i), weapon.pivot);
         const double inertia = MomentAboutAxis(properties, weapon.axis);
@@ -1794,7 +2407,8 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
         if (ImGui::Selectable(assemblies_[i].name.c_str(), selected.assembly == int(i))) {
           selected.assembly = int(i);
           if (i > 0) assemblies_[i].pivot = GroupCenter(int(i));
-            if (i > 0 && assemblies_[i].kind != AssemblyKind::Fixed) {
+            if (i > 0 && assemblies_[i].kind != AssemblyKind::Fixed &&
+                AssemblyEnabled(int(i))) {
               axis_assembly_ = int(i);
               axis_points_.clear(); hovered_loop_.clear(); axis_picking_ = false;
             }
@@ -1808,10 +2422,15 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
   ImGui::SameLine();
   if (ImGui::Button("Show only selected") && selected_part_ >= 0)
     for (size_t i = 0; i < parts_.size(); ++i) parts_[i].preview_visible = int(i) == selected_part_;
-  double total = 0;
-  for (const auto& p : parts_) if (p.assembly >= 0) total += p.mass;
-  ImGui::Text("Assigned mass: %.1f g / 500 g", total * 1000.0);
-  if (total > 0.5) ImGui::TextWrapped("Mass exceeds the 500 g class. Check for duplicate CAD bodies or adjust overrides.");
+  double total = 0.0, included_mass = 0.0;
+  for (size_t i = 0; i < parts_.size(); ++i) {
+    if (parts_[i].assembly >= 0) total += parts_[i].mass;
+    if (PartIncludedInSimulation(int(i))) included_mass += parts_[i].mass;
+  }
+  ImGui::Text("Assigned CAD mass: %.1f g / 500 g", total * 1000.0);
+  if (std::abs(total - included_mass) > 1e-8)
+    ImGui::Text("Mass in current simulation: %.1f g", included_mass * 1000.0);
+  if (total > 0.5) ImGui::TextWrapped("Assigned CAD mass exceeds the 500 g class. Check for duplicate CAD bodies or adjust overrides.");
   if (ImGui::Button("Save setup")) Save();
   ImGui::SameLine();
   if (ImGui::Button("Apply and preview")) {
@@ -1822,8 +2441,8 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
   int fork_count = ForkCount();
   if (ImGui::InputInt("Gravity-driven fork modules", &fork_count)) SetForkCount(fork_count);
   if (!fork_message_.empty())
-    ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.25f, 1.0f), "%s", fork_message_.c_str());
-  ImGui::TextWrapped("Each fork module is a separate passive hinge with no motor. Assign its CAD bodies, set the hinge center and axis at the attachment, and check that it does not begin interpenetrating the main frame. Travel defaults to +/-90 degrees from the CAD pose and is editable per fork. Explicit contact pairs are generated between every fork body and every main-frame body.");
+    ImGui::TextColored(ImVec4(1.00f, 0.75f, 0.36f, 1.0f), "%s", fork_message_.c_str());
+  ImGui::TextWrapped("Each fork module is a separate passive hinge with no motor. Assign its CAD bodies, set the hinge center and axis at the attachment, and check that it does not begin interpenetrating the main frame. Travel defaults to +/-90 degrees from the CAD pose and is editable per fork. Explicit contact pairs are generated between every fork body and every main-frame body. Chassis, fixed structural parts, and forks use a damped response only when they touch the floor, including forks left fixed to the frame.");
   for (size_t i = 1; i < assemblies_.size(); ++i) {
     auto& group = assemblies_[i];
     ImGui::PushID(int(i));
@@ -1843,6 +2462,8 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
             group.kind = kind;
             const bool is_drive_wheel = kind == AssemblyKind::LeftWheel ||
                                         kind == AssemblyKind::RightWheel;
+            if (is_drive_wheel && !was_drive_wheel && group.wheel_position.empty())
+              group.wheel_position = "single";
             if (!is_drive_wheel) {
               group.motor.enabled = false;
               group.motor.drive_group = -1;
@@ -1859,18 +2480,38 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
                 ++available_group;
               group.motor.drive_group = available_group;
             }
-            if (kind != AssemblyKind::Fixed) axis_assembly_ = int(i);
+            if (kind != AssemblyKind::Fixed && AssemblyEnabled(int(i))) axis_assembly_ = int(i);
             else if (axis_assembly_ == int(i)) {
               axis_picking_ = false; axis_points_.clear(); hovered_loop_.clear();
               axis_assembly_ = 0;
               for (size_t candidate = 1; candidate < assemblies_.size(); ++candidate)
-                if (assemblies_[candidate].kind != AssemblyKind::Fixed) {
+                if (assemblies_[candidate].kind != AssemblyKind::Fixed &&
+                    AssemblyEnabled(int(candidate))) {
                   axis_assembly_ = int(candidate);
                   break;
                 }
             }
           }
         ImGui::EndCombo();
+      }
+      if (group.kind == AssemblyKind::LeftWheel || group.kind == AssemblyKind::RightWheel) {
+        const char* wheel_position_label = group.wheel_position == "rear" ? "Rear axle" :
+          group.wheel_position == "front" ? "Front axle" : "Single axle";
+        if (ImGui::BeginCombo("Wheel position", wheel_position_label)) {
+          const std::array<std::pair<const char*, const char*>, 3> positions{{
+            {"Single axle", "single"}, {"Front axle", "front"}, {"Rear axle", "rear"}}};
+          for (const auto& position : positions) {
+            if (!ImGui::Selectable(position.first,
+                                   group.wheel_position == position.second)) continue;
+            group.wheel_position = position.second;
+            if (drive_layout_ == DriveLayout::TwoWheel)
+              SetTwoWheelDriveAxle(two_wd_axle_);
+            if (AssemblyEnabled(int(i))) axis_assembly_ = int(i);
+          }
+          ImGui::EndCombo();
+        }
+        if (drive_layout_ == DriveLayout::TwoWheel && !AssemblyEnabled(int(i)))
+          ImGui::TextDisabled("Stored for 4WD; excluded from this 2WD simulation.");
       }
       if (group.kind != AssemblyKind::Fixed) {
         const auto assembly_mass_properties = GroupMass(parts_, int(i), group.pivot);
@@ -1916,6 +2557,58 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
   DrawTree({});
 }
 
+void FusionBundle::Clear() {
+  {
+    std::lock_guard<std::mutex> lock(dialog_mutex_);
+    pending_path_.clear();
+  }
+  parts_.clear();
+  assemblies_.clear();
+  manifest_.clear();
+  design_name_.clear();
+  error_.clear();
+  selected_part_ = hovered_part_ = -1;
+  axis_picking_ = false;
+  axis_points_.clear();
+  hovered_loop_.clear();
+}
+
+void FusionBundle::DrawImporter(SDL_Window* window, bool& changed) {
+  {
+    std::lock_guard<std::mutex> lock(dialog_mutex_);
+    if (!pending_path_.empty()) {
+      std::snprintf(path_buffer_, sizeof(path_buffer_), "%s", pending_path_.c_str());
+      pending_path_.clear();
+      if (Load(path_buffer_)) changed = true;
+    }
+  }
+  ImGui::PushID(this);
+  ImGui::InputText("Opponent manifest.json", path_buffer_, sizeof(path_buffer_));
+  if (ImGui::Button("Browse opponent...")) {
+    static const SDL_DialogFileFilter filters[] = {{"Fusion manifest", "json"}};
+    SDL_ShowOpenFileDialog([](void* user, const char* const* paths, int) {
+      if (!paths || !paths[0]) return;
+      auto* editor = static_cast<FusionBundle*>(user);
+      std::lock_guard<std::mutex> lock(editor->dialog_mutex_);
+      editor->pending_path_ = paths[0];
+    }, this, window, filters, 1, nullptr, false);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Load opponent")) {
+    if (Load(path_buffer_)) changed = true;
+  }
+  if (!error_.empty()) ImGui::TextWrapped("Opponent import: %s", error_.c_str());
+  if (HasBundle()) {
+    ImGui::TextWrapped("%s: %d imported bodies; configure assemblies in the selected bot editor.",
+                       design_name_.c_str(), int(parts_.size()));
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Remove")) { Clear(); changed = true; }
+  } else {
+    ImGui::TextDisabled("Import a separate Fusion bundle for the opposing bot.");
+  }
+  ImGui::PopID();
+}
+
 void FusionBundle::DrawAxisSelectionControls() {
   if (!HasBundle()) return;
   ImGui::SeparatorText("Select rotation axis");
@@ -1924,7 +2617,7 @@ void FusionBundle::DrawAxisSelectionControls() {
   ImGui::SetNextItemWidth(260.0f);
   if (ImGui::BeginCombo("Axis target (weapon / wheel / fork)", axis_name)) {
     for (size_t i = 1; i < assemblies_.size(); ++i) {
-      if (assemblies_[i].kind == AssemblyKind::Fixed) continue;
+      if (!AssemblyEnabled(int(i)) || assemblies_[i].kind == AssemblyKind::Fixed) continue;
       const std::string label = assemblies_[i].name + " (" + KindLabel(assemblies_[i].kind) + ")";
       if (ImGui::Selectable(label.c_str(), int(i) == axis_assembly_)) {
         axis_assembly_ = int(i); axis_points_.clear(); hovered_loop_.clear(); hovered_part_ = -1;

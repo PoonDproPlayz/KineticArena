@@ -21,8 +21,25 @@
 
 namespace {
 constexpr double pi = 3.14159265358979323846;
+constexpr double drive_command_ramp_seconds = 0.30;
 using json = nlohmann::json;
 constexpr int max_input_channels = 16;
+const ImVec4 ui_ink(0.90f, 0.93f, 0.97f, 1.0f);
+const ImVec4 ui_blue(0.39f, 0.70f, 1.00f, 1.0f);
+const ImVec4 ui_teal(0.30f, 0.84f, 0.82f, 1.0f);
+const ImVec4 ui_green(0.40f, 0.84f, 0.60f, 1.0f);
+const ImVec4 ui_violet(0.74f, 0.62f, 1.00f, 1.0f);
+const ImVec4 ui_coral(1.00f, 0.57f, 0.45f, 1.0f);
+const ImVec4 ui_amber(1.00f, 0.75f, 0.36f, 1.0f);
+const ImVec4 ui_red(1.00f, 0.42f, 0.44f, 1.0f);
+
+void push_button_palette(ImVec4 base, ImVec4 hovered, ImVec4 active) {
+  ImGui::PushStyleColor(ImGuiCol_Button, base);
+  ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hovered);
+  ImGui::PushStyleColor(ImGuiCol_ButtonActive, active);
+}
+
+void pop_button_palette() { ImGui::PopStyleColor(3); }
 
 struct InputChannel {
   bool button = false;
@@ -52,6 +69,7 @@ struct Controls {
   std::vector<int> weapon;
   std::map<int, MotorSpec> motor_models;
   std::map<int, MotorSpec> weapon_motor_models;
+  std::map<int, double> filtered_wheel_speeds;
   std::map<int, int> manual_velocity_actuators;
   double battery_voltage = 0.0;
   double weapon_sign = -1.0;
@@ -102,6 +120,48 @@ std::string ungrouped_wheel_output_key(bool left, size_t index) {
 }
 
 std::string weapon_output_key() { return "weapon"; }
+
+int CadPartIndexFromGeom(const mjModel* model, int geom_id) {
+  if (!model || geom_id < 0) return -1;
+  const char* name = mj_id2name(model, mjOBJ_GEOM, geom_id);
+  if (!name || std::string(name).rfind("cad_part_", 0) != 0) return -1;
+  const std::string index_text = std::string(name).substr(9);
+  if (index_text.empty() || !std::all_of(index_text.begin(), index_text.end(),
+      [](unsigned char c) { return c >= '0' && c <= '9'; })) return -1;
+  try { return std::stoi(index_text); }
+  catch (...) { return -1; }
+}
+
+int SelectPreviewPartForHover(const mjModel* model, const mjData* data,
+                              const mjvOption* options, double aspect,
+                              double relx, double rely, const mjvScene& scene,
+                              const FusionBundle& bundle, mjtNum hit[3]) {
+  mjvScene pick_scene = scene;
+  std::vector<mjvGeom> cad_pick_geoms;
+  std::vector<int> cad_pick_order;
+  if (bundle.AxisPicking()) {
+    cad_pick_geoms.reserve(scene.ngeom);
+    cad_pick_order.reserve(scene.ngeom);
+    for (int i = 0; i < scene.ngeom; ++i) {
+      const mjvGeom& geom = scene.geoms[i];
+      if (geom.objtype != mjOBJ_GEOM) continue;
+      const int part = CadPartIndexFromGeom(model, geom.objid);
+      if (part < 0 || !bundle.PreviewVisible(part)) continue;
+      cad_pick_geoms.push_back(geom);
+      cad_pick_order.push_back(int(cad_pick_order.size()));
+    }
+    // The selected assembly is the axis destination. A shaft or hole reference
+    // may be on any visible CAD part, so ray-pick CAD only and ignore decor.
+    pick_scene.geoms = cad_pick_geoms.data();
+    pick_scene.geomorder = cad_pick_order.data();
+    pick_scene.ngeom = int(cad_pick_geoms.size());
+  }
+  int geom_id = -1, flex_id = -1, skin_id = -1;
+  const int selected = mjv_select(model, data, options, aspect, relx, rely,
+                                  &pick_scene, hit, &geom_id, &flex_id, &skin_id);
+  if (selected < 0 || geom_id < 0) return -1;
+  return CadPartIndexFromGeom(model, geom_id);
+}
 
 void initialize_default_mixer(InputMixer& mixer) {
   mixer = InputMixer{};
@@ -246,7 +306,7 @@ double motor_group_torque_per_wheel(const MotorSpec& motor, double battery_volta
                              actual_output_speed) / static_cast<double>(wheel_count);
 }
 
-void apply_wheel_drive_targets(const mjModel* model, mjData* data, const Controls& controls,
+void apply_wheel_drive_targets(const mjModel* model, mjData* data, Controls& controls,
                                double left_speed, double right_speed,
                                const std::map<int, double>* custom_speeds = nullptr) {
   struct PendingMotorGroup {
@@ -257,19 +317,32 @@ void apply_wheel_drive_targets(const mjModel* model, mjData* data, const Control
   };
   std::map<int, PendingMotorGroup> pending_motor_groups;
   auto set_wheel_actuator = [&](int id, double forward_sign, double desired_forward_speed) {
-    const double desired_joint_speed = forward_sign * desired_forward_speed;
     const auto motor = controls.motor_models.find(id);
     const auto manual_actuator = controls.manual_velocity_actuators.find(id);
     if (motor == controls.motor_models.end()) {
+      controls.filtered_wheel_speeds.erase(id);
+      const double desired_joint_speed = forward_sign * desired_forward_speed;
       data->ctrl[id] = desired_joint_speed;
       return;
     }
     if (controls.manual_wheel_rpm_override &&
         manual_actuator != controls.manual_velocity_actuators.end()) {
+      controls.filtered_wheel_speeds[id] = desired_forward_speed;
+      const double desired_joint_speed = forward_sign * desired_forward_speed;
       data->ctrl[id] = 0.0;
       data->ctrl[manual_actuator->second] = desired_joint_speed;
       return;
     }
+    const double no_load_rpm = MotorNoLoadOutputRpm(motor->second, controls.battery_voltage);
+    const double reference_speed = std::max(std::abs(desired_forward_speed),
+      no_load_rpm * 2.0 * pi / 60.0);
+    const double max_speed_step = reference_speed * model->opt.timestep /
+      drive_command_ramp_seconds;
+    double& filtered_speed = controls.filtered_wheel_speeds[id];
+    filtered_speed += std::clamp(desired_forward_speed - filtered_speed,
+      -max_speed_step, max_speed_step);
+    desired_forward_speed = filtered_speed;
+    const double desired_joint_speed = forward_sign * desired_forward_speed;
     if (manual_actuator != controls.manual_velocity_actuators.end()) {
       const int joint = model->actuator_trnid[2 * id];
       if (joint >= 0 && joint < model->njnt) {
@@ -411,6 +484,231 @@ bool body_is_in_subtree(const mjModel* model, int body, int root) {
   for (int current = body; current > 0; current = model->body_parentid[current])
     if (current == root) return true;
   return false;
+}
+
+using Vec3 = std::array<double, 3>;
+using ScreenPoint = std::array<double, 2>;
+constexpr std::array<Vec3, 3> world_axes{{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
+constexpr std::array<std::array<Vec3, 2>, 3> ring_basis{{
+  {{{0, 1, 0}, {0, 0, 1}}},
+  {{{0, 0, 1}, {1, 0, 0}}},
+  {{{1, 0, 0}, {0, 1, 0}}}
+}};
+
+double dot3(const Vec3& a, const Vec3& b) {
+  return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+
+Vec3 cross3(const Vec3& a, const Vec3& b) {
+  return {a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2],
+          a[0]*b[1] - a[1]*b[0]};
+}
+
+bool project_to_screen(const mjModel* model, const mjvScene& scene,
+                       int width, int height, const Vec3& point, ScreenPoint& screen) {
+  if (!model || width <= 0 || height <= 0) return false;
+  const mjvGLCamera& camera = scene.camera[0];
+  const Vec3 position{camera.pos[0], camera.pos[1], camera.pos[2]};
+  Vec3 forward{camera.forward[0], camera.forward[1], camera.forward[2]};
+  Vec3 up{camera.up[0], camera.up[1], camera.up[2]};
+  const double forward_length = std::sqrt(dot3(forward, forward));
+  const double up_length = std::sqrt(dot3(up, up));
+  if (forward_length < 1e-9 || up_length < 1e-9) return false;
+  for (double& value : forward) value /= forward_length;
+  for (double& value : up) value /= up_length;
+  Vec3 right = cross3(forward, up);
+  const double right_length = std::sqrt(dot3(right, right));
+  if (right_length < 1e-9) return false;
+  for (double& value : right) value /= right_length;
+  const Vec3 relative{point[0] - position[0], point[1] - position[1], point[2] - position[2]};
+  const double depth = dot3(relative, forward);
+  if (depth <= std::max(1e-5, double(camera.frustum_near) * 0.25)) return false;
+  const double fovy = model->vis.global.fovy;
+  if (!std::isfinite(fovy) || fovy <= 1e-4) return false;
+  const double focal = camera.orthographic
+    ? height / fovy
+    : height / (2.0 * std::tan(fovy * pi / 360.0));
+  const double horizontal = dot3(relative, right);
+  const double vertical = dot3(relative, up);
+  const double divisor = camera.orthographic ? 1.0 : depth;
+  screen = {width * 0.5 + horizontal * focal / divisor,
+            height * 0.5 - vertical * focal / divisor};
+  return std::isfinite(screen[0]) && std::isfinite(screen[1]);
+}
+
+double point_segment_distance(const ScreenPoint& point, const ScreenPoint& first,
+                              const ScreenPoint& second, double* fraction = nullptr) {
+  const double dx = second[0] - first[0], dy = second[1] - first[1];
+  const double length2 = dx*dx + dy*dy;
+  const double t = length2 > 1e-9
+    ? std::clamp(((point[0] - first[0])*dx + (point[1] - first[1])*dy) / length2, 0.0, 1.0)
+    : 0.0;
+  if (fraction) *fraction = t;
+  const double ex = point[0] - (first[0] + t*dx);
+  const double ey = point[1] - (first[1] + t*dy);
+  return std::sqrt(ex*ex + ey*ey);
+}
+
+Vec3 ring_point(const Vec3& center, int axis, double radius, double angle) {
+  const auto& basis = ring_basis[axis];
+  return {center[0] + radius*(std::cos(angle)*basis[0][0] + std::sin(angle)*basis[1][0]),
+          center[1] + radius*(std::cos(angle)*basis[0][1] + std::sin(angle)*basis[1][1]),
+          center[2] + radius*(std::cos(angle)*basis[0][2] + std::sin(angle)*basis[1][2])};
+}
+
+struct GizmoHit {
+  int axis = -1;
+  double distance = std::numeric_limits<double>::infinity();
+  double angle = 0.0;
+};
+
+GizmoHit pick_translation_axis(const mjModel* model, const mjvScene& scene,
+                               int width, int height, const Vec3& center,
+                               double length, const ScreenPoint& mouse) {
+  GizmoHit best;
+  ScreenPoint start;
+  if (!project_to_screen(model, scene, width, height, center, start)) return best;
+  for (int axis = 0; axis < 3; ++axis) {
+    const Vec3 end_world{center[0] + length*world_axes[axis][0],
+                         center[1] + length*world_axes[axis][1],
+                         center[2] + length*world_axes[axis][2]};
+    ScreenPoint end;
+    if (!project_to_screen(model, scene, width, height, end_world, end)) continue;
+    const double distance = point_segment_distance(mouse, start, end);
+    if (distance < best.distance) best = {axis, distance, 0.0};
+  }
+  return best;
+}
+
+GizmoHit pick_rotation_ring(const mjModel* model, const mjvScene& scene,
+                            int width, int height, const Vec3& center,
+                            double radius, const ScreenPoint& mouse, int only_axis = -1) {
+  GizmoHit best;
+  constexpr int segments = 96;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (only_axis >= 0 && axis != only_axis) continue;
+    ScreenPoint previous;
+    if (!project_to_screen(model, scene, width, height,
+                           ring_point(center, axis, radius, 0.0), previous)) continue;
+    for (int i = 0; i < segments; ++i) {
+      const double next_angle = 2.0*pi*(i + 1)/segments;
+      ScreenPoint next;
+      if (!project_to_screen(model, scene, width, height,
+                             ring_point(center, axis, radius, next_angle), next)) continue;
+      double fraction = 0.0;
+      const double distance = point_segment_distance(mouse, previous, next, &fraction);
+      if (distance < best.distance)
+        best = {axis, distance, 2.0*pi*(i + fraction)/segments};
+      previous = next;
+    }
+  }
+  return best;
+}
+
+int free_joint_for_body(const mjModel* model, int body) {
+  if (body <= 0 || body >= model->nbody) return -1;
+  const int first = model->body_jntadr[body];
+  for (int i = 0; i < model->body_jntnum[body]; ++i) {
+    const int joint = first + i;
+    if (model->jnt_type[joint] == mjJNT_FREE) return joint;
+  }
+  return -1;
+}
+
+bool translate_free_body_axis(const mjModel* model, mjData* data, int body,
+                              int axis, double distance) {
+  if (axis < 0 || axis >= 3 || !std::isfinite(distance)) return false;
+  const int joint = free_joint_for_body(model, body);
+  if (joint < 0) return false;
+  const int qpos = model->jnt_qposadr[joint];
+  const int dof = model->jnt_dofadr[joint];
+  for (int i = 0; i < 3; ++i) data->qpos[qpos + i] += world_axes[axis][i] * distance;
+  for (int i = 0; i < 6; ++i) data->qvel[dof + i] = 0.0;
+  mj_forward(model, data);
+  return true;
+}
+
+bool rotate_free_body_axis(const mjModel* model, mjData* data, int body, int axis,
+                           double angle, const Vec3& pivot, const Vec3& local_pivot) {
+  if (axis < 0 || axis >= 3 || !std::isfinite(angle)) return false;
+  const int joint = free_joint_for_body(model, body);
+  if (joint < 0) return false;
+  const int qpos = model->jnt_qposadr[joint];
+  const int dof = model->jnt_dofadr[joint];
+  const double half = angle * 0.5;
+  const mjtNum delta_quat[4] = {std::cos(half),
+    world_axes[axis][0]*std::sin(half), world_axes[axis][1]*std::sin(half),
+    world_axes[axis][2]*std::sin(half)};
+  mjtNum next_quat[4];
+  mju_mulQuat(next_quat, delta_quat, data->qpos + qpos + 3);
+  const double norm = std::sqrt(next_quat[0]*next_quat[0] + next_quat[1]*next_quat[1] +
+                                next_quat[2]*next_quat[2] + next_quat[3]*next_quat[3]);
+  if (!std::isfinite(norm) || norm < 1e-9) return false;
+  for (int i = 0; i < 4; ++i) data->qpos[qpos + 3 + i] = next_quat[i] / norm;
+  mjtNum rotated_pivot[3];
+  mju_rotVecQuat(rotated_pivot, local_pivot.data(), data->qpos + qpos + 3);
+  for (int i = 0; i < 3; ++i) data->qpos[qpos + i] = pivot[i] - rotated_pivot[i];
+  for (int i = 0; i < 6; ++i) data->qvel[dof + i] = 0.0;
+  mj_forward(model, data);
+  return true;
+}
+
+void add_transform_gizmo(const mjModel* model, const mjData* data, int body,
+                         bool rotation_mode, int active_axis, double length,
+                         mjvScene& scene) {
+  if (body <= 0 || body >= model->nbody || scene.ngeom >= scene.maxgeom) return;
+  const Vec3 center{data->subtree_com[3*body], data->subtree_com[3*body + 1],
+                    data->subtree_com[3*body + 2]};
+  const float colors[3][4] = {{0.96f, 0.18f, 0.16f, 1.0f},
+                              {0.20f, 0.86f, 0.28f, 1.0f},
+                              {0.20f, 0.48f, 1.0f, 1.0f}};
+  const float selected[4] = {1.0f, 0.78f, 0.18f, 1.0f};
+  auto connector = [&](int type, double width, const Vec3& from, const Vec3& to,
+                       const float* rgba) {
+    if (scene.ngeom >= scene.maxgeom) return;
+    mjtNum a[3] = {from[0], from[1], from[2]};
+    mjtNum b[3] = {to[0], to[1], to[2]};
+    const int index = scene.ngeom++;
+    scene.geomorder[index] = index;
+    mjvGeom& geom = scene.geoms[index];
+    mjv_initGeom(&geom, type, nullptr, nullptr, nullptr, rgba);
+    mjv_connector(&geom, type, width, a, b);
+    geom.objtype = mjOBJ_UNKNOWN;
+    geom.objid = -1;
+    geom.category = mjCAT_DECOR;
+  };
+  if (!rotation_mode) {
+    const mjtNum marker_size[3] = {0.018, 0.018, 0.018};
+    if (scene.ngeom < scene.maxgeom) {
+      mjtNum origin[3] = {center[0], center[1], center[2]};
+      const int index = scene.ngeom++;
+      scene.geomorder[index] = index;
+      mjvGeom& marker = scene.geoms[index];
+      mjv_initGeom(&marker, mjGEOM_SPHERE, marker_size, origin, nullptr, selected);
+      marker.objtype = mjOBJ_UNKNOWN;
+      marker.objid = -1;
+      marker.category = mjCAT_DECOR;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+      const Vec3 end{center[0] + length*world_axes[axis][0],
+                     center[1] + length*world_axes[axis][1],
+                     center[2] + length*world_axes[axis][2]};
+      const float* color = axis == active_axis ? selected : colors[axis];
+      connector(mjGEOM_ARROW, 0.014, center, end, color);
+    }
+  } else {
+    constexpr int segments = 48;
+    const double radius = length * 0.82;
+    for (int axis = 0; axis < 3; ++axis) {
+      const float* color = axis == active_axis ? selected : colors[axis];
+      Vec3 previous = ring_point(center, axis, radius, 0.0);
+      for (int i = 1; i <= segments; ++i) {
+        const Vec3 next = ring_point(center, axis, radius, 2.0*pi*i/segments);
+        connector(mjGEOM_LINE, 3.0, previous, next, color);
+        previous = next;
+      }
+    }
+  }
 }
 
 WheelSlip wheel_slip(const mjModel* model, const mjData* data, int actuator_id) {
@@ -633,6 +931,14 @@ float output_value(const InputMixer& mixer, const MixerOutputDescriptor& output,
     expos == mixer.output_expos.end() ? nullptr : &expos->second);
 }
 
+float output_channel_response(const InputMixer& mixer, const MixerOutputDescriptor& output,
+                              int channel_index, float channel_value) {
+  std::array<float, max_input_channels> sample{};
+  if (channel_index >= 0 && channel_index < max_input_channels)
+    sample[channel_index] = channel_value;
+  return output_value(mixer, output, sample);
+}
+
 void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
                        SDL_JoystickID& joystick_id, const Controls& controls) {
   bool changed = false;
@@ -643,10 +949,15 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
   if (selected_name.empty()) selected_name = mixer.preferred_guid == "none"
     ? "No joystick selected" : "Choose USB joystick";
 
-  ImGui::BeginChild("Controller input setup", ImVec2(376.0f, 0.0f),
+  const float dialog_width = ImGui::GetContentRegionAvail().x;
+  const float input_panel_width = std::min(480.0f, std::max(340.0f, dialog_width * 0.44f));
+  constexpr float footer_reserve = 72.0f;
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.155f, 0.205f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.27f, 0.34f, 0.43f, 1.0f));
+  ImGui::BeginChild("Controller input setup", ImVec2(input_panel_width, -footer_reserve),
                     ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
                     ImGuiWindowFlags_AlwaysVerticalScrollbar);
-  ImGui::TextColored(ImVec4(0.32f, 0.88f, 0.89f, 1.0f), "INPUT SOURCES");
+  ImGui::TextColored(ui_blue, "INPUT SOURCES");
   if (ImGui::BeginCombo("USB joystick", selected_name.c_str())) {
     if (ImGui::Selectable("No joystick", mixer.preferred_guid == "none")) {
       mixer.preferred_guid = "none";
@@ -674,7 +985,7 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
   if (ImGui::Checkbox("Enable custom joystick mixer", &mixer.enabled)) changed = true;
   ImGui::TextDisabled("RC default: left = Ch1 - Ch2; right = Ch1 + Ch2; weapon = Ch3.");
   if (mixer.enabled && !joystick)
-    ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.34f, 1.0f),
+    ImGui::TextColored(ui_amber,
       "Mixer is enabled but no joystick is connected; keyboard and mapped gamepad controls remain available.");
 
   ImGui::SeparatorText("Input channels");
@@ -691,10 +1002,11 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
   ImGui::TextDisabled("%d / %d channels", mixer.channel_count, max_input_channels);
 
   const auto live_channels = read_input_channels(joystick, mixer);
+  const float input_table_height = std::min(360.0f, 36.0f + 30.0f * mixer.channel_count);
   if (ImGui::BeginTable("##joystick_input_channels", 6,
       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX |
       ImGuiTableFlags_SizingFixedFit,
-      ImVec2(0.0f, 210.0f))) {
+      ImVec2(0.0f, input_table_height))) {
     ImGui::TableSetupColumn("Channel", ImGuiTableColumnFlags_WidthFixed, 55.0f);
     ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 86.0f);
     ImGui::TableSetupColumn("Index", ImGuiTableColumnFlags_WidthFixed, 54.0f);
@@ -736,12 +1048,15 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
     ImGui::EndTable();
   }
   ImGui::EndChild();
+  ImGui::PopStyleColor(2);
 
   ImGui::SameLine(0.0f, 12.0f);
-  ImGui::BeginChild("Controller output mixer", ImVec2(0.0f, 0.0f),
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.145f, 0.125f, 0.19f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.36f, 0.29f, 0.46f, 1.0f));
+  ImGui::BeginChild("Controller output mixer", ImVec2(0.0f, -footer_reserve),
                     ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
                     ImGuiWindowFlags_AlwaysVerticalScrollbar);
-  ImGui::TextColored(ImVec4(0.32f, 0.88f, 0.89f, 1.0f), "OUTPUT MIXES");
+  ImGui::TextColored(ui_violet, "OUTPUT MIXES");
   static std::string selected_output_key;
   static int graph_channel = 0;
   if (!outputs.empty() && std::none_of(outputs.begin(), outputs.end(), [&](const auto& output) {
@@ -779,9 +1094,10 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
     }
     ImGui::SameLine();
     ImGui::TextDisabled("Each channel is a mix line: input x weight + offset, with optional expo.");
+    const float output_table_height = std::min(260.0f, 36.0f + 28.0f * mixer.channel_count);
     if (ImGui::BeginTable("##output_mix_lines", 5,
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit,
-        ImVec2(0.0f, 300.0f))) {
+        ImVec2(0.0f, output_table_height))) {
       ImGui::TableSetupColumn("Input", ImGuiTableColumnFlags_WidthFixed, 58.0f);
       ImGui::TableSetupColumn("Live", ImGuiTableColumnFlags_WidthFixed, 70.0f);
       ImGui::TableSetupColumn("Weight", ImGuiTableColumnFlags_WidthFixed, 108.0f);
@@ -827,9 +1143,10 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
     }
     const float live_output = output_value(mixer, output, live_channels);
     ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.32f, 0.88f, 0.89f, 1.0f),
-                       "Output %+.0f%%", live_output * 100.0f);
-    const ImVec2 graph_size(std::max(260.0f, ImGui::GetContentRegionAvail().x), 220.0f);
+    ImGui::TextColored(ui_violet,
+                       "Mixed output %+.0f%%", live_output * 100.0f);
+    ImGui::TextDisabled("Curve and amber dot show this input alone; the mixed output includes all channels.");
+    const ImVec2 graph_size(std::max(260.0f, ImGui::GetContentRegionAvail().x), 200.0f);
     const ImVec2 graph_min = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("##mixer_response_graph", graph_size);
     const ImVec2 graph_max(graph_min.x + graph_size.x, graph_min.y + graph_size.y);
@@ -837,7 +1154,7 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
     const ImU32 graph_bg = ImGui::GetColorU32(ImGuiCol_FrameBg);
     const ImU32 grid_color = ImGui::GetColorU32(ImGuiCol_Border);
     const ImU32 axis_color = ImGui::GetColorU32(ImGuiCol_TextDisabled);
-    const ImU32 curve_color = ImGui::GetColorU32(ImVec4(0.20f, 0.82f, 0.88f, 1.0f));
+    const ImU32 curve_color = ImGui::GetColorU32(ui_teal);
     const ImVec2 plot_min(graph_min.x + 36.0f, graph_min.y + 12.0f);
     const ImVec2 plot_max(graph_max.x - 12.0f, graph_max.y - 26.0f);
     const float input_min = mixer.channels[graph_channel].button ? 0.0f : -1.0f;
@@ -869,9 +1186,7 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
     draw->AddText(ImVec2(plot_max.x - 67.0f, graph_max.y - 19.0f), axis_color,
                   "+100% INPUT");
     auto evaluate_graph = [&](float x) {
-      auto sample = live_channels;
-      sample[graph_channel] = x;
-      return output_value(mixer, output, sample);
+      return output_channel_response(mixer, output, graph_channel, x);
     };
     ImVec2 previous = map_point(input_min, evaluate_graph(input_min));
     constexpr int curve_samples = 64;
@@ -881,35 +1196,147 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
       draw->AddLine(previous, next, curve_color, 2.5f);
       previous = next;
     }
-    const ImVec2 dot = map_point(live_channels[graph_channel], live_output);
-    draw->AddCircleFilled(dot, 7.0f, ImGui::GetColorU32(ImVec4(1.0f, 0.72f, 0.18f, 1.0f)));
-    draw->AddCircle(dot, 9.0f, ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.95f)), 16, 1.5f);
+    const ImVec2 dot = map_point(live_channels[graph_channel],
+                                 evaluate_graph(live_channels[graph_channel]));
+    draw->AddCircleFilled(dot, 7.0f, ImGui::GetColorU32(ImVec4(0.91f, 0.53f, 0.10f, 1.0f)));
+    draw->AddCircle(dot, 9.0f, ImGui::GetColorU32(ui_ink), 16, 1.5f);
   }
-  ImGui::TextDisabled("Drive outputs clamp to -100..100%%. Weapon uses 0..100%%. Positive expo softens the center; negative expo sharpens it.");
+  ImGui::TextWrapped("Drive outputs clamp to -100..100%%. Weapon uses 0..100%%. Positive expo softens the center; negative expo sharpens it.");
   ImGui::EndChild();
+  ImGui::PopStyleColor(2);
   if (changed) {
     if (!save_mixer_settings(mixer))
-      ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "Could not save mixer settings.");
+      ImGui::TextColored(ui_red, "Could not save mixer settings.");
   }
 }
 
+struct KeyboardControls {
+  float throttle = 0.0f;
+  float turn = 0.0f;
+  bool weapon = false;
+};
+
+constexpr double opponent_ai_start_delay_seconds = 2.0;
+
+bool opponent_ai_delay_elapsed(double simulation_time) {
+  return std::isfinite(simulation_time) &&
+         simulation_time >= opponent_ai_start_delay_seconds;
+}
+
+KeyboardControls read_keyboard_controls(const bool* keys, bool opponent = false) {
+  if (!keys) return {};
+  if (opponent) {
+    return {
+      float(keys[SDL_SCANCODE_I]) - float(keys[SDL_SCANCODE_K]),
+      float(keys[SDL_SCANCODE_J]) - float(keys[SDL_SCANCODE_L]),
+      keys[SDL_SCANCODE_M]
+    };
+  }
+  return {float(keys[SDL_SCANCODE_W]) - float(keys[SDL_SCANCODE_S]),
+          float(keys[SDL_SCANCODE_A]) - float(keys[SDL_SCANCODE_D]),
+          keys[SDL_SCANCODE_SPACE]};
+}
+
+KeyboardControls aim_and_ram_command(const Vec3& robot_position,
+                                     const Vec3& target_position,
+                                     const Vec3& forward_heading,
+                                     bool weapon_available,
+                                     float aggression_percent) {
+  const double dx = target_position[0] - robot_position[0];
+  const double dy = target_position[1] - robot_position[1];
+  const double distance = std::hypot(dx, dy);
+  const double heading_length = std::hypot(forward_heading[0], forward_heading[1]);
+  if (!std::isfinite(distance) || distance <= 1e-5 ||
+      !std::isfinite(heading_length) || heading_length <= 1e-6)
+    return {};
+
+  const double target_x = dx / distance;
+  const double target_y = dy / distance;
+  const double forward_x = forward_heading[0] / heading_length;
+  const double forward_y = forward_heading[1] / heading_length;
+  const double heading_error = std::atan2(
+      forward_x * target_y - forward_y * target_x,
+      forward_x * target_x + forward_y * target_y);
+
+  KeyboardControls command;
+  command.weapon = weapon_available;
+  const float aggression = std::clamp(aggression_percent, 25.0f, 100.0f) / 100.0f;
+  constexpr double ram_alignment_tolerance = 0.18;
+  if (std::abs(heading_error) <= ram_alignment_tolerance) {
+    command.throttle = aggression;
+  } else {
+    command.turn = float(std::clamp(heading_error * 1.7, -1.0, 1.0)) * aggression;
+  }
+  return command;
+}
+
+KeyboardControls opponent_ram_ai(const mjModel* model, const mjData* data,
+                                 const Controls& opponent_controls,
+                                 float aggression_percent) {
+  if (!model || !data || opponent_controls.left.empty() ||
+      opponent_controls.right.empty()) return {};
+  const int robot_body = mj_name2id(model, mjOBJ_BODY, "Target_Robot");
+  const int target_body = mj_name2id(model, mjOBJ_BODY, "Player_Robot");
+  if (robot_body <= 0 || target_body <= 0) return {};
+
+  auto average_wheel_center = [&](const auto& wheels, Vec3& center) {
+    int count = 0;
+    for (const auto& [actuator_id, direction] : wheels) {
+      (void)direction;
+      if (actuator_id < 0 || actuator_id >= model->nu) continue;
+      const int joint_id = model->actuator_trnid[2 * actuator_id];
+      if (joint_id < 0 || joint_id >= model->njnt) continue;
+      const int body_id = model->jnt_bodyid[joint_id];
+      if (body_id <= 0 || body_id >= model->nbody) continue;
+      for (int axis = 0; axis < 3; ++axis)
+        center[axis] += data->xpos[3 * body_id + axis];
+      ++count;
+    }
+    if (count == 0) return false;
+    for (double& value : center) value /= count;
+    return true;
+  };
+
+  Vec3 left_center{}, right_center{};
+  if (!average_wheel_center(opponent_controls.left, left_center) ||
+      !average_wheel_center(opponent_controls.right, right_center)) return {};
+  Vec3 lateral{right_center[0] - left_center[0],
+               right_center[1] - left_center[1], 0.0};
+  Vec3 heading = cross3({0.0, 0.0, 1.0}, lateral);
+  const double heading_length = std::hypot(heading[0], heading[1]);
+  if (!std::isfinite(heading_length) || heading_length <= 1e-6) return {};
+  heading[0] /= heading_length;
+  heading[1] /= heading_length;
+
+  const Vec3 robot_position{data->subtree_com[3 * robot_body],
+                            data->subtree_com[3 * robot_body + 1],
+                            data->subtree_com[3 * robot_body + 2]};
+  const Vec3 target_position{data->subtree_com[3 * target_body],
+                             data->subtree_com[3 * target_body + 1],
+                             data->subtree_com[3 * target_body + 2]};
+  return aim_and_ram_command(robot_position, target_position, heading,
+                             !opponent_controls.weapon.empty(), aggression_percent);
+}
+
 void drive(const mjModel* model, mjData* data, Controls& c, SDL_Gamepad* pad,
-           SDL_Joystick* joystick, const InputMixer& mixer, bool keyboard_enabled) {
-  const bool* keys = SDL_GetKeyboardState(nullptr);
-  float throttle = keyboard_enabled ? float(keys[SDL_SCANCODE_W]) - float(keys[SDL_SCANCODE_S]) : 0.0f;
-  float turn = keyboard_enabled ? float(keys[SDL_SCANCODE_A]) - float(keys[SDL_SCANCODE_D]) : 0.0f;
-  const bool custom_input = mixer.enabled && joystick;
+           SDL_Joystick* joystick, const InputMixer& mixer,
+           const KeyboardControls& keyboard, bool external_inputs_enabled) {
+  float throttle = keyboard.throttle;
+  float turn = keyboard.turn;
+  const bool custom_input = external_inputs_enabled && mixer.enabled && joystick;
   std::array<float, max_input_channels> channels{};
   float weapon_throttle = 0.0f;
   if (custom_input) {
     channels = read_input_channels(joystick, mixer);
   } else {
-    const float pad_throttle = -axis_with_deadzone(pad, SDL_GAMEPAD_AXIS_LEFTY, c.deadzone);
-    const float pad_turn = -axis_with_deadzone(pad, SDL_GAMEPAD_AXIS_LEFTX, c.deadzone);
+    const float pad_throttle = external_inputs_enabled
+      ? -axis_with_deadzone(pad, SDL_GAMEPAD_AXIS_LEFTY, c.deadzone) : 0.0f;
+    const float pad_turn = external_inputs_enabled
+      ? -axis_with_deadzone(pad, SDL_GAMEPAD_AXIS_LEFTX, c.deadzone) : 0.0f;
     if (pad_throttle != 0.0f) throttle = pad_throttle;
     if (pad_turn != 0.0f) turn = pad_turn;
-    weapon_throttle = ((keyboard_enabled && keys[SDL_SCANCODE_SPACE]) ||
-      (pad && (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) ||
+    weapon_throttle = (keyboard.weapon ||
+      (external_inputs_enabled && pad && (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) ||
                SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_SOUTH)))) ? 1.0f : 0.0f;
   }
 
@@ -955,6 +1382,7 @@ void drive(const mjModel* model, mjData* data, Controls& c, SDL_Gamepad* pad,
 
 int main(int argc, char** argv) {
   FusionBundle bundle;
+  FusionBundle opponent_bundle;
   if (argc >= 2 && std::string(argv[1]) == "--test-input-mixer") {
     std::array<float, max_input_channels> input{0.6f, 0.25f, 1.0f};
     std::array<float, max_input_channels> left_weights{};
@@ -1002,6 +1430,7 @@ int main(int argc, char** argv) {
         std::abs(capped - 1.0f) > 1e-5f || std::abs(weapon_off) > 1e-6f ||
         !motor_a_output || !motor_b_output || !weapon_output ||
         std::abs(output_value(defaults, *motor_a_output, input) - 0.35f) > 1e-5f ||
+        std::abs(output_channel_response(defaults, *motor_a_output, 0, input[0]) - 0.6f) > 1e-5f ||
         std::abs(output_value(defaults, *motor_b_output, input) - 0.85f) > 1e-5f ||
         std::abs(output_value(defaults, *weapon_output, input) - 1.0f) > 1e-5f ||
         std::abs(normalize_axis(0, 0.12f)) > 1e-6f ||
@@ -1010,7 +1439,297 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "Input mixer failed: elevon sums, weight/offset/expo, weapon range, or axis calibration are incorrect.\n");
       return 1;
     }
-    std::puts("Input mixer passed: motor outputs, elevon sums, weight/offset/expo, weapon channel, and axis normalization.");
+    std::puts("Input mixer passed: combined motor outputs, isolated channel response, elevon sums, weight/offset/expo, weapon channel, and axis normalization.");
+    return 0;
+  }
+  if (argc >= 4 && std::string(argv[1]) == "--test-opponent-bundle") {
+    if (!bundle.Load(argv[2])) {
+      std::fprintf(stderr, "Player bundle load failed: %s\n", bundle.Error().c_str());
+      return 1;
+    }
+    if (!opponent_bundle.Load(argv[3])) {
+      std::fprintf(stderr, "Opponent bundle load failed: %s\n", opponent_bundle.Error().c_str());
+      return 1;
+    }
+    std::filesystem::path generated;
+    if (!bundle.Generate(generated, &opponent_bundle)) {
+      std::fprintf(stderr, "Opponent model generation failed: %s\n", bundle.Error().c_str());
+      return 1;
+    }
+    std::array<char, 8192> diagnostic{};
+    mjModel* test_model = mj_loadXML(generated.string().c_str(), nullptr,
+                                      diagnostic.data(), diagnostic.size());
+    if (!test_model) {
+      std::fprintf(stderr, "Generated opponent model did not load: %s\n", diagnostic.data());
+      return 1;
+    }
+    mjData* test_data = mj_makeData(test_model);
+    const int target_body = mj_name2id(test_model, mjOBJ_BODY, "Target_Robot");
+    const int target_joint = mj_name2id(test_model, mjOBJ_JOINT, "target_free");
+    const int opponent_geom = mj_name2id(test_model, mjOBJ_GEOM, "opponent_part_0");
+    double opponent_total_mass = target_body >= 0 ? test_model->body_mass[target_body] : 0.0;
+    for (int group = 1; group <= 4; ++group) {
+      const std::string body_name = "opponent_assembly_" + std::to_string(group);
+      const int body_id = mj_name2id(test_model, mjOBJ_BODY, body_name.c_str());
+      if (body_id >= 0) opponent_total_mass += test_model->body_mass[body_id];
+    }
+    if (!test_data || target_body < 0 || target_joint < 0 || opponent_geom < 0 ||
+        std::abs(opponent_total_mass - 0.34) > 1e-6 ||
+        test_model->geom_contype[opponent_geom] == 0 ||
+        test_model->geom_conaffinity[opponent_geom] == 0) {
+      std::fprintf(stderr, "Opponent assembly bodies, imported collision mesh, or combined mass is missing.\n");
+      if (test_data) mj_deleteData(test_data);
+      mj_deleteModel(test_model);
+      return 1;
+    }
+    for (int group = 1; group <= 4; ++group) {
+      const std::string joint_name = "opponent_joint_" + std::to_string(group);
+      const int joint_id = mj_name2id(test_model, mjOBJ_JOINT, joint_name.c_str());
+      if (joint_id < 0 || test_model->jnt_type[joint_id] != mjJNT_HINGE) {
+        std::fprintf(stderr, "Opponent wheel/weapon/fork hinge %s is missing.\n", joint_name.c_str());
+        mj_deleteData(test_data); mj_deleteModel(test_model);
+        return 1;
+      }
+    }
+    Controls opponent_test_controls;
+    opponent_bundle.BindControls(test_model, opponent_test_controls.left,
+        opponent_test_controls.right, opponent_test_controls.weapon,
+        opponent_test_controls.motor_models, opponent_test_controls.weapon_motor_models,
+        opponent_test_controls.manual_velocity_actuators,
+        opponent_test_controls.battery_voltage, true);
+    const int opponent_weapon_actuator = mj_name2id(
+        test_model, mjOBJ_ACTUATOR, "opponent_assembly_1_drive");
+    const int opponent_wheel_actuator = mj_name2id(
+        test_model, mjOBJ_ACTUATOR, "opponent_assembly_2_drive");
+    const int opponent_right_wheel_actuator = mj_name2id(
+        test_model, mjOBJ_ACTUATOR, "opponent_assembly_3_drive");
+    if (opponent_weapon_actuator < 0 || opponent_wheel_actuator < 0 ||
+        opponent_right_wheel_actuator < 0 || opponent_test_controls.left.size() != 1 ||
+        opponent_test_controls.right.size() != 1 ||
+        opponent_test_controls.weapon.size() != 1 ||
+        opponent_test_controls.motor_models.size() != 2 ||
+        opponent_test_controls.weapon_motor_models.size() != 1 ||
+        opponent_test_controls.manual_velocity_actuators.size() != 2) {
+      std::fprintf(stderr, "Opponent wheel/weapon motor actuators did not bind independently.\n");
+      mj_deleteData(test_data); mj_deleteModel(test_model);
+      return 1;
+    }
+    const int opponent_fork_geom = mj_name2id(test_model, mjOBJ_GEOM, "opponent_part_3");
+    bool opponent_fork_pair = false;
+    for (int pair = 0; pair < test_model->npair; ++pair)
+      if ((test_model->pair_geom1[pair] == opponent_fork_geom &&
+           test_model->pair_geom2[pair] == opponent_geom) ||
+          (test_model->pair_geom2[pair] == opponent_fork_geom &&
+           test_model->pair_geom1[pair] == opponent_geom))
+        opponent_fork_pair = true;
+    if (!opponent_fork_pair) {
+      std::fprintf(stderr, "Configured opponent fork does not have its frame collision pair.\n");
+      mj_deleteData(test_data); mj_deleteModel(test_model);
+      return 1;
+    }
+    mj_forward(test_model, test_data);
+    const int target_qpos = test_model->jnt_qposadr[target_joint];
+    if (std::abs(test_data->qpos[target_qpos] - 0.55) > 1e-6 ||
+        std::abs(test_data->qpos[target_qpos + 1]) > 1e-6 ||
+        std::abs(test_data->qpos[target_qpos + 2] - 0.012) > 1e-6) {
+      std::fprintf(stderr, "Opponent did not spawn opposite the player.\n");
+      mj_deleteData(test_data); mj_deleteModel(test_model);
+      return 1;
+    }
+    const KeyboardControls spawn_ai_command = opponent_ram_ai(
+        test_model, test_data, opponent_test_controls, 70.0f);
+    if (std::abs(spawn_ai_command.throttle - 0.70f) > 1e-6f ||
+        spawn_ai_command.turn != 0.0f ||
+        !spawn_ai_command.weapon) {
+      std::fprintf(stderr,
+          "Opponent ram AI did not apply 70%% aggression toward the player ahead from its configured spawn heading.\n");
+      mj_deleteData(test_data); mj_deleteModel(test_model);
+      return 1;
+    }
+    const int player_body = mj_name2id(test_model, mjOBJ_BODY, "Player_Robot");
+    const int player_joint = mj_name2id(test_model, mjOBJ_JOINT, "robot_free");
+    const int player_geom = mj_name2id(test_model, mjOBJ_GEOM, "cad_part_0");
+    if (player_body < 0 || player_joint < 0 || player_geom < 0) {
+      std::fprintf(stderr, "Player free body missing while loading opponent.\n");
+      mj_deleteData(test_data); mj_deleteModel(test_model);
+      return 1;
+    }
+    const int player_qpos = test_model->jnt_qposadr[player_joint];
+    test_data->qpos[player_qpos + 1] += 0.5;
+    mj_forward(test_model, test_data);
+    const KeyboardControls side_aim_command = opponent_ram_ai(
+        test_model, test_data, opponent_test_controls, 70.0f);
+    if (side_aim_command.throttle != 0.0f || side_aim_command.turn >= 0.0f) {
+      std::fprintf(stderr,
+          "Opponent ram AI did not turn toward a player shifted to its left.\n");
+      mj_deleteData(test_data); mj_deleteModel(test_model);
+      return 1;
+    }
+    test_data->qpos[player_qpos + 1] -= 0.5;
+    mj_forward(test_model, test_data);
+    // Keep the earlier assertion that the target initially faces the player,
+    // then align its orientation for a direct collision-overlap check.
+    test_data->qpos[target_qpos + 6] = 1.0;
+    test_data->qpos[target_qpos + 7] = 0.0;
+    test_data->qpos[target_qpos + 8] = 0.0;
+    test_data->qpos[target_qpos + 9] = 0.0;
+    mj_forward(test_model, test_data);
+    for (int axis = 0; axis < 3; ++axis)
+      test_data->qpos[target_qpos + axis] +=
+        test_data->geom_xpos[3 * player_geom + axis] -
+        test_data->geom_xpos[3 * opponent_geom + axis];
+    test_data->qpos[target_qpos] += 0.02;  // Partial overlap avoids coincident-mesh ambiguity.
+    mj_forward(test_model, test_data);
+    bool contact_with_player = false;
+    for (int i = 0; i < test_data->ncon; ++i) {
+      const int body0 = test_model->geom_bodyid[test_data->contact[i].geom[0]];
+      const int body1 = test_model->geom_bodyid[test_data->contact[i].geom[1]];
+      if ((body0 == target_body && body1 == player_body) ||
+          (body1 == target_body && body0 == player_body)) contact_with_player = true;
+    }
+    mj_deleteData(test_data);
+    mj_deleteModel(test_model);
+    if (!contact_with_player) {
+      std::fprintf(stderr, "Imported opponent did not produce player-to-opponent collision contacts.\n");
+      return 1;
+    }
+    std::puts("Opponent bundle passed: two wheel drives, weapon, and fork load with 0.34 kg total mass; opposite spawn faces the player and AI drives forward; fork/frame contact and player collision work.");
+    return 0;
+  }
+  if (argc >= 3 && std::string(argv[1]) == "--test-transform-gizmo") {
+    std::array<char, 8192> diagnostic{};
+    mjModel* test_model = mj_loadXML(argv[2], nullptr, diagnostic.data(), diagnostic.size());
+    if (!test_model) {
+      std::fprintf(stderr, "Transform test model load failed: %s\n", diagnostic.data());
+      return 1;
+    }
+    mjData* test_data = mj_makeData(test_model);
+    const int body = mj_name2id(test_model, mjOBJ_BODY, "Player_Robot");
+    const int joint = free_joint_for_body(test_model, body);
+    if (!test_data || body < 0 || joint < 0) {
+      std::fprintf(stderr, "Transform test needs a Player_Robot body with a free joint.\n");
+      if (test_data) mj_deleteData(test_data);
+      mj_deleteModel(test_model);
+      return 1;
+    }
+    const int qpos = test_model->jnt_qposadr[joint];
+    const Vec3 initial{test_data->qpos[qpos], test_data->qpos[qpos + 1],
+                       test_data->qpos[qpos + 2]};
+    for (int axis = 0; axis < 3; ++axis)
+      if (!translate_free_body_axis(test_model, test_data, body, axis, 0.01*(axis + 1))) {
+        mj_deleteData(test_data); mj_deleteModel(test_model);
+        return 1;
+      }
+    for (int axis = 0; axis < 3; ++axis)
+      if (std::abs(test_data->qpos[qpos + axis] - initial[axis] - 0.01*(axis + 1)) > 1e-9) {
+        std::fprintf(stderr, "World-axis translation failed on axis %d.\n", axis);
+        mj_deleteData(test_data); mj_deleteModel(test_model);
+        return 1;
+      }
+    const Vec3 pivot{test_data->subtree_com[3*body], test_data->subtree_com[3*body + 1],
+                     test_data->subtree_com[3*body + 2]};
+    mjtNum offset[3];
+    mju_sub3(offset, pivot.data(), test_data->xpos + 3*body);
+    Vec3 local_pivot{};
+    mju_mulMatTVec(local_pivot.data(), test_data->xmat + 9*body, offset, 3, 3);
+    for (int axis = 0; axis < 3; ++axis) {
+      if (!rotate_free_body_axis(test_model, test_data, body, axis, 0.2, pivot, local_pivot)) {
+        mj_deleteData(test_data); mj_deleteModel(test_model);
+        return 1;
+      }
+      for (int component = 0; component < 3; ++component)
+        if (std::abs(test_data->subtree_com[3*body + component] - pivot[component]) > 1e-8) {
+          std::fprintf(stderr, "Rotation about axis %d failed to preserve the robot pivot.\n", axis);
+          mj_deleteData(test_data); mj_deleteModel(test_model);
+          return 1;
+        }
+    }
+    mjvScene test_scene;
+    mjv_defaultScene(&test_scene);
+    mjv_makeScene(test_model, &test_scene, 2000);
+    mjvOption test_options;
+    mjv_defaultOption(&test_options);
+    mjvCamera test_camera;
+    mjv_defaultCamera(&test_camera);
+    test_camera.distance = 3.5;
+    test_camera.elevation = -55;
+    test_camera.azimuth = 90;
+    for (int i = 0; i < 3; ++i) test_camera.lookat[i] = pivot[i];
+    mjv_updateScene(test_model, test_data, &test_options, nullptr, &test_camera,
+                    mjCAT_ALL, &test_scene);
+    const int initial_geoms = test_scene.ngeom;
+    add_transform_gizmo(test_model, test_data, body, false, -1, 0.35, test_scene);
+    if (test_scene.ngeom < initial_geoms + 4) {
+      std::fprintf(stderr, "Move gizmo arrows were not added to the viewport scene.\n");
+      mjv_freeScene(&test_scene); mj_deleteData(test_data); mj_deleteModel(test_model);
+      return 1;
+    }
+    const Vec3 center{test_data->subtree_com[3*body], test_data->subtree_com[3*body + 1],
+                      test_data->subtree_com[3*body + 2]};
+    ScreenPoint screen_start;
+    if (!project_to_screen(test_model, test_scene, 1280, 800, center, screen_start)) {
+      std::fprintf(stderr, "Could not project the transform gizmo into the Drive viewport.\n");
+      mjv_freeScene(&test_scene); mj_deleteData(test_data); mj_deleteModel(test_model);
+      return 1;
+    }
+    double longest_axis_pixels = 0.0;
+    int projected_axis = -1;
+    for (int axis = 0; axis < 3; ++axis) {
+      const Vec3 endpoint{center[0] + 0.35*world_axes[axis][0],
+                          center[1] + 0.35*world_axes[axis][1],
+                          center[2] + 0.35*world_axes[axis][2]};
+      ScreenPoint screen_end;
+      if (!project_to_screen(test_model, test_scene, 1280, 800, endpoint, screen_end)) continue;
+      const double dx = screen_end[0] - screen_start[0], dy = screen_end[1] - screen_start[1];
+      const double pixels = std::sqrt(dx*dx + dy*dy);
+      if (pixels > longest_axis_pixels) { longest_axis_pixels = pixels; projected_axis = axis; }
+    }
+    if (projected_axis < 0 || longest_axis_pixels < 25.0) {
+      std::fprintf(stderr, "Transform axis handles are not visible at the default Drive camera.\n");
+      mjv_freeScene(&test_scene); mj_deleteData(test_data); mj_deleteModel(test_model);
+      return 1;
+    }
+    const Vec3 endpoint{center[0] + 0.35*world_axes[projected_axis][0],
+                        center[1] + 0.35*world_axes[projected_axis][1],
+                        center[2] + 0.35*world_axes[projected_axis][2]};
+    ScreenPoint screen_end;
+    project_to_screen(test_model, test_scene, 1280, 800, endpoint, screen_end);
+    const ScreenPoint arrow_mouse{screen_start[0] + 0.8*(screen_end[0] - screen_start[0]),
+                                  screen_start[1] + 0.8*(screen_end[1] - screen_start[1])};
+    const GizmoHit arrow_hit = pick_translation_axis(test_model, test_scene, 1280, 800,
+                                                      center, 0.35, arrow_mouse);
+    if (arrow_hit.axis != projected_axis || arrow_hit.distance > 1.0) {
+      std::fprintf(stderr, "Projected axis arrow did not pick at its visible screen position.\n");
+      mjv_freeScene(&test_scene); mj_deleteData(test_data); mj_deleteModel(test_model);
+      return 1;
+    }
+    const int move_scene_geoms = test_scene.ngeom;
+    add_transform_gizmo(test_model, test_data, body, true, -1, 0.35, test_scene);
+    if (test_scene.ngeom < move_scene_geoms + 3*48) {
+      std::fprintf(stderr, "Rotation gizmo rings were not added to the viewport scene.\n");
+      mjv_freeScene(&test_scene); mj_deleteData(test_data); mj_deleteModel(test_model);
+      return 1;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+      ScreenPoint ring_screen;
+      if (!project_to_screen(test_model, test_scene, 1280, 800,
+                             ring_point(center, axis, 0.35*0.82, 1.1), ring_screen)) {
+        std::fprintf(stderr, "Could not project rotation ring %d into the Drive viewport.\n", axis);
+        mjv_freeScene(&test_scene); mj_deleteData(test_data); mj_deleteModel(test_model);
+        return 1;
+      }
+      const GizmoHit ring_hit = pick_rotation_ring(test_model, test_scene, 1280, 800,
+          center, 0.35*0.82, ring_screen, axis);
+      if (ring_hit.axis != axis || ring_hit.distance > 1.0) {
+        std::fprintf(stderr, "Projected rotation ring %d did not pick at its screen position.\n", axis);
+        mjv_freeScene(&test_scene); mj_deleteData(test_data); mj_deleteModel(test_model);
+        return 1;
+      }
+    }
+    mjv_freeScene(&test_scene);
+    mj_deleteData(test_data);
+    mj_deleteModel(test_model);
+    std::puts("Transform gizmo passed: X/Y/Z arrows and rotation rings render and pick; translation and rotation preserve the robot pivot.");
     return 0;
   }
   if (argc >= 2 && std::string(argv[1]) == "--test-drive-mix") {
@@ -1026,7 +1745,52 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "Drive mix failed: zero-throttle turns must counter-rotate both sides.\n");
       return 1;
     }
-    std::puts("Drive mixing passed: zero-throttle turns counter-rotate both sides; W/S drive both sides together.");
+    std::array<bool, SDL_SCANCODE_COUNT> keys{};
+    auto pressed = [&](SDL_Scancode key, bool opponent) {
+      keys.fill(false);
+      keys[key] = true;
+      return read_keyboard_controls(keys.data(), opponent);
+    };
+    const auto opponent_forward = pressed(SDL_SCANCODE_I, true);
+    const auto opponent_reverse = pressed(SDL_SCANCODE_K, true);
+    const auto opponent_left = pressed(SDL_SCANCODE_J, true);
+    const auto opponent_right = pressed(SDL_SCANCODE_L, true);
+    const auto opponent_weapon = pressed(SDL_SCANCODE_M, true);
+    const auto player_forward = pressed(SDL_SCANCODE_W, false);
+    const auto player_reverse = pressed(SDL_SCANCODE_S, false);
+    const auto player_left = pressed(SDL_SCANCODE_A, false);
+    const auto player_right = pressed(SDL_SCANCODE_D, false);
+    const auto player_weapon = pressed(SDL_SCANCODE_SPACE, false);
+    const auto i_not_player = pressed(SDL_SCANCODE_I, false);
+    const auto w_not_opponent = pressed(SDL_SCANCODE_W, true);
+    const auto m_not_player_weapon = pressed(SDL_SCANCODE_M, false);
+    const auto ai_forward = aim_and_ram_command(
+        {0, 0, 0}, {2, 0, 0}, {1, 0, 0}, true, 70.0f);
+    const auto ai_turn_left = aim_and_ram_command(
+        {0, 0, 0}, {0, 2, 0}, {1, 0, 0}, false, 70.0f);
+    const auto ai_turn_right = aim_and_ram_command(
+        {0, 0, 0}, {0, -2, 0}, {1, 0, 0}, false, 70.0f);
+    const auto ai_low_aggression_turn = aim_and_ram_command(
+        {0, 0, 0}, {0, 2, 0}, {1, 0, 0}, false, 25.0f);
+    const auto ai_full_aggression_turn = aim_and_ram_command(
+        {0, 0, 0}, {0, 2, 0}, {1, 0, 0}, false, 100.0f);
+    if (opponent_forward.throttle != 1.0f || opponent_reverse.throttle != -1.0f ||
+        opponent_left.turn != 1.0f || opponent_right.turn != -1.0f || !opponent_weapon.weapon ||
+        player_forward.throttle != 1.0f || player_reverse.throttle != -1.0f ||
+        player_left.turn != 1.0f || player_right.turn != -1.0f || !player_weapon.weapon ||
+        i_not_player.throttle != 0.0f || w_not_opponent.throttle != 0.0f ||
+        m_not_player_weapon.weapon || std::abs(ai_forward.throttle - 0.70f) > 1e-6f ||
+        ai_forward.turn != 0.0f || !ai_forward.weapon || ai_turn_left.throttle != 0.0f ||
+        ai_turn_left.turn <= 0.0f || ai_turn_right.throttle != 0.0f ||
+        ai_turn_right.turn >= 0.0f ||
+        std::abs(ai_low_aggression_turn.turn - 0.25f) > 1e-6f ||
+        std::abs(ai_full_aggression_turn.turn - 1.0f) > 1e-6f ||
+        opponent_ai_delay_elapsed(1.999) || !opponent_ai_delay_elapsed(2.0) ||
+        opponent_ai_delay_elapsed(std::numeric_limits<double>::quiet_NaN())) {
+      std::fprintf(stderr, "Drive mapping or opponent aim-and-ram command failed.\n");
+      return 1;
+    }
+    std::puts("Drive mixing passed: WASD/Space control the player; IJKL/M control the manual opponent; opponent AI aggression scales throttle and turn, and its simulation-time warm-up is checked.");
     return 0;
   }
   if (argc >= 2 && std::string(argv[1]) == "--test-straight-drive") {
@@ -1138,6 +1902,35 @@ int main(int argc, char** argv) {
       return 1;
     }
     const int root_qpos = checked->jnt_qposadr[player_joint];
+    const int floor_geom = mj_name2id(checked, mjOBJ_GEOM, "floor");
+    std::vector<int> scrape_geom_ids;
+    for (int part = 0; part < bundle.PartCount(); ++part) {
+      const int assembly = bundle.PartAssembly(part);
+      const bool fixed_structure = assembly > 0 && assembly < bundle.AssemblyCount() &&
+        bundle.Assembly(assembly).kind == AssemblyKind::Fixed;
+      if (assembly != 0 && !fixed_structure && !bundle.IsForkPart(part)) continue;
+      const std::string geom_name = "cad_part_" + std::to_string(part);
+      const int geom = mj_name2id(checked, mjOBJ_GEOM, geom_name.c_str());
+      if (geom >= 0) scrape_geom_ids.push_back(geom);
+    }
+    int scrape_floor_contact_steps = 0;
+    int max_scrape_floor_contacts = 0;
+    double max_scrape_floor_normal = 0.0;
+    auto record_scrape_floor_contacts = [&]() {
+      int contact_count = 0;
+      for (int contact = 0; contact < checked_data->ncon; ++contact) {
+        const mjContact& item = checked_data->contact[contact];
+        if (item.geom[0] != floor_geom && item.geom[1] != floor_geom) continue;
+        const int other = item.geom[0] == floor_geom ? item.geom[1] : item.geom[0];
+        if (std::find(scrape_geom_ids.begin(), scrape_geom_ids.end(), other) == scrape_geom_ids.end()) continue;
+        ++contact_count;
+        mjtNum wrench[6]{};
+        mj_contactForce(checked, checked_data, contact, wrench);
+        max_scrape_floor_normal = std::max(max_scrape_floor_normal, double(wrench[0]));
+      }
+      if (contact_count > 0) ++scrape_floor_contact_steps;
+      max_scrape_floor_contacts = std::max(max_scrape_floor_contacts, contact_count);
+    };
     for (int geom = 0; geom < checked->ngeom; ++geom) {
       const int body = checked->geom_bodyid[geom];
       if (checked->geom_type[geom] == mjGEOM_PLANE ||
@@ -1149,9 +1942,19 @@ int main(int argc, char** argv) {
     for (int step = 0; step < 1250; ++step) {
       apply_wheel_drive_targets(checked, checked_data, test_controls, 0.0, 0.0);
       mj_step(checked, checked_data);
+      record_scrape_floor_contacts();
     }
+    const int settle_scrape_contact_steps = scrape_floor_contact_steps;
+    const int settle_max_scrape_contacts = max_scrape_floor_contacts;
+    const double settle_max_scrape_normal = max_scrape_floor_normal;
+    scrape_floor_contact_steps = 0;
+    max_scrape_floor_contacts = 0;
+    max_scrape_floor_normal = 0.0;
     const double start_x = checked_data->qpos[root_qpos];
     const double start_y = checked_data->qpos[root_qpos + 1];
+    const double start_z = checked_data->xipos[3 * player_body + 2];
+    double min_com_z = start_z;
+    double max_com_z = start_z;
     auto yaw_at = [&](const mjData* sample) {
       const double w = sample->qpos[root_qpos + 3];
       const double qx = sample->qpos[root_qpos + 4];
@@ -1182,11 +1985,21 @@ int main(int argc, char** argv) {
     for (int step = 0; step < 2500; ++step) {
       apply_wheel_drive_targets(checked, checked_data, test_controls, left_speed, right_speed);
       mj_step(checked, checked_data);
+      record_scrape_floor_contacts();
+      const double center_of_mass_z = checked_data->xipos[3 * player_body + 2];
+      min_com_z = std::min(min_com_z, center_of_mass_z);
+      max_com_z = std::max(max_com_z, center_of_mass_z);
     }
     const double yaw_change = std::remainder(yaw_at(checked_data) - start_yaw, 2.0 * pi);
     std::printf("CAD straight run (floor and bot only, 1.0 s): dx=%.4f m dy=%.4f m yaw=%.5f rad (%.3f deg)\n",
       checked_data->qpos[root_qpos] - start_x, checked_data->qpos[root_qpos + 1] - start_y,
       yaw_change, yaw_change * 180.0 / pi);
+    std::printf("Bot COM height during drive: start=%.4f m end=%.4f m range=%.4f..%.4f m (%.1f mm span)\n",
+      start_z, checked_data->xipos[3 * player_body + 2], min_com_z, max_com_z,
+      (max_com_z - min_com_z) * 1000.0);
+    std::printf("Chassis/fork-floor contact during settle: %d steps, up to %d contacts, max normal %.3f N; during drive: %d steps, up to %d contacts, max normal %.3f N\n",
+      settle_scrape_contact_steps, settle_max_scrape_contacts, settle_max_scrape_normal,
+      scrape_floor_contact_steps, max_scrape_floor_contacts, max_scrape_floor_normal);
     auto print_wheels = [&](const char* side,
                             const std::vector<std::pair<int, double>>& wheels) {
       std::printf("%s wheels:", side);
@@ -1206,7 +2019,6 @@ int main(int argc, char** argv) {
     };
     print_wheels("Left", test_controls.left);
     print_wheels("Right", test_controls.right);
-    const int floor_geom = mj_name2id(checked, mjOBJ_GEOM, "floor");
     if (floor_geom >= 0) {
       mj_forward(checked, checked_data);
       std::printf("Floor contacts (body, geom, z, normal N):");
@@ -1289,15 +2101,39 @@ int main(int argc, char** argv) {
     motor.phase_resistance_ohm = voltage / motor.peak_current_a;
     const double resistive_stall = MotorOutputTorque(motor, voltage, free_speed, 0.0);
     const double resistive_free = MotorOutputTorque(motor, voltage, free_speed, free_speed);
+    MotorSpec brushed = motor;
+    brushed.type = MotorType::Brushed;
+    brushed.speed_input = MotorSpeedInput::RatedRpmAtVoltage;
+    brushed.rated_rpm = 6200.0;
+    brushed.rated_voltage = 12.0;
+    brushed.phase_resistance_ohm = 0.0;
+    const double brushed_kv = 6200.0 / 12.0;
+    const double brushed_free_rpm = 6200.0 * voltage / 12.0 / brushed.gear_ratio;
+    const double brushed_free_speed = brushed_free_rpm * 2.0 * pi / 60.0;
+    const double brushed_stall_torque = MotorOutputTorque(
+      brushed, voltage, brushed_free_speed, 0.0);
+    const double expected_brushed_stall = (1.0 / (brushed_kv * 2.0 * pi / 60.0)) *
+      brushed.peak_current_a * brushed.gear_ratio * brushed.gearbox_efficiency *
+      brushed.motor_count;
     if (std::abs(ideal_stall - expected_stall) > 1e-8 ||
         std::abs(resistive_stall - expected_stall) > 1e-8 ||
         std::abs(2.0 * shared_wheel_torque - expected_stall) > 1e-8 ||
         std::abs(estimated_no_load_rpm - 1110.0) > 1e-8 ||
-        std::abs(ideal_free) > 1e-8 || std::abs(resistive_free) > 1e-8) {
+        std::abs(ideal_free) > 1e-8 || std::abs(resistive_free) > 1e-8 ||
+        std::abs(MotorKvRpmPerVolt(brushed) - brushed_kv) > 1e-8 ||
+        std::abs(MotorNoLoadOutputRpm(brushed, voltage) - brushed_free_rpm) > 1e-8 ||
+        std::abs(brushed_stall_torque - expected_brushed_stall) > 1e-8 ||
+        brushed.phase_resistance_ohm != 0.0) {
       std::fprintf(stderr, "Motor torque model failed its stall/free-speed checks.\n");
       return 1;
     }
-    std::printf("Motor torque and RPM estimate passed: %.4f Nm total stall torque; %.0f output RPM no-load; zero torque at no-load speed.\n",
+    brushed.speed_input = MotorSpeedInput::Kv;
+    brushed.kv_rpm_per_volt = brushed_kv;
+    if (std::abs(MotorNoLoadOutputRpm(brushed, voltage) - brushed_free_rpm) > 1e-8) {
+      std::fprintf(stderr, "Brushed Kv and rated-RPM speed inputs disagree.\n");
+      return 1;
+    }
+    std::printf("Motor torque/RPM passed: %.4f Nm brushless stall, %.0f RPM brushless no-load; brushed rated-RPM input and optional resistance passed.\n",
                 expected_stall, estimated_no_load_rpm);
     return 0;
   }
@@ -1340,12 +2176,16 @@ int main(int argc, char** argv) {
       checked->geom_contype[geom] = 0;
       checked->geom_conaffinity[geom] = 0;
     }
+    // Explicit MuJoCo pairs bypass geom collision masks. Disable them too in
+    // this isolated motor-speed test so CAD floor-contact pairs cannot load a
+    // wheel while the test is measuring its free speed.
+    checked->npair = 0;
     mj_forward(checked, checked_data);
     const int actuator_id = motor_it->first;
     const int joint_id = checked->actuator_trnid[2 * actuator_id];
     const MotorSpec& motor = motor_it->second;
-    const double free_output_speed = motor.kv_rpm_per_volt * voltage *
-      2.0 * pi / 60.0 / motor.gear_ratio;
+    const double free_output_speed = MotorNoLoadOutputRpm(motor, voltage) *
+      2.0 * pi / 60.0;
     Controls test_controls;
     test_controls.left = left;
     test_controls.right = right;
@@ -1421,6 +2261,52 @@ int main(int argc, char** argv) {
                 manual_target_rpm, manual_actual_rpm);
     return 0;
   }
+  if (argc >= 3 && std::string(argv[1]) == "--test-drive-layout") {
+    if (!bundle.Load(argv[2])) {
+      std::fprintf(stderr, "%s\n", bundle.Error().c_str());
+      return 1;
+    }
+    auto verify_layout = [&](DriveLayout layout, const char* axle,
+                             int expected_left, int expected_right) {
+      bundle.SetWheelDriveLayout(layout);
+      if (layout == DriveLayout::TwoWheel) bundle.SetTwoWheelDriveAxle(axle);
+      std::filesystem::path generated;
+      if (!bundle.Generate(generated)) {
+        std::fprintf(stderr, "%s\n", bundle.Error().c_str());
+        return false;
+      }
+      std::array<char, 8192> diagnostic{};
+      mjModel* checked = mj_loadXML(generated.string().c_str(), nullptr,
+                                    diagnostic.data(), diagnostic.size());
+      if (!checked) {
+        std::fprintf(stderr, "Drive-layout model failed to load: %s\n", diagnostic.data());
+        return false;
+      }
+      std::vector<std::pair<int, double>> left, right;
+      std::vector<int> weapon;
+      std::map<int, MotorSpec> motors, weapon_motors;
+      std::map<int, int> manual_velocity_actuators;
+      double voltage = 0.0;
+      bundle.BindControls(checked, left, right, weapon, motors, weapon_motors,
+                          manual_velocity_actuators, voltage);
+      const bool valid = int(left.size()) == expected_left &&
+                         int(right.size()) == expected_right;
+      mj_deleteModel(checked);
+      if (!valid)
+        std::fprintf(stderr, "Drive-layout mapping was left=%d/right=%d; expected left=%d/right=%d.\n",
+                     int(left.size()), int(right.size()), expected_left, expected_right);
+      return valid;
+    };
+    if (!verify_layout(DriveLayout::TwoWheel, "front", 1, 1) ||
+        !verify_layout(DriveLayout::TwoWheel, "rear", 1, 1) ||
+        !verify_layout(DriveLayout::FourWheel, "front", 2, 2)) return 1;
+    if (!bundle.Save()) {
+      std::fprintf(stderr, "%s\n", bundle.Error().c_str());
+      return 1;
+    }
+    std::puts("2WD front/rear axle selection and return to 4WD passed.");
+    return 0;
+  }
   if (argc >= 3 && std::string(argv[1]) == "--test-weapon-motor") {
     if (!bundle.Load(argv[2])) { std::fprintf(stderr, "%s\n", bundle.Error().c_str()); return 1; }
     std::filesystem::path generated;
@@ -1447,6 +2333,9 @@ int main(int argc, char** argv) {
       checked->geom_contype[geom] = 0;
       checked->geom_conaffinity[geom] = 0;
     }
+    // This measures the motor model in isolation, without any generated
+    // floor or fork/frame contact pairs adding a mechanical load.
+    checked->npair = 0;
     mj_forward(checked, checked_data);
     const double estimated_spinup_seconds = bundle.EstimatedWeaponSpinupSeconds();
     double early_rpm = 0.0;
@@ -1682,13 +2571,15 @@ int main(int argc, char** argv) {
     }
     bundle.StartAxis(1);
     bundle.UpdateHover(1, {0.010, 0.0, 0.004});
-    if (bundle.HoveredPart() != -1) {
-      std::fprintf(stderr, "Axis picking accepted a body outside the target assembly.\n");
+    if (bundle.HoveredPart() != 1 || bundle.HoveredLoopPoints() < 6 ||
+        !bundle.SelectHoveredHole()) {
+      std::fprintf(stderr, "Could not use an outside-assembly part as the axis reference: %s\n",
+                   bundle.PickMessage().c_str());
       return 1;
     }
-    bundle.UpdateHover(0, {0.010, 0.0, 0.004});
-    if (bundle.HoveredPart() != 0 || !bundle.SelectHoveredHole()) {
-      std::fprintf(stderr, "Synthetic hole hover/selection failed: %s\n", bundle.PickMessage().c_str());
+    if (bundle.PickMessage().rfind("Fitted Weapon axis at (", 0) != 0) {
+      std::fprintf(stderr, "Fitted axis result was not reported to the editor: %s\n",
+                   bundle.PickMessage().c_str());
       return 1;
     }
     const auto& axis = bundle.Assembly(1);
@@ -1700,18 +2591,60 @@ int main(int argc, char** argv) {
     if (!bundle.Save()) { std::fprintf(stderr, "%s\n", bundle.Error().c_str()); return 1; }
     FusionBundle reloaded;
     if (!reloaded.Load(argv[2]) || reloaded.AxisAssembly() != 1 ||
-        reloaded.PartAssembly(0) != 1 ||
+        reloaded.PartAssembly(0) != 1 || reloaded.PartAssembly(1) != 0 ||
         std::abs(reloaded.Assembly(1).pivot[2] - axis.pivot[2]) > 0.0005) {
-      std::fprintf(stderr, "Saved folder assignment, axis target, or fitted axis did not persist.\n");
+      std::fprintf(stderr, "Saved assignments changed or target axis did not persist.\n");
       return 1;
     }
-    std::printf("Synthetic hole rim recognized and fitted: center=(%.4f, %.4f, %.4f) m\n",
+    std::printf("Outside-assembly reference part fitted Weapon axis without reassignment: center=(%.4f, %.4f, %.4f) m\n",
                 axis.pivot[0], axis.pivot[1], axis.pivot[2]);
+    return 0;
+  }
+  if (argc >= 8 && std::string(argv[1]) == "--test-axis-point") {
+    if (!bundle.Load(argv[2])) { std::fprintf(stderr, "%s\n", bundle.Error().c_str()); return 1; }
+    int target = -1, part = -1;
+    std::array<double, 3> hit{};
+    try {
+      target = std::stoi(argv[3]); part = std::stoi(argv[4]);
+      for (int i = 0; i < 3; ++i) hit[i] = std::stod(argv[5+i]);
+    } catch (...) {
+      std::fprintf(stderr, "Expected assembly, part, and three world-space hit coordinates.\n");
+      return 1;
+    }
+    bundle.StartAxis(target);
+    if (!bundle.AxisPicking()) {
+      std::fprintf(stderr, "Could not start axis picking: %s\n", bundle.PickMessage().c_str());
+      return 1;
+    }
+    bundle.UpdateHover(part, hit);
+    if (bundle.HoveredLoopPoints() < 6) {
+      std::fprintf(stderr, "No round rim highlighted at the supplied point: %s\n",
+                   bundle.PickMessage().c_str());
+      return 1;
+    }
+    const int points = int(bundle.HoveredLoopPoints());
+    if (!bundle.SelectHoveredHole()) {
+      std::fprintf(stderr, "Highlighted rim could not fit an axis: %s\n",
+                   bundle.PickMessage().c_str());
+      return 1;
+    }
+    const auto& axis = bundle.Assembly(target);
+    std::printf("Axis target '%s': part %d highlighted a %d-point round rim and fitted "
+                "center %.5f %.5f %.5f m, direction %.4f %.4f %.4f\n",
+                axis.name.c_str(), part, points, axis.pivot[0], axis.pivot[1], axis.pivot[2],
+                axis.axis[0], axis.axis[1], axis.axis[2]);
     return 0;
   }
   if (argc >= 4 && std::string(argv[1]) == "--test-axis-hover") {
     if (!bundle.Load(argv[3])) { std::fprintf(stderr, "%s\n", bundle.Error().c_str()); return 1; }
-    const int target = bundle.AxisAssembly();
+    int target = bundle.AxisAssembly();
+    if (argc >= 5) {
+      try { target = std::stoi(argv[4]); }
+      catch (...) {
+        std::fprintf(stderr, "Axis test target must be an assembly index.\n");
+        return 1;
+      }
+    }
     if (target <= 0) {
       std::fprintf(stderr, "Bundle has no rotating assembly selected for the hole test.\n");
       return 1;
@@ -1735,8 +2668,16 @@ int main(int argc, char** argv) {
     const int elevations[] = {-65, -35, 0, 35, 65};
     int rays = 0;
     int found_part = -1;
+    int highlight_segments = 0;
+    bool highlight_render_ready = true;
     bool fit = false;
     bundle.StartAxis(target);
+    if (!bundle.AxisPicking()) {
+      std::fprintf(stderr, "Could not start axis picking for assembly %d: %s\n",
+                   target, bundle.PickMessage().c_str());
+      mjv_freeScene(&checked_scene); mj_deleteData(checked_data); mj_deleteModel(checked);
+      return 1;
+    }
     for (int elevation : elevations) {
       for (int azimuth : azimuths) {
         checked_camera.azimuth = azimuth;
@@ -1744,17 +2685,30 @@ int main(int argc, char** argv) {
         mjv_updateScene(checked, checked_data, &checked_options, nullptr, &checked_camera,
                         mjCAT_ALL, &checked_scene);
         for (int y = 2; y < 62 && !fit; ++y) for (int x = 2; x < 62; ++x) {
-          mjtNum point[3]; int geom = -1, flex = -1, skin = -1;
-          mjv_select(checked, checked_data, &checked_options, 1.3,
-                     x/64.0, y/64.0, &checked_scene, point, &geom, &flex, &skin);
+          mjtNum point[3];
+          const int part = SelectPreviewPartForHover(checked, checked_data,
+            &checked_options, 1.3, x/64.0, y/64.0, checked_scene, bundle, point);
           ++rays;
-          const char* name = geom >= 0 ? mj_id2name(checked, mjOBJ_GEOM, geom) : nullptr;
-          if (!name || std::string(name).rfind("cad_part_", 0) != 0) continue;
-          const int part = std::stoi(std::string(name).substr(9));
-          if (bundle.PartAssembly(part) != target) continue;
+          if (part < 0) continue;
           bundle.UpdateHover(part, {point[0], point[1], point[2]});
           if (bundle.HoveredLoopPoints() >= 6) {
             found_part = part;
+            highlight_segments = int(bundle.HoveredLoopPoints());
+            const int first_highlight_geom = checked_scene.ngeom;
+            mjtNum camera_head[3], camera_forward[3], camera_up[3];
+            mjv_cameraInModel(camera_head, camera_forward, camera_up, &checked_scene);
+            bundle.AddSetupAxisMarkers(checked_scene,
+              {camera_head[0], camera_head[1], camera_head[2]});
+            for (int i = 0; i < highlight_segments; ++i) {
+              const int index = first_highlight_geom + i;
+              if (index >= checked_scene.ngeom || checked_scene.geomorder[index] != index ||
+                  checked_scene.geoms[index].type != mjGEOM_LINE ||
+                  checked_scene.geoms[index].category != mjCAT_DECOR ||
+                  checked_scene.geoms[index].objtype != mjOBJ_UNKNOWN) {
+                highlight_render_ready = false;
+                break;
+              }
+            }
             fit = bundle.SelectHoveredHole();
             break;
           }
@@ -1765,10 +2719,17 @@ int main(int argc, char** argv) {
     }
     if (fit) {
       const auto& axis = bundle.Assembly(target);
-      std::printf("Real bundle rim hit part %d after %d rays; click-to-axis fit %s; center %.5f %.5f %.5f m\n",
-                  found_part, rays, fit ? "passed" : "failed", axis.pivot[0], axis.pivot[1], axis.pivot[2]);
+      if (!highlight_render_ready) {
+        std::fprintf(stderr, "Detected Sparrow rim, but its hover line geoms were not registered for rendering.\n");
+        mjv_freeScene(&checked_scene); mj_deleteData(checked_data); mj_deleteModel(checked);
+        return 1;
+      }
+      std::printf("Axis target '%s': rim hit reference part %d after %d CAD-only preview rays; "
+                  "highlight loop %d line segments registered; click-to-axis fit passed; center %.5f %.5f %.5f m\n",
+                  axis.name.c_str(), found_part, rays, highlight_segments,
+                  axis.pivot[0], axis.pivot[1], axis.pivot[2]);
     } else {
-      std::fprintf(stderr, "No complete target-assembly rim hit in %d MuJoCo preview rays. Last status: %s\n",
+      std::fprintf(stderr, "No complete rim hit on a visible CAD part in %d MuJoCo preview rays. Last status: %s\n",
                    rays, bundle.PickMessage().c_str());
     }
     mjv_freeScene(&checked_scene); mj_deleteData(checked_data); mj_deleteModel(checked);
@@ -1851,8 +2812,18 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < fork_qpos.size(); ++i)
       max_fork_rotation = std::max(max_fork_rotation,
         std::abs(sample->qpos[fork_qpos[i].second] - initial_fork_angles[i]));
+    int explicit_fork_frame_pairs = 0;
+    for (int pair = 0; pair < checked->npair; ++pair) {
+      const int body1 = checked->geom_bodyid[checked->pair_geom1[pair]];
+      const int body2 = checked->geom_bodyid[checked->pair_geom2[pair]];
+      const bool root_fork = (body1 == root_body &&
+        std::find(fork_bodies.begin(), fork_bodies.end(), body2) != fork_bodies.end()) ||
+        (body2 == root_body &&
+        std::find(fork_bodies.begin(), fork_bodies.end(), body1) != fork_bodies.end());
+      if (root_fork) ++explicit_fork_frame_pairs;
+    }
     std::printf("CAD gravity forks: %d; explicit fork-frame pairs: %d; initial fork-frame contacts: %d; max passive fork angle after 1.0 s: %.5f rad\n",
-                int(fork_bodies.size()), checked->npair, initial_fork_frame_contacts,
+                int(fork_bodies.size()), explicit_fork_frame_pairs, initial_fork_frame_contacts,
                 max_fork_rotation);
     bool finite = std::isfinite(sample->time);
     for (int i = 0; i < checked->nq; ++i) finite = finite && std::isfinite(sample->qpos[i]);
@@ -1863,9 +2834,9 @@ int main(int argc, char** argv) {
       if (bundle.PartAssembly(part) == 1) { axis_test_part = part; break; }
     }
     if (axis_test_part < 0) {
+      std::printf("CAD axis-fit tests skipped: no body is assigned to rotating assembly 1.\n");
       mj_deleteModel(checked);
-      std::fprintf(stderr, "Axis test requires at least one body assigned to rotating assembly 1.\n");
-      return 1;
+      return 0;
     }
     bundle.StartAxis(1);
     for (const auto& point : {std::array<double, 3>{0.12, 0.08, 0.09},
@@ -1923,6 +2894,7 @@ int main(int argc, char** argv) {
   }
   Controls controls;
   bind_stock_actuators(model, controls);
+  Controls opponent_controls;
   mjData* data = mj_makeData(model);
   if (!data || !SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK)) {
     std::fprintf(stderr, "Initialization failed: %s\n", SDL_GetError());
@@ -1973,32 +2945,69 @@ int main(int argc, char** argv) {
   IMGUI_CHECKVERSION(); ImGui::CreateContext();
   ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_DockingEnable;
   ImGuiStyle& ui = ImGui::GetStyle();
-  ui.WindowRounding = 10.0f; ui.ChildRounding = 8.0f; ui.FrameRounding = 6.0f;
-  ui.PopupRounding = 6.0f; ui.ScrollbarRounding = 8.0f; ui.GrabRounding = 6.0f;
+  ImGui::StyleColorsDark(&ui);
+  ui.WindowRounding = 11.0f; ui.ChildRounding = 8.0f; ui.FrameRounding = 5.0f;
+  ui.PopupRounding = 7.0f; ui.ScrollbarRounding = 7.0f; ui.GrabRounding = 5.0f;
   ui.WindowPadding = ImVec2(18, 16); ui.FramePadding = ImVec2(10, 7);
-  ui.ItemSpacing = ImVec2(10, 9); ui.WindowBorderSize = 0.0f;
+  ui.ItemSpacing = ImVec2(10, 9); ui.ItemInnerSpacing = ImVec2(8, 6);
+  ui.WindowBorderSize = 0.0f; ui.ChildBorderSize = 1.0f; ui.FrameBorderSize = 0.0f;
   ImVec4* colors = ui.Colors;
-  colors[ImGuiCol_WindowBg] = ImVec4(0.055f, 0.075f, 0.105f, 0.96f);
-  colors[ImGuiCol_ChildBg] = ImVec4(0.075f, 0.098f, 0.132f, 1.0f);
-  colors[ImGuiCol_PopupBg] = ImVec4(0.075f, 0.098f, 0.132f, 1.0f);
-  colors[ImGuiCol_FrameBg] = ImVec4(0.12f, 0.15f, 0.20f, 1.0f);
-  colors[ImGuiCol_FrameBgHovered] = ImVec4(0.17f, 0.22f, 0.29f, 1.0f);
-  colors[ImGuiCol_FrameBgActive] = ImVec4(0.20f, 0.27f, 0.35f, 1.0f);
-  colors[ImGuiCol_Button] = ImVec4(0.12f, 0.20f, 0.27f, 1.0f);
-  colors[ImGuiCol_ButtonHovered] = ImVec4(0.16f, 0.38f, 0.47f, 1.0f);
-  colors[ImGuiCol_ButtonActive] = ImVec4(0.10f, 0.54f, 0.62f, 1.0f);
-  colors[ImGuiCol_Header] = ImVec4(0.11f, 0.23f, 0.30f, 1.0f);
-  colors[ImGuiCol_HeaderHovered] = ImVec4(0.14f, 0.34f, 0.42f, 1.0f);
-  colors[ImGuiCol_HeaderActive] = ImVec4(0.10f, 0.43f, 0.51f, 1.0f);
-  colors[ImGuiCol_CheckMark] = ImVec4(0.25f, 0.83f, 0.83f, 1.0f);
-  colors[ImGuiCol_SliderGrab] = ImVec4(0.20f, 0.69f, 0.75f, 1.0f);
-  colors[ImGuiCol_SliderGrabActive] = ImVec4(0.32f, 0.86f, 0.87f, 1.0f);
+  colors[ImGuiCol_Text] = ui_ink;
+  colors[ImGuiCol_TextDisabled] = ImVec4(0.58f, 0.63f, 0.70f, 1.0f);
+  colors[ImGuiCol_WindowBg] = ImVec4(0.075f, 0.090f, 0.115f, 1.0f);
+  colors[ImGuiCol_ChildBg] = ImVec4(0.105f, 0.125f, 0.160f, 1.0f);
+  colors[ImGuiCol_PopupBg] = ImVec4(0.105f, 0.125f, 0.160f, 0.99f);
+  colors[ImGuiCol_Border] = ImVec4(0.23f, 0.27f, 0.33f, 0.82f);
+  colors[ImGuiCol_BorderShadow] = ImVec4(0.015f, 0.020f, 0.030f, 0.22f);
+  colors[ImGuiCol_FrameBg] = ImVec4(0.145f, 0.170f, 0.215f, 1.0f);
+  colors[ImGuiCol_FrameBgHovered] = ImVec4(0.19f, 0.235f, 0.295f, 1.0f);
+  colors[ImGuiCol_FrameBgActive] = ImVec4(0.22f, 0.29f, 0.36f, 1.0f);
+  colors[ImGuiCol_Button] = ImVec4(0.16f, 0.20f, 0.26f, 1.0f);
+  colors[ImGuiCol_ButtonHovered] = ImVec4(0.23f, 0.30f, 0.38f, 1.0f);
+  colors[ImGuiCol_ButtonActive] = ImVec4(0.20f, 0.39f, 0.47f, 1.0f);
+  colors[ImGuiCol_Header] = ImVec4(0.16f, 0.21f, 0.28f, 1.0f);
+  colors[ImGuiCol_HeaderHovered] = ImVec4(0.21f, 0.29f, 0.37f, 1.0f);
+  colors[ImGuiCol_HeaderActive] = ImVec4(0.18f, 0.36f, 0.43f, 1.0f);
+  colors[ImGuiCol_CheckMark] = ui_teal;
+  colors[ImGuiCol_SliderGrab] = ImVec4(0.24f, 0.62f, 0.70f, 1.0f);
+  colors[ImGuiCol_SliderGrabActive] = ui_teal;
+  colors[ImGuiCol_Separator] = ImVec4(0.25f, 0.30f, 0.37f, 0.82f);
+  colors[ImGuiCol_SeparatorHovered] = ImVec4(0.34f, 0.65f, 0.74f, 1.0f);
+  colors[ImGuiCol_SeparatorActive] = ImVec4(0.30f, 0.80f, 0.86f, 1.0f);
+  colors[ImGuiCol_ScrollbarBg] = ImVec4(0.075f, 0.090f, 0.115f, 0.72f);
+  colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.27f, 0.32f, 0.39f, 1.0f);
+  colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.37f, 0.45f, 0.55f, 1.0f);
+  colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.31f, 0.61f, 0.69f, 1.0f);
+  colors[ImGuiCol_TableHeaderBg] = ImVec4(0.17f, 0.21f, 0.27f, 1.0f);
+  colors[ImGuiCol_TableBorderStrong] = ImVec4(0.29f, 0.34f, 0.41f, 1.0f);
+  colors[ImGuiCol_TableBorderLight] = ImVec4(0.22f, 0.27f, 0.34f, 1.0f);
+  colors[ImGuiCol_TableRowBg] = ImVec4(0.10f, 0.12f, 0.15f, 1.0f);
+  colors[ImGuiCol_TableRowBgAlt] = ImVec4(0.13f, 0.155f, 0.195f, 1.0f);
+  colors[ImGuiCol_Tab] = ImVec4(0.13f, 0.16f, 0.21f, 1.0f);
+  colors[ImGuiCol_TabHovered] = ImVec4(0.22f, 0.32f, 0.39f, 1.0f);
+  colors[ImGuiCol_TabSelected] = ImVec4(0.18f, 0.24f, 0.31f, 1.0f);
+  colors[ImGuiCol_TabDimmed] = ImVec4(0.10f, 0.125f, 0.16f, 1.0f);
+  colors[ImGuiCol_TabDimmedSelected] = ImVec4(0.15f, 0.19f, 0.24f, 1.0f);
+  colors[ImGuiCol_PlotHistogram] = ui_teal;
+  colors[ImGuiCol_PlotHistogramHovered] = ImVec4(0.22f, 0.69f, 0.70f, 1.0f);
   ImGui_ImplSDL3_InitForOpenGL(window, gl);
   ImGui_ImplOpenGL3_Init("#version 330");
 
   enum class AppScreen { Home, Drive, Configure };
+  enum class GizmoMode { Move, Rotate };
   AppScreen screen = AppScreen::Home;
+  int config_bot = 0;  // 0 = player, 1 = opponent.
+  bool opponent_ai_enabled = true;
+  float opponent_ai_aggression_percent = 70.0f;
   bool running = true, paused = true;
+  bool placement_mode = false;
+  GizmoMode gizmo_mode = GizmoMode::Move;
+  bool gizmo_drag_active = false;
+  int gizmo_drag_axis = -1;
+  double gizmo_length = 0.35;
+  double ring_previous_angle = 0.0;
+  Vec3 rotation_pivot{};
+  Vec3 rotation_local_pivot{};
   bool mixer_popup_open = false;
   std::string runtime_error;
   double accumulator = 0.0;
@@ -2027,10 +3036,106 @@ int main(int argc, char** argv) {
 
       if (event.type == SDL_EVENT_MOUSE_WHEEL && !ImGui::GetIO().WantCaptureMouse)
         camera.distance = std::clamp(camera.distance * std::pow(0.9, event.wheel.y), 0.5, 15.0);
-      if (event.type == SDL_EVENT_MOUSE_MOTION && !ImGui::GetIO().WantCaptureMouse &&
-          (event.motion.state & SDL_BUTTON_LMASK)) {
-        camera.azimuth += event.motion.xrel * 0.4;
-        camera.elevation = std::clamp(camera.elevation - event.motion.yrel * 0.4, -89.0, 89.0);
+      if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_R &&
+          event.key.repeat == 0 && screen == AppScreen::Drive && placement_mode &&
+          !ImGui::GetIO().WantCaptureKeyboard) {
+        gizmo_mode = gizmo_mode == GizmoMode::Move ? GizmoMode::Rotate : GizmoMode::Move;
+        gizmo_drag_active = false;
+        gizmo_drag_axis = -1;
+      }
+      if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT &&
+          screen == AppScreen::Drive && placement_mode && !ImGui::GetIO().WantCaptureMouse) {
+        gizmo_drag_active = false;
+        gizmo_drag_axis = -1;
+        const int player_root = mj_name2id(model, mjOBJ_BODY, "Player_Robot");
+        int window_width = 0, window_height = 0;
+        SDL_GetWindowSize(window, &window_width, &window_height);
+        if (player_root > 0 && window_width > 0 && window_height > 0) {
+          const Vec3 center{data->subtree_com[3*player_root],
+                            data->subtree_com[3*player_root + 1],
+                            data->subtree_com[3*player_root + 2]};
+          gizmo_length = std::clamp(camera.distance * 0.11, 0.18, 0.65);
+          const ScreenPoint mouse{event.button.x, event.button.y};
+          GizmoHit hit = gizmo_mode == GizmoMode::Move
+            ? pick_translation_axis(model, scene, window_width, window_height,
+                                    center, gizmo_length, mouse)
+            : pick_rotation_ring(model, scene, window_width, window_height,
+                                 center, gizmo_length * 0.82, mouse);
+          const double pick_tolerance = gizmo_mode == GizmoMode::Move ? 16.0 : 18.0;
+          if (hit.axis >= 0 && hit.distance <= pick_tolerance) {
+            gizmo_drag_axis = hit.axis;
+            gizmo_drag_active = true;
+            paused = true;
+            const int joint = free_joint_for_body(model, player_root);
+            if (joint >= 0) {
+              const int dof = model->jnt_dofadr[joint];
+              for (int i = 0; i < 6; ++i) data->qvel[dof + i] = 0.0;
+            }
+            if (gizmo_mode == GizmoMode::Rotate) {
+              rotation_pivot = center;
+              mjtNum offset[3];
+              mju_sub3(offset, rotation_pivot.data(), data->xpos + 3*player_root);
+              mju_mulMatTVec(rotation_local_pivot.data(), data->xmat + 9*player_root,
+                             offset, 3, 3);
+            }
+            ring_previous_angle = hit.angle;
+          }
+        }
+      }
+      if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) {
+        gizmo_drag_active = false;
+        gizmo_drag_axis = -1;
+      }
+      if (event.type == SDL_EVENT_MOUSE_MOTION && !ImGui::GetIO().WantCaptureMouse) {
+        int window_width = 0, window_height = 0;
+        SDL_GetWindowSize(window, &window_width, &window_height);
+        if (window_width > 0 && window_height > 0 && screen == AppScreen::Drive &&
+            placement_mode && gizmo_drag_active && gizmo_drag_axis >= 0 &&
+            (event.motion.state & SDL_BUTTON_LMASK)) {
+          const int player_root = mj_name2id(model, mjOBJ_BODY, "Player_Robot");
+          if (player_root > 0 && gizmo_mode == GizmoMode::Move) {
+            const Vec3 center{data->subtree_com[3*player_root],
+                              data->subtree_com[3*player_root + 1],
+                              data->subtree_com[3*player_root + 2]};
+            const Vec3 end{center[0] + gizmo_length*world_axes[gizmo_drag_axis][0],
+                           center[1] + gizmo_length*world_axes[gizmo_drag_axis][1],
+                           center[2] + gizmo_length*world_axes[gizmo_drag_axis][2]};
+            ScreenPoint start_screen, end_screen;
+            if (project_to_screen(model, scene, window_width, window_height,
+                                  center, start_screen) &&
+                project_to_screen(model, scene, window_width, window_height,
+                                  end, end_screen)) {
+              const double dx = end_screen[0] - start_screen[0];
+              const double dy = end_screen[1] - start_screen[1];
+              const double length2 = dx*dx + dy*dy;
+              if (length2 > 25.0) {
+                const double distance = gizmo_length *
+                  (event.motion.xrel*dx + event.motion.yrel*dy) / length2;
+                translate_free_body_axis(model, data, player_root, gizmo_drag_axis, distance);
+              }
+            }
+          } else if (player_root > 0 && gizmo_mode == GizmoMode::Rotate) {
+            const GizmoHit hit = pick_rotation_ring(model, scene, window_width, window_height,
+                rotation_pivot, gizmo_length*0.82,
+                ScreenPoint{event.motion.x, event.motion.y}, gizmo_drag_axis);
+            double delta = hit.angle - ring_previous_angle;
+            while (delta > pi) delta -= 2.0*pi;
+            while (delta < -pi) delta += 2.0*pi;
+            if (hit.axis == gizmo_drag_axis && std::abs(delta) > 1e-8)
+              rotate_free_body_axis(model, data, player_root, gizmo_drag_axis, delta,
+                                    rotation_pivot, rotation_local_pivot);
+            ring_previous_angle = hit.angle;
+          }
+        } else if (window_height > 0 && screen == AppScreen::Drive &&
+                   (event.motion.state & SDL_BUTTON_RMASK)) {
+          mjv_moveCamera(model, mjMOUSE_MOVE_H,
+              event.motion.xrel / static_cast<mjtNum>(window_height),
+              -event.motion.yrel / static_cast<mjtNum>(window_height), &scene, &camera);
+        } else if ((!placement_mode || screen == AppScreen::Drive) &&
+                   (event.motion.state & SDL_BUTTON_LMASK)) {
+          camera.azimuth += event.motion.xrel * 0.4;
+          camera.elevation = std::clamp(camera.elevation - event.motion.yrel * 0.4, -89.0, 89.0);
+        }
       }
 
     }
@@ -2040,8 +3145,22 @@ int main(int argc, char** argv) {
     if (paused || screen != AppScreen::Drive) accumulator = 0.0;
     int steps = 0;
     while (!paused && screen == AppScreen::Drive && accumulator >= model->opt.timestep && steps++ < 250) {
-      drive(model, data, controls, pad, joystick, input_mixer,
-            !ImGui::GetIO().WantCaptureKeyboard);
+      const bool keyboard_enabled = !ImGui::GetIO().WantCaptureKeyboard;
+      const bool* keys = SDL_GetKeyboardState(nullptr);
+      const KeyboardControls player_keyboard = keyboard_enabled
+        ? read_keyboard_controls(keys) : KeyboardControls{};
+      const KeyboardControls opponent_keyboard = keyboard_enabled
+        ? read_keyboard_controls(keys, true) : KeyboardControls{};
+      drive(model, data, controls, pad, joystick, input_mixer, player_keyboard, true);
+      const bool opponent_ai_ready = opponent_ai_delay_elapsed(data->time);
+      const KeyboardControls opponent_command = opponent_ai_enabled
+        ? (opponent_ai_ready
+            ? opponent_ram_ai(model, data, opponent_controls,
+                              opponent_ai_aggression_percent)
+            : KeyboardControls{})
+        : opponent_keyboard;
+      drive(model, data, opponent_controls, nullptr, nullptr, input_mixer,
+            opponent_command, false);
       mj_step(model, data);
       accumulator -= model->opt.timestep;
     }
@@ -2053,9 +3172,17 @@ int main(int argc, char** argv) {
     mjr_setBuffer(mjFB_WINDOW, &context);
     mjv_updateScene(model, data, &options, nullptr, &camera, mjCAT_ALL, &scene);
     bundle.AddAxisMarkers(model, data, scene);
+    if (screen == AppScreen::Drive && placement_mode) {
+      const int player_root = mj_name2id(model, mjOBJ_BODY, "Player_Robot");
+      gizmo_length = std::clamp(camera.distance * 0.11, 0.18, 0.65);
+      add_transform_gizmo(model, data, player_root, gizmo_mode == GizmoMode::Rotate,
+                          gizmo_drag_axis, gizmo_length, scene);
+    }
     mjr_render(viewport, &scene, &context);
     ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL3_NewFrame(); ImGui::NewFrame();
-    bool load_requested = false, apply_requested = false, mixer_popup_requested = false;
+    bool load_requested = false, apply_requested = false;
+    FusionBundle* setup_bundle = &bundle;
+    bool mixer_popup_requested = false;
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     constexpr ImGuiWindowFlags fixed_window = ImGuiWindowFlags_NoTitleBar |
       ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
@@ -2063,15 +3190,24 @@ int main(int argc, char** argv) {
 
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(ImVec2(display.x, 62));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.13f, 0.19f, 0.28f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.13f, 0.19f, 0.28f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.97f, 1.0f, 1.0f));
     ImGui::Begin("##main_navigation", nullptr,
       fixed_window | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    ImGui::TextColored(ImVec4(0.32f, 0.88f, 0.89f, 1.0f), "COMBATSIM");
+    ImGui::TextColored(ImVec4(0.64f, 0.88f, 0.98f, 1.0f), "COMBATSIM");
     ImGui::SameLine(152);
     auto nav_button = [&](const char* label, AppScreen target) {
       const bool active = screen == target;
-      if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.40f, 0.47f, 1.0f));
+      const ImVec4 active_color = target == AppScreen::Drive ? ImVec4(0.20f, 0.50f, 0.38f, 1.0f) :
+        target == AppScreen::Configure ? ImVec4(0.34f, 0.40f, 0.68f, 1.0f) :
+        ImVec4(0.24f, 0.43f, 0.64f, 1.0f);
+      push_button_palette(active ? active_color : ImVec4(0.22f, 0.29f, 0.39f, 1.0f),
+        active ? ImVec4(active_color.x + 0.08f, active_color.y + 0.08f,
+                        active_color.z + 0.08f, 1.0f) : ImVec4(0.30f, 0.39f, 0.51f, 1.0f),
+        active ? active_color : ImVec4(0.34f, 0.45f, 0.58f, 1.0f));
       const bool clicked = ImGui::Button(label, ImVec2(122, 36));
-      if (active) ImGui::PopStyleColor();
+      pop_button_palette();
       if (clicked) {
         screen = target;
         paused = target != AppScreen::Drive;
@@ -2079,51 +3215,163 @@ int main(int argc, char** argv) {
     };
     nav_button("Home", AppScreen::Home);
     ImGui::SameLine(); nav_button("Drive", AppScreen::Drive);
-    ImGui::SameLine(); nav_button("Bot workshop", AppScreen::Configure);
+    ImGui::SameLine(); nav_button("Configure", AppScreen::Configure);
     ImGui::SameLine(display.x - 245);
     ImGui::TextColored((joystick || pad) ? ImVec4(0.35f, 0.84f, 0.58f, 1.0f) :
                              ImVec4(0.68f, 0.72f, 0.78f, 1.0f),
                        "%s", joystick ? "USB JOYSTICK CONNECTED" :
                          pad ? "GAMEPAD CONNECTED" : "KEYBOARD READY");
     ImGui::End();
+    ImGui::PopStyleColor(3);
 
     if (screen == AppScreen::Home) {
-      ImGui::SetNextWindowPos(ImVec2(32, 92), ImGuiCond_Always);
-      ImGui::SetNextWindowSize(ImVec2(std::min(520.0f, display.x - 64.0f),
-                                      std::min(620.0f, display.y - 118.0f)), ImGuiCond_Always);
-      ImGui::Begin("##home_screen", nullptr, fixed_window | ImGuiWindowFlags_NoScrollbar);
-      ImGui::TextColored(ImVec4(0.32f, 0.88f, 0.89f, 1.0f), "ROBOT COMBAT PRACTICE");
-      ImGui::Spacing();
-      ImGui::Text("Build. Tune. Drive.");
-      ImGui::TextWrapped("Set up your robot from Fusion 360, then test its handling and weapon in the MuJoCo arena.");
-      ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
-      ImGui::Text("QUICK START");
-      ImGui::Spacing();
-      if (ImGui::Button("Practice drive", ImVec2(-1, 58))) {
-        screen = AppScreen::Drive; paused = false;
+      ImGui::SetNextWindowPos(ImVec2(0, 62), ImGuiCond_Always);
+      ImGui::SetNextWindowSize(ImVec2(display.x, std::max(1.0f, display.y - 62.0f)),
+                               ImGuiCond_Always);
+      ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+      ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+      ImGui::Begin("##home_screen", nullptr, fixed_window | ImGuiWindowFlags_NoBackground |
+          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+      ImDrawList* menu_draw = ImGui::GetWindowDrawList();
+      const ImVec2 home_min = ImGui::GetWindowPos();
+      const ImVec2 home_max(home_min.x + display.x, home_min.y + display.y - 62.0f);
+      menu_draw->AddRectFilled(home_min, home_max, IM_COL32(7, 10, 16, 142));
+      menu_draw->AddRectFilledMultiColor(
+          home_min, ImVec2(home_min.x + display.x * 0.70f, home_max.y),
+          IM_COL32(7, 11, 18, 245), IM_COL32(8, 13, 21, 75),
+          IM_COL32(8, 13, 21, 75), IM_COL32(7, 11, 18, 245));
+
+      const float margin = std::clamp(display.x * 0.055f, 28.0f, 76.0f);
+      const float menu_width = std::max(230.0f,
+          std::min(480.0f, display.x - margin * 2.0f - 20.0f));
+      const bool compact_home = display.x < 980.0f;
+      const float title_size = display.y < 660.0f ? 40.0f : 50.0f;
+      const float hero_y = home_min.y + (display.y < 660.0f ? 24.0f : 46.0f);
+      const ImU32 white = IM_COL32(240, 245, 250, 255);
+      const ImU32 muted = IM_COL32(164, 177, 193, 255);
+      const ImU32 accent = ImGui::GetColorU32(ui_teal);
+      menu_draw->AddRectFilled(ImVec2(margin, hero_y), ImVec2(margin + 34.0f, hero_y + 3.0f),
+                               accent, 1.5f);
+      menu_draw->AddText(ImGui::GetFont(), 13.0f, ImVec2(margin, hero_y + 13.0f),
+                         ImGui::GetColorU32(ui_teal), "MUJOCO ROBOT COMBAT SIMULATOR");
+      menu_draw->AddText(ImGui::GetFont(), title_size, ImVec2(margin, hero_y + 37.0f),
+                         white, "COMBAT");
+      menu_draw->AddText(ImGui::GetFont(), title_size, ImVec2(margin, hero_y + 37.0f + title_size),
+                         white, "ROBOTICS");
+      const float hero_bottom = hero_y + 43.0f + 2.0f * title_size;
+      menu_draw->AddText(ImGui::GetFont(), 16.0f, ImVec2(margin + 2.0f, hero_bottom + 4.0f),
+                         muted, "Build your machine. Tune the setup. Enter the arena.");
+      const float status_y = hero_bottom + 37.0f;
+      menu_draw->AddCircleFilled(ImVec2(margin + 5.0f, status_y + 8.0f), 4.0f,
+                                 ImGui::GetColorU32(ui_green));
+      menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(margin + 17.0f, status_y),
+                         ImGui::GetColorU32(ui_green), "SIMULATION READY");
+
+      const float item_height = std::clamp(display.y * 0.095f, 56.0f, 70.0f);
+      const float menu_y = std::min(home_min.y + 285.0f,
+          std::max(status_y + 27.0f,
+                   display.y - (3.0f * item_height + 2.0f * 7.0f + 78.0f)));
+      float menu_item_y = menu_y;
+      auto menu_item = [&](const char* id, const char* index, const char* title,
+                           const char* subtitle, ImVec4 item_accent, bool primary,
+                           auto&& on_click) {
+        ImGui::SetCursorScreenPos(ImVec2(margin, menu_item_y));
+        const bool pressed = ImGui::InvisibleButton(id, ImVec2(menu_width, item_height));
+        const bool hovered = ImGui::IsItemHovered();
+        const ImVec2 item_min = ImGui::GetItemRectMin();
+        const ImVec2 item_max = ImGui::GetItemRectMax();
+        if (primary || hovered) {
+          const ImU32 fill = primary
+              ? IM_COL32(30, 78, 88, hovered ? 218 : 176)
+              : IM_COL32(38, 49, 63, 170);
+          menu_draw->AddRectFilled(item_min, item_max, fill, 5.0f);
+        }
+        if (primary || hovered) {
+          menu_draw->AddRectFilled(ImVec2(item_min.x, item_min.y + 8.0f),
+              ImVec2(item_min.x + 3.0f, item_max.y - 8.0f),
+              ImGui::GetColorU32(item_accent), 1.5f);
+        }
+        const ImU32 index_color = ImGui::GetColorU32(item_accent);
+        const ImU32 title_color = (primary || hovered) ? white : IM_COL32(215, 222, 232, 255);
+        menu_draw->AddText(ImGui::GetFont(), 12.0f,
+                           ImVec2(item_min.x + 16.0f, item_min.y + 13.0f), index_color, index);
+        menu_draw->AddText(ImGui::GetFont(), 19.0f,
+                           ImVec2(item_min.x + 54.0f, item_min.y + 9.0f), title_color, title);
+        menu_draw->AddText(ImGui::GetFont(), 12.0f,
+                           ImVec2(item_min.x + 54.0f, item_min.y + 36.0f), muted, subtitle);
+        menu_draw->AddText(ImGui::GetFont(), 21.0f,
+                           ImVec2(item_max.x - 30.0f, item_min.y + 20.0f), index_color, "> ");
+        menu_item_y += item_height + 7.0f;
+        if (pressed) on_click();
+      };
+      menu_item("##menu_drive", "01", "ENTER THE ARENA", "Practice driving and test your setup",
+          ui_teal, true, [&] { screen = AppScreen::Drive; paused = false; });
+      menu_item("##menu_configure", "02", "BOT WORKSHOP", "Import CAD, tune motors and configure parts",
+          ui_blue, false, [&] { screen = AppScreen::Configure; paused = true; });
+      menu_item("##menu_mixer", "03", "CONTROLLER SETUP", "Map joystick channels and response curves",
+          ui_violet, false, [&] { mixer_popup_requested = true; });
+
+      if (!compact_home) {
+        const float info_x = display.x - 374.0f;
+        const float info_y = home_min.y + std::max(112.0f, display.y * 0.20f);
+        menu_draw->AddRectFilled(ImVec2(info_x - 23.0f, info_y - 4.0f),
+                                 ImVec2(info_x - 21.0f, info_y + 326.0f),
+                                 IM_COL32(65, 205, 210, 175), 1.0f);
+        menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x, info_y),
+                           ImGui::GetColorU32(ui_teal), "SESSION READOUT");
+        menu_draw->AddText(ImGui::GetFont(), 14.0f, ImVec2(info_x, info_y + 32.0f),
+                           muted, "PHYSICS ENGINE");
+        menu_draw->AddText(ImGui::GetFont(), 21.0f, ImVec2(info_x, info_y + 53.0f),
+                           white, "MuJoCo");
+        char rate_text[64];
+        std::snprintf(rate_text, sizeof(rate_text), "%.0f HZ SOLVER", 1.0 / model->opt.timestep);
+        menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x, info_y + 81.0f),
+                           ImGui::GetColorU32(ui_green), rate_text);
+        menu_draw->AddLine(ImVec2(info_x, info_y + 111.0f),
+                           ImVec2(display.x - margin, info_y + 111.0f),
+                           IM_COL32(116, 132, 150, 90), 1.0f);
+        menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x, info_y + 128.0f),
+                           muted, "ACTIVE MODEL");
+        const std::string active_model = model_path.filename().string();
+        menu_draw->AddText(ImGui::GetFont(), 15.0f, ImVec2(info_x, info_y + 149.0f),
+                           white, active_model.c_str());
+        menu_draw->AddLine(ImVec2(info_x, info_y + 180.0f),
+                           ImVec2(display.x - margin, info_y + 180.0f),
+                           IM_COL32(116, 132, 150, 90), 1.0f);
+        menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x, info_y + 197.0f),
+                           muted, "FUSION CAD BUNDLE");
+        menu_draw->AddCircleFilled(ImVec2(info_x + 5.0f, info_y + 228.0f), 4.0f,
+            ImGui::GetColorU32(bundle.HasBundle() ? ui_green : ui_amber));
+        menu_draw->AddText(ImGui::GetFont(), 14.0f, ImVec2(info_x + 17.0f, info_y + 220.0f),
+            white, bundle.HasBundle() ? "Loaded" : "Not loaded");
+        if (bundle.HasBundle()) {
+          char parts_text[64];
+          std::snprintf(parts_text, sizeof(parts_text), "%d imported bodies", bundle.PartCount());
+          menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x, info_y + 246.0f),
+                             muted, parts_text);
+        }
+        menu_draw->AddLine(ImVec2(info_x, info_y + 281.0f),
+                           ImVec2(display.x - margin, info_y + 281.0f),
+                           IM_COL32(116, 132, 150, 90), 1.0f);
+        menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x, info_y + 298.0f),
+                           muted, "PLAYER  WASD  /  SPACE WEAPON");
       }
-      ImGui::TextDisabled("W/S drive    A/D turn    Space spin weapon");
-      ImGui::Spacing();
-      if (ImGui::Button("Configure bot", ImVec2(-1, 58))) {
-        screen = AppScreen::Configure; paused = true;
+
+      if (!runtime_error.empty()) {
+        ImGui::SetCursorScreenPos(ImVec2(margin, menu_y - 24.0f));
+        ImGui::TextColored(ui_red, "%s", runtime_error.c_str());
       }
-      ImGui::TextDisabled("Import a Fusion bundle, assign assemblies, set axes and forks.");
-      ImGui::Spacing();
-      if (ImGui::Button("Controller mixing", ImVec2(-1, 58))) {
-        mixer_popup_requested = true;
-      }
-      ImGui::TextDisabled("Assign USB channels, weights, offsets and response curves.");
-      ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
-      ImGui::Text("CURRENT SESSION");
-      ImGui::Text("Physics: MuJoCo  |  %.0f Hz", 1.0 / model->opt.timestep);
-      ImGui::Text("Model: %s", model_path.filename().string().c_str());
-      ImGui::Text("CAD bundle: %s", bundle.HasBundle() ? "loaded" : "not loaded");
-      if (bundle.HasBundle()) ImGui::Text("Imported bodies: %d", bundle.PartCount());
-      if (!runtime_error.empty()) ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f),
-                                                       "Setup message: %s", runtime_error.c_str());
-      ImGui::Spacing();
-      if (ImGui::Button("Quit", ImVec2(104, 38))) running = false;
+      const float footer_y = display.y - 45.0f;
+      menu_draw->AddLine(ImVec2(margin, footer_y - 10.0f),
+          ImVec2(display.x - margin, footer_y - 10.0f), IM_COL32(116, 132, 150, 65), 1.0f);
+      ImGui::SetCursorScreenPos(ImVec2(margin, footer_y));
+      ImGui::TextDisabled("W / S DRIVE     A / D TURN     SPACE WEAPON");
+      ImGui::SameLine(display.x - margin - 104.0f);
+      if (ImGui::Button("QUIT GAME", ImVec2(104.0f, 28.0f))) running = false;
       ImGui::End();
+      ImGui::PopStyleVar();
+      ImGui::PopStyleColor(2);
     } else if (screen == AppScreen::Drive) {
       static float drive_sidebar_width = 380.0f;
       static float requested_drive_sidebar_width = 380.0f;
@@ -2135,24 +3383,93 @@ int main(int argc, char** argv) {
       if (!drive_sidebar_dragging) requested_drive_sidebar_width = drive_sidebar_width;
       ImGui::SetNextWindowPos(ImVec2(16, 76), ImGuiCond_Always);
       ImGui::SetNextWindowSize(ImVec2(drive_sidebar_width, display.y - 92), ImGuiCond_Always);
+      ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.075f, 0.105f, 0.12f, 0.98f));
+      ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.34f, 0.36f, 0.95f));
       ImGui::Begin("##drive_dashboard", nullptr, fixed_window);
       const float drive_content_height = ImGui::GetContentRegionAvail().y;
+      ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.105f, 0.145f, 0.16f, 0.98f));
       ImGui::BeginChild("Drive sidebar contents", ImVec2(-8.0f, 0.0f),
                         ImGuiChildFlags_None, ImGuiWindowFlags_AlwaysVerticalScrollbar);
       ImGui::PushTextWrapPos(520.0f);
-      ImGui::TextColored(ImVec4(0.32f, 0.88f, 0.89f, 1.0f), "PRACTICE DRIVE");
+      ImGui::TextColored(ui_green, "PRACTICE DRIVE");
       ImGui::TextDisabled("MuJoCo simulation  |  %.0f Hz", 1.0 / model->opt.timestep);
       ImGui::Spacing();
-      if (ImGui::Button(paused ? "Resume simulation" : "Pause simulation", ImVec2(166, 40)))
-        paused = !paused;
+      if (placement_mode) {
+        ImGui::BeginDisabled();
+        ImGui::Button("Paused for placement", ImVec2(166, 40));
+        ImGui::EndDisabled();
+      } else {
+        push_button_palette(paused ? ImVec4(0.13f, 0.29f, 0.24f, 1.0f) :
+                                      ImVec4(0.16f, 0.20f, 0.26f, 1.0f),
+                            paused ? ImVec4(0.17f, 0.39f, 0.30f, 1.0f) :
+                                      ImVec4(0.23f, 0.30f, 0.38f, 1.0f),
+                            paused ? ImVec4(0.22f, 0.49f, 0.36f, 1.0f) :
+                                      ImVec4(0.20f, 0.39f, 0.47f, 1.0f));
+        if (ImGui::Button(paused ? "Resume simulation" : "Pause simulation", ImVec2(166, 40)))
+          paused = !paused;
+        pop_button_palette();
+      }
       ImGui::SameLine();
       if (ImGui::Button("Reset robot", ImVec2(132, 40))) {
         mj_resetData(model, data); mj_forward(model, data); controls.weapon_command = 0.0;
+        controls.filtered_wheel_speeds.clear();
+        opponent_controls.filtered_wheel_speeds.clear();
+        gizmo_drag_active = false; gizmo_drag_axis = -1;
+      }
+      if (ImGui::Button(placement_mode ? "Finish moving robot" : "Move", ImVec2(190, 40))) {
+        placement_mode = !placement_mode;
+        gizmo_drag_active = false;
+        gizmo_drag_axis = -1;
+        gizmo_mode = GizmoMode::Move;
+        if (placement_mode) {
+          paused = true;
+          controls.weapon_command = 0.0;
+          controls.filtered_wheel_speeds.clear();
+          opponent_controls.filtered_wheel_speeds.clear();
+          const int player_root = mj_name2id(model, mjOBJ_BODY, "Player_Robot");
+          const int joint = free_joint_for_body(model, player_root);
+          if (joint >= 0) {
+            const int dof = model->jnt_dofadr[joint];
+            for (int i = 0; i < 6; ++i) data->qvel[dof + i] = 0.0;
+            mj_forward(model, data);
+          }
+        }
+      }
+      if (placement_mode) {
+        ImGui::TextColored(gizmo_mode == GizmoMode::Move ? ui_teal : ui_amber,
+            "%s MODE  |  R toggles Move / Rotate",
+            gizmo_mode == GizmoMode::Move ? "MOVE" : "ROTATE");
+        if (gizmo_mode == GizmoMode::Move)
+          ImGui::TextWrapped("Drag the red X, green Y, or blue Z arrow to move only along that axis. Press R to show rotation rings. Right-drag pans; left-drag empty arena orbits.");
+        else
+          ImGui::TextWrapped("Drag a colored ring to rotate around its X, Y, or Z axis. Press R to return to the move arrows. Right-drag pans; left-drag empty arena orbits.");
+      } else {
+        ImGui::TextWrapped("Right-drag to pan the arena view, left-drag to orbit, and scroll to zoom.");
       }
       if (ImGui::Button("Controller mixer", ImVec2(280.0f, 38.0f))) {
         mixer_popup_requested = true;
       }
       ImGui::Text("Simulation time  %.2f s", data->time);
+      ImGui::SeparatorText("Opponent control");
+      ImGui::Checkbox("Aim and ram AI", &opponent_ai_enabled);
+      ImGui::SetNextItemWidth(280.0f);
+      ImGui::SliderFloat("Aggression", &opponent_ai_aggression_percent,
+                         25.0f, 100.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp);
+      ImGui::TextDisabled("Scales the opponent's drive speed and turn rate.");
+      if (opponent_ai_enabled && (opponent_controls.left.empty() ||
+                                  opponent_controls.right.empty())) {
+        ImGui::TextColored(ui_amber,
+          "AI is waiting for an opponent bundle with left and right wheel drives.");
+      } else if (opponent_ai_enabled && !opponent_ai_delay_elapsed(data->time)) {
+        ImGui::TextColored(ui_amber, "AI starts in %.1f s",
+            std::max(0.0, opponent_ai_start_delay_seconds - data->time));
+      } else if (opponent_ai_enabled) {
+        ImGui::TextColored(ui_green, "AI active: turns toward the player and rams forward");
+        if (!opponent_controls.weapon.empty())
+          ImGui::TextDisabled("Opponent weapon spins while AI is active.");
+      } else {
+        ImGui::TextDisabled("Manual opponent: I/K drive, J/L turn, M weapon.");
+      }
       ImGui::SeparatorText("Drive settings");
       ImGui::Checkbox("Manual wheel RPM override", &controls.manual_wheel_rpm_override);
       if (controls.manual_wheel_rpm_override) {
@@ -2170,9 +3487,9 @@ int main(int argc, char** argv) {
         ImGui::Text("Motor no-load estimate  L %.0f | R %.0f RPM",
                     left_estimate.rpm, right_estimate.rpm);
         if (left_estimate.modeled_wheels == 0 || right_estimate.modeled_wheels == 0)
-          ImGui::TextWrapped("A side without motor data uses the 424 RPM fallback. Configure its motor in Bot workshop for a motor-based estimate.");
+          ImGui::TextWrapped("A side without motor data uses the 424 RPM fallback. Configure its motor in Configure for a motor-based estimate.");
         else
-          ImGui::TextWrapped("Full throttle targets the Kv x battery voltage / gear ratio estimate. Loaded wheel RPM is calculated from motor torque and the bot's contact and inertia.");
+        ImGui::TextWrapped("Full throttle targets the motor speed estimate after pack-voltage and gear-ratio scaling. Loaded RPM comes from motor torque and simulated wheel load.");
       }
       const bool weapon_torque_enabled = weapon_uses_torque_model(controls);
       const double weapon_rpm_limit = weapon_torque_enabled
@@ -2188,7 +3505,7 @@ int main(int argc, char** argv) {
         if (input_mixer.enabled && joystick)
           ImGui::TextWrapped("The controller mixer's Weapon output applies motor torque. Zero output lets the weapon coast down.");
         else
-          ImGui::TextWrapped("Hold Space or the gamepad weapon button to apply motor torque. Spin-up comes from the configured motor and weapon assembly inertia; releasing the button lets it coast down.");
+          ImGui::TextWrapped("Hold Space or the gamepad weapon button to apply player weapon motor torque. Opponent weapon uses M. Releasing lets each weapon coast under the modeled losses.");
       } else {
         ImGui::SetNextItemWidth(280.0f);
         ImGui::SliderFloat("Weapon target RPM", &controls.weapon_rpm, 0, 30000, "%.0f RPM");
@@ -2205,7 +3522,7 @@ int main(int argc, char** argv) {
       }
       if (weapon_readings) weapon_actual /= weapon_readings;
       ImGui::SameLine();
-      if (weapon_readings) ImGui::TextColored(ImVec4(0.35f, 0.88f, 0.83f, 1.0f),
+      if (weapon_readings) ImGui::TextColored(ui_teal,
                                                "%.0f RPM", weapon_actual);
       else ImGui::TextDisabled("No weapon drive assigned");
       ImGui::ProgressBar(weapon_rpm_limit > 0.0 ?
@@ -2213,7 +3530,8 @@ int main(int argc, char** argv) {
         ImVec2(-1, 12), "");
       auto draw_wheel_telemetry = [&](const char* side,
                                       const std::vector<std::pair<int, double>>& wheels) {
-        ImGui::Text("%s wheels  (%d)", side, int(wheels.size()));
+        ImGui::TextColored(std::string(side) == "Left" ? ui_blue : ui_coral,
+                           "%s wheels  (%d)", side, int(wheels.size()));
         if (wheels.empty()) { ImGui::TextDisabled("No wheel drives assigned"); return; }
         double sum = 0.0; int valid = 0;
         for (size_t i = 0; i < wheels.size(); ++i) {
@@ -2226,16 +3544,14 @@ int main(int argc, char** argv) {
           if (!slip.valid) {
             ImGui::TextDisabled("SLIP UNKNOWN");
           } else if (!slip.has_ground_contact) {
-            ImGui::TextColored(ImVec4(0.80f, 0.75f, 0.48f, 1.0f), "AIRBORNE");
+            ImGui::TextColored(ui_amber, "AIRBORNE");
           } else if (slip.speed > 0.18) {
-            ImGui::TextColored(ImVec4(1.0f, 0.40f, 0.28f, 1.0f),
-                               "SLIPPING  %.2f m/s", slip.speed);
+            ImGui::TextColored(ui_red, "SLIPPING  %.2f m/s", slip.speed);
           } else {
-            ImGui::TextColored(ImVec4(0.36f, 0.84f, 0.58f, 1.0f),
-                               "GRIP  %.2f m/s", slip.speed);
+            ImGui::TextColored(ui_green, "GRIP  %.2f m/s", slip.speed);
           }
         }
-        if (valid) ImGui::TextColored(ImVec4(0.75f, 0.82f, 0.9f, 1.0f),
+        if (valid) ImGui::TextColored(ui_ink,
                                       "  Average: %+.0f RPM", sum / valid);
       };
       draw_wheel_telemetry("Left", controls.left);
@@ -2247,14 +3563,15 @@ int main(int argc, char** argv) {
       ImGui::Text("Drive joints: left %d  |  right %d",
                   int(controls.left.size()), int(controls.right.size()));
       if (controls.left.empty() || controls.right.empty())
-        ImGui::TextWrapped("Assign at least one wheel assembly to each side in Bot workshop, then Apply and preview.");
+        ImGui::TextWrapped("Assign at least one wheel assembly to each side in Configure, then Apply and preview.");
       if (!runtime_error.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.55f, 0.4f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ui_red);
         ImGui::TextWrapped("Model message: %s", runtime_error.c_str());
         ImGui::PopStyleColor();
       }
       ImGui::PopTextWrapPos();
       ImGui::EndChild();
+      ImGui::PopStyleColor();
       ImGui::SameLine(0.0f, 0.0f);
       ImGui::InvisibleButton("##drive_sidebar_splitter",
                              ImVec2(8.0f, drive_content_height));
@@ -2291,10 +3608,13 @@ int main(int argc, char** argv) {
           drive_splitter_color, 2.0f);
       }
       ImGui::End();
+      ImGui::PopStyleColor(2);
     } else {
       ImGui::SetNextWindowPos(ImVec2(12, 72), ImGuiCond_Always);
       ImGui::SetNextWindowSize(ImVec2(display.x - 24, display.y - 84), ImGuiCond_Always);
-      ImGui::Begin("##bot_workshop", nullptr, fixed_window);
+      ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.075f, 0.09f, 0.12f, 0.98f));
+      ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.24f, 0.29f, 0.36f, 0.95f));
+      ImGui::Begin("##configure_bots", nullptr, fixed_window);
       const float panel_width = ImGui::GetContentRegionAvail().x;
       const float splitter_width = 10.0f;
       const float column_spacing = ImGui::GetStyle().ItemSpacing.x;
@@ -2312,17 +3632,58 @@ int main(int argc, char** argv) {
       editor_width = std::clamp(editor_width, min_editor_width, max_editor_width);
       if (!editor_dragging) requested_editor_width = editor_width;
       const float splitter_height = ImGui::GetContentRegionAvail().y;
+      ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.115f, 0.145f, 0.19f, 0.98f));
       ImGui::BeginChild("Bot configuration", ImVec2(editor_width, 0),
                         ImGuiChildFlags_Borders, ImGuiWindowFlags_AlwaysVerticalScrollbar);
       ImGui::PushTextWrapPos(520.0f);
-      ImGui::TextColored(ImVec4(0.32f, 0.88f, 0.89f, 1.0f), "BOT CONFIGURATION");
-      ImGui::TextDisabled("Import and assign your robot components");
+      ImGui::TextColored(ui_blue, "BOT CONFIGURATION");
+      ImGui::TextDisabled("Configure imported bodies, wheels, weapons, and forks");
+      const bool player_tab_active = config_bot == 0;
+      if (player_tab_active)
+        push_button_palette(ImVec4(0.16f, 0.27f, 0.39f, 1.0f),
+                            ImVec4(0.21f, 0.37f, 0.53f, 1.0f),
+                            ImVec4(0.25f, 0.46f, 0.65f, 1.0f));
+      if (ImGui::Button("Player bot", ImVec2(132, 32))) {
+        if (config_bot != 0) {
+          config_bot = 0;
+          load_requested = bundle.HasBundle();
+        }
+      }
+      if (player_tab_active) pop_button_palette();
+      ImGui::SameLine();
+      const bool opponent_tab_active = config_bot == 1;
+      if (opponent_tab_active)
+        push_button_palette(ImVec4(0.39f, 0.22f, 0.20f, 1.0f),
+                            ImVec4(0.53f, 0.29f, 0.24f, 1.0f),
+                            ImVec4(0.65f, 0.34f, 0.27f, 1.0f));
+      if (ImGui::Button("Opponent bot", ImVec2(132, 32))) {
+        if (config_bot != 1) {
+          config_bot = 1;
+          load_requested = opponent_bundle.HasBundle();
+        }
+      }
+      if (opponent_tab_active) pop_button_palette();
+      setup_bundle = config_bot == 1 ? &opponent_bundle : &bundle;
+      if (config_bot == 1 && opponent_bundle.HasBundle()) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove opponent")) {
+          opponent_bundle.Clear();
+          config_bot = 0;
+          setup_bundle = &bundle;
+          load_requested = bundle.HasBundle();
+          apply_requested = true;
+        }
+        ImGui::TextWrapped("Opponent modules use their own saved setup and actuators. In Drive, I/K move it forward/back, J/L turn it, and M spins its weapon.");
+      }
       ImGui::Separator();
-      bundle.Draw(window, load_requested, apply_requested);
-      if (!runtime_error.empty()) ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f),
+      setup_bundle->Draw(window, load_requested, apply_requested);
+      if (config_bot == 1 && load_requested && opponent_bundle.HasBundle())
+        apply_requested = true;
+      if (!runtime_error.empty()) ImGui::TextColored(ui_red,
                                                        "Model message: %s", runtime_error.c_str());
       ImGui::PopTextWrapPos();
       ImGui::EndChild();
+      ImGui::PopStyleColor();
       ImGui::SameLine();
       ImGui::InvisibleButton("##bot_config_splitter", ImVec2(splitter_width, splitter_height));
       const bool splitter_hovered = ImGui::IsItemHovered();
@@ -2356,15 +3717,17 @@ int main(int argc, char** argv) {
           splitter_color, 2.0f);
       }
       ImGui::SameLine();
+      ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.13f, 0.17f, 1.0f));
       ImGui::BeginChild("Robot preview panel", ImVec2(0, 0), ImGuiChildFlags_Borders);
-      ImGui::TextColored(ImVec4(0.32f, 0.88f, 0.89f, 1.0f), "ROBOT PREVIEW");
-      bundle.DrawAxisSelectionControls();
+      ImGui::TextColored(config_bot == 1 ? ui_coral : ui_blue,
+                         config_bot == 1 ? "OPPONENT PREVIEW" : "PLAYER PREVIEW");
+      setup_bundle->DrawAxisSelectionControls();
       ImGui::TextWrapped("Hover to highlight a part. In axis mode, hover a hole rim until its edge loop highlights, then click. Left drag orbits; right drag pans; scroll zooms.");
-      if (setup_model) {
+      if (setup_model && setup_bundle->HasBundle()) {
         if (ImGui::SmallButton("Reset view")) {
-          const auto center = bundle.PreviewCenter();
+          const auto center = setup_bundle->PreviewCenter();
           for (int i = 0; i < 3; ++i) setup_camera.lookat[i] = center[i];
-          setup_camera.distance = bundle.PreviewDistance();
+          setup_camera.distance = setup_bundle->PreviewDistance();
           setup_camera.azimuth = 45; setup_camera.elevation = -45;
         }
         ImGui::SameLine();
@@ -2373,7 +3736,7 @@ int main(int argc, char** argv) {
         ImGui::SliderScalar("Tilt", ImGuiDataType_Double, &setup_camera.elevation,
                             &min_tilt, &max_tilt, "%.0f deg");
       }
-      if (setup_model) {
+      if (setup_model && setup_bundle->HasBundle()) {
         const ImVec2 available = ImGui::GetContentRegionAvail();
         const int preview_width = std::max(1, int(available.x));
         const int preview_height = std::max(1, int(available.y));
@@ -2389,7 +3752,7 @@ int main(int argc, char** argv) {
                        GL_RGB, GL_UNSIGNED_BYTE, nullptr);
         }
         for (int i = 0; i < setup_model->ngeom; ++i)
-          setup_model->geom_group[i] = bundle.PreviewVisible(i) ? 0 : 5;
+          setup_model->geom_group[i] = setup_bundle->PreviewVisible(i) ? 0 : 5;
         options.geomgroup[5] = 0;
         mjv_updateScene(setup_model, setup_data, &options, nullptr, &setup_camera, mjCAT_ALL, &setup_scene);
         const ImVec2 canvas_min = ImGui::GetCursorScreenPos();
@@ -2399,18 +3762,17 @@ int main(int argc, char** argv) {
           mouse.x < canvas_min.x + preview_width && mouse.y < canvas_min.y + preview_height;
         if (mouse_on_canvas && !ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
             !ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
-          mjtNum hit[3]; int geom_id = -1, flex_id = -1, skin_id = -1;
-          mjv_select(setup_model, setup_data, &options, double(preview_width)/preview_height,
-            (mouse.x-canvas_min.x)/preview_width, 1.0-(mouse.y-canvas_min.y)/preview_height,
-            &setup_scene, hit, &geom_id, &flex_id, &skin_id);
-          const char* picked = geom_id >= 0 ? mj_id2name(setup_model, mjOBJ_GEOM, geom_id) : nullptr;
-          const int part = picked && std::string(picked).rfind("cad_part_", 0) == 0 ?
-            std::stoi(std::string(picked).substr(9)) : -1;
-          bundle.UpdateHover(part, {hit[0], hit[1], hit[2]});
-        } else bundle.UpdateHover(-1, {});
-        if (!bundle.AxisPicking()) {
-          const int selected = bundle.SelectedPart();
-          for (int highlight : {bundle.HoveredPart(), selected}) if (highlight >= 0) {
+          mjtNum hit[3];
+          const int part = SelectPreviewPartForHover(setup_model, setup_data, &options,
+            double(preview_width)/preview_height,
+            (mouse.x-canvas_min.x)/preview_width,
+            1.0-(mouse.y-canvas_min.y)/preview_height,
+            setup_scene, *setup_bundle, hit);
+          setup_bundle->UpdateHover(part, {hit[0], hit[1], hit[2]});
+        } else setup_bundle->UpdateHover(-1, {});
+        if (!setup_bundle->AxisPicking()) {
+          const int selected = setup_bundle->SelectedPart();
+          for (int highlight : {setup_bundle->HoveredPart(), selected}) if (highlight >= 0) {
             const std::string name = "cad_part_" + std::to_string(highlight);
             const int geom_id = mj_name2id(setup_model, mjOBJ_GEOM, name.c_str());
             for (int i = 0; i < setup_scene.ngeom; ++i)
@@ -2423,7 +3785,7 @@ int main(int argc, char** argv) {
         }
         mjtNum camera_head[3], camera_forward[3], camera_up[3];
         mjv_cameraInModel(camera_head, camera_forward, camera_up, &setup_scene);
-        bundle.AddSetupAxisMarkers(setup_scene,
+        setup_bundle->AddSetupAxisMarkers(setup_scene,
           {camera_head[0], camera_head[1], camera_head[2]});
         mjr_setBuffer(mjFB_OFFSCREEN, &setup_context);
         mjr_render({0, 0, preview_width, preview_height}, &setup_scene, &setup_context);
@@ -2441,6 +3803,10 @@ int main(int argc, char** argv) {
         const ImVec2 image_max = ImGui::GetItemRectMax();
         ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)preview_texture,
                                              image_min, image_max, ImVec2(0, 1), ImVec2(1, 0));
+        const bool canvas_click = mouse.x >= image_min.x && mouse.y >= image_min.y &&
+          mouse.x < image_max.x && mouse.y < image_max.y &&
+          ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+          ImGui::GetIO().MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] <= 16.0f;
         if (ImGui::IsItemHovered()) {
           if (ImGui::GetIO().MouseWheel != 0)
             setup_camera.distance = std::clamp(setup_camera.distance * std::pow(0.9, ImGui::GetIO().MouseWheel), 0.05, 15.0);
@@ -2457,15 +3823,29 @@ int main(int argc, char** argv) {
               setup_camera.lookat[i] += (-right[i]*ImGui::GetIO().MouseDelta.x +
                                           up[i]*ImGui::GetIO().MouseDelta.y) * scale;
           }
-          if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
-              ImGui::GetIO().MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] <= 16.0f) {
-            if (bundle.AxisPicking()) bundle.SelectHoveredHole();
-            else if (bundle.HoveredPart() >= 0) bundle.SelectPart(bundle.HoveredPart());
+        }
+        // Re-pick at release using the displayed image's exact rectangle. This
+        // keeps the fitted loop synchronized with the click even if the hover
+        // ray was stale for one frame while crossing into the preview canvas.
+        if (canvas_click) {
+          if (setup_bundle->AxisPicking()) {
+            mjtNum hit[3];
+            const int part = SelectPreviewPartForHover(setup_model, setup_data,
+              &options, double(preview_width)/preview_height,
+              (mouse.x-image_min.x)/preview_width,
+              1.0-(mouse.y-image_min.y)/preview_height,
+              setup_scene, *setup_bundle, hit);
+            setup_bundle->UpdateHover(part, {hit[0], hit[1], hit[2]});
+            setup_bundle->SelectHoveredHole();
+          } else if (setup_bundle->HoveredPart() >= 0) {
+            setup_bundle->SelectPart(setup_bundle->HoveredPart());
           }
         }
-      } else ImGui::TextWrapped("Load a Fusion manifest in Bot configuration to preview and select its parts.");
+      } else ImGui::TextWrapped("Load a Fusion manifest in this bot's configuration to preview and select its parts.");
       ImGui::EndChild();
+      ImGui::PopStyleColor();
       ImGui::End();
+      ImGui::PopStyleColor(2);
     }
     if (mixer_popup_requested) {
       mixer_popup_open = true;
@@ -2478,9 +3858,11 @@ int main(int argc, char** argv) {
       ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                               ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
       ImGui::SetNextWindowSize(mixer_window_size, ImGuiCond_Appearing);
+      ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.09f, 0.085f, 0.13f, 0.99f));
+      ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.30f, 0.25f, 0.39f, 1.0f));
       if (ImGui::BeginPopupModal("Controller mixer setup", &mixer_popup_open,
           ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
-        ImGui::TextColored(ImVec4(0.32f, 0.88f, 0.89f, 1.0f), "CONTROLLER MIXER");
+        ImGui::TextColored(ui_violet, "CONTROLLER MIXER");
         ImGui::TextDisabled("Set input channels, tune each output mix line, then move the controller to test its response graph.");
         ImGui::Separator();
         draw_mixer_dialog(input_mixer, joystick, joystick_id, controls);
@@ -2493,10 +3875,11 @@ int main(int argc, char** argv) {
         }
         ImGui::EndPopup();
       }
+      ImGui::PopStyleColor(2);
     }
     if (load_requested) {
       std::filesystem::path preview_path;
-      if (bundle.GeneratePreview(preview_path)) {
+      if (setup_bundle->HasBundle() && setup_bundle->GeneratePreview(preview_path)) {
         std::array<char, 8192> diagnostic{};
         mjModel* next = mj_loadXML(preview_path.string().c_str(), nullptr, diagnostic.data(), diagnostic.size());
         mjData* next_data = next ? mj_makeData(next) : nullptr;
@@ -2510,19 +3893,19 @@ int main(int argc, char** argv) {
           setup_model->vis.quality.offsamples = 0;
           mjv_makeScene(setup_model, &setup_scene, 2000);
           mjr_makeContext(setup_model, &setup_context, mjFONTSCALE_100);
-          const auto center = bundle.PreviewCenter();
+          const auto center = setup_bundle->PreviewCenter();
           for (int i = 0; i < 3; ++i) setup_camera.lookat[i] = center[i];
-          setup_camera.distance = bundle.PreviewDistance();
+          setup_camera.distance = setup_bundle->PreviewDistance();
           runtime_error.clear();
         } else {
           runtime_error = next ? "Could not allocate CAD setup model." : diagnostic.data();
           if (next) mj_deleteModel(next);
         }
-      } else runtime_error = bundle.Error();
+      } else if (setup_bundle->HasBundle()) runtime_error = setup_bundle->Error();
     }
     if (apply_requested) {
       std::filesystem::path generated;
-      if (bundle.Generate(generated)) {
+      if (bundle.Generate(generated, opponent_bundle.HasBundle() ? &opponent_bundle : nullptr)) {
         std::array<char, 8192> preview_error{};
         mjModel* next_model = mj_loadXML(generated.string().c_str(), nullptr, preview_error.data(), preview_error.size());
         mjData* next_data = next_model ? mj_makeData(next_model) : nullptr;
@@ -2534,14 +3917,27 @@ int main(int argc, char** argv) {
           mjr_freeContext(&context); mjv_freeScene(&scene);
           mj_deleteData(data); mj_deleteModel(model);
           model = next_model; data = next_data;
+          gizmo_drag_active = false; gizmo_drag_axis = -1;
           model->vis.quality.offsamples = 0;
           mjv_makeScene(model, &scene, 2000); mjr_makeContext(model, &context, mjFONTSCALE_100);
           controls.left.clear(); controls.right.clear(); controls.weapon.clear();
+          controls.filtered_wheel_speeds.clear();
           bundle.BindControls(model, controls.left, controls.right, controls.weapon,
                               controls.motor_models, controls.weapon_motor_models,
                               controls.manual_velocity_actuators,
                               controls.battery_voltage);
           controls.weapon_sign = 1.0; controls.weapon_command = 0.0;
+          opponent_controls.left.clear();
+          opponent_controls.right.clear();
+          opponent_controls.weapon.clear();
+          opponent_controls.filtered_wheel_speeds.clear();
+          opponent_bundle.BindControls(model, opponent_controls.left,
+              opponent_controls.right, opponent_controls.weapon,
+              opponent_controls.motor_models, opponent_controls.weapon_motor_models,
+              opponent_controls.manual_velocity_actuators,
+              opponent_controls.battery_voltage, true);
+          opponent_controls.weapon_sign = 1.0;
+          opponent_controls.weapon_command = 0.0;
           accumulator = 0.0; paused = true; runtime_error.clear();
         }
       } else runtime_error = bundle.Error();

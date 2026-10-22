@@ -63,6 +63,21 @@ def chamfered_ring_stl(path, segments=64):
             stream.write(struct.pack("<H", 0))
 
 
+def floor_scrape_pairs(model):
+    return [pair for pair in model.findall("contact/pair")
+            if "floor" in (pair.attrib.get("geom1"), pair.attrib.get("geom2"))]
+
+
+def robot_internal_pairs(model):
+    return [pair for pair in model.findall("contact/pair")
+            if "floor" not in (pair.attrib.get("geom1"), pair.attrib.get("geom2"))]
+
+
+def has_pair(model, geom_a, geom_b):
+    return any({pair.attrib.get("geom1"), pair.attrib.get("geom2")} == {geom_a, geom_b}
+               for pair in model.findall("contact/pair"))
+
+
 @contextmanager
 def smoke_directory(workdir=None):
     if workdir is None:
@@ -104,6 +119,13 @@ def main(exe, workdir=None):
         raise SystemExit(result.returncode)
     assert "Wall impact at 2500 Hz and 100.0 m/s" in result.stdout
     assert "Wall impact stayed inside the arena at both update rates." in result.stdout
+    result = subprocess.run([str(exe), "--test-transform-gizmo", str(stock_model)],
+                            text=True, capture_output=True)
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    if result.returncode:
+        raise SystemExit(result.returncode)
+    assert "X/Y/Z arrows and rotation rings render and pick" in result.stdout
 
     with smoke_directory(workdir) as root:
         entries = [
@@ -169,6 +191,86 @@ def main(exe, workdir=None):
                                       "gearboxEfficiency": 0.9}}
                            for pivot, (n, k, axis) in zip(pivots, groups)],
             "partAssignments": assignments}), encoding="utf-8")
+        opponent_root = root / "opponent"
+        tetra_stl(opponent_root / "Parts" / "chassis.stl")
+        tetra_stl(opponent_root / "Parts" / "weapon.stl")
+        tetra_stl(opponent_root / "Parts" / "wheel.stl")
+        tetra_stl(opponent_root / "Parts" / "wheel_right.stl")
+        tetra_stl(opponent_root / "Parts" / "fork.stl")
+        opponent_parts = [
+            {"file": "Parts/chassis.stl", "partName": "Chassis",
+             "bodyName": "Chassis", "occurrencePath": ["Chassis"],
+             "massKg": 0.18, "unitToMeters": 0.001,
+             "positionFusionMeters": [0, 0, 0], "rotationFusionWxyz": [1, 0, 0, 0]},
+            {"file": "Parts/weapon.stl", "partName": "Weapon",
+             "bodyName": "Weapon", "occurrencePath": ["Weapon"],
+             "massKg": 0.05, "unitToMeters": 0.001,
+             "positionFusionMeters": [0.15, 0, 0.01], "rotationFusionWxyz": [1, 0, 0, 0]},
+            {"file": "Parts/wheel.stl", "partName": "Wheel",
+             "bodyName": "Wheel", "occurrencePath": ["Wheel"],
+             "massKg": 0.04, "unitToMeters": 0.001,
+             "positionFusionMeters": [-0.15, 0, 0], "rotationFusionWxyz": [1, 0, 0, 0]},
+            {"file": "Parts/fork.stl", "partName": "Fork",
+             "bodyName": "Fork", "occurrencePath": ["Fork"],
+             "massKg": 0.03, "unitToMeters": 0.001,
+             "positionFusionMeters": [0, 0.15, 0], "rotationFusionWxyz": [1, 0, 0, 0]},
+            {"file": "Parts/wheel_right.stl", "partName": "Right wheel",
+             "bodyName": "Right wheel", "occurrencePath": ["Right wheel"],
+             "massKg": 0.04, "unitToMeters": 0.001,
+             "positionFusionMeters": [0.15, 0, 0], "rotationFusionWxyz": [1, 0, 0, 0]},
+        ]
+        opponent_manifest = opponent_root / "manifest.json"
+        opponent_manifest.write_text(json.dumps({"schemaVersion": 2,
+            "designName": "Synthetic opponent", "unitToMeters": 0.001,
+            "parts": opponent_parts}), encoding="utf-8")
+        (opponent_root / "combatsim_setup.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "batteryVoltage": 11.1,
+            "assemblies": [
+                {"name": "Weapon", "kind": "Weapon", "pivotMeters": [0.15, 0, 0.01],
+                 "axis": [0, 1, 0], "motor": {"enabled": True, "motorCount": 1,
+                     "kvRpmPerVolt": 1000.0, "peakCurrentA": 10.0,
+                     "phaseResistanceOhm": 0.04, "gearRatio": "1:1",
+                     "gearboxEfficiency": 0.9}},
+                {"name": "Drive wheel left", "kind": "Left wheel", "pivotMeters": [-0.15, 0, 0],
+                 "axis": [1, 0, 0], "motor": {"enabled": True, "driveGroup": 0,
+                     "motorCount": 1, "kvRpmPerVolt": 1000.0, "peakCurrentA": 10.0,
+                     "phaseResistanceOhm": 0.04, "gearRatio": "1:1",
+                     "gearboxEfficiency": 0.9}},
+                {"name": "Drive wheel right", "kind": "Right wheel", "pivotMeters": [0.15, 0, 0],
+                 "axis": [1, 0, 0], "motor": {"enabled": True, "driveGroup": 1,
+                     "motorCount": 1, "kvRpmPerVolt": 1000.0, "peakCurrentA": 10.0,
+                     "phaseResistanceOhm": 0.04, "gearRatio": "1:1",
+                     "gearboxEfficiency": 0.9}},
+                {"name": "Front fork", "kind": "Gravity fork", "pivotMeters": [0, 0.15, 0],
+                 "axis": [0, 1, 0], "forkRangeDegrees": [-65, 70],
+                 "forkCollidesWithFrame": True},
+            ],
+            "partAssignments": {"Parts/chassis.stl": 0, "Parts/weapon.stl": 1,
+                                 "Parts/wheel.stl": 2, "Parts/wheel_right.stl": 3,
+                                 "Parts/fork.stl": 4},
+        }), encoding="utf-8")
+        result = subprocess.run([str(exe), "--test-opponent-bundle",
+                                 str(root / "manifest.json"), str(opponent_manifest)],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        assert "0.34 kg total mass" in result.stdout
+        assert "opposite spawn" in result.stdout
+        assert "player collision" in result.stdout
+        opponent_model = ET.parse(root / "combatsim_generated.xml").getroot()
+        assert has_pair(opponent_model, "floor", "opponent_part_0")
+        assert has_pair(opponent_model, "floor", "opponent_part_3")
+        for part_name in ("opponent_part_0", "opponent_part_3"):
+            pair = next(pair for pair in floor_scrape_pairs(opponent_model)
+                        if part_name in (pair.attrib.get("geom1"), pair.attrib.get("geom2")))
+            assert pair.attrib["solref"] == "0.02 2"
+        opponent_quat = [float(value) for value in
+                         opponent_model.find(".//body[@name='Target_Robot']").attrib["quat"].split()]
+        assert abs(opponent_quat[0] - 2 ** -0.5) < 1e-6
+        assert abs(opponent_quat[3] - 2 ** -0.5) < 1e-6
         result = subprocess.run([str(exe), "--test-motor-actuator", str(root / "manifest.json")],
                                 text=True, capture_output=True)
         print(result.stdout, end="")
@@ -178,6 +280,48 @@ def main(exe, workdir=None):
         assert "Shared motor spin test passed: 2 wheel assemblies" in result.stdout
         assert "Manual speed override passed: 4000 RPM target reached" in result.stdout
         assert "7400 RPM no-load" in result.stdout
+
+        setup_path = root / "combatsim_setup.json"
+        setup = json.loads(setup_path.read_text(encoding="utf-8"))
+        result = subprocess.run([str(exe), "--test-drive-layout", str(root / "manifest.json")],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        assert "2WD front/rear axle selection and return to 4WD passed" in result.stdout
+        saved_layout = json.loads(setup_path.read_text(encoding="utf-8"))
+        assert saved_layout["driveLayout"] == "4WD"
+        assert saved_layout["twoWdAxle"] == "rear"
+        assert all(assembly.get("wheelPosition") in ("front", "rear")
+                   for assembly in saved_layout["assemblies"]
+                   if assembly["kind"] in ("Left wheel", "Right wheel"))
+
+        # Brushed motors often publish speed at a voltage instead of Kv and may
+        # omit resistance/controller details. Confirm both speed data and those
+        # missing optional values load through the real bundle path.
+        brushed_setup = json.loads(json.dumps(setup))
+        brushed_setup["driveLayout"] = "4WD"
+        for assembly in brushed_setup["assemblies"]:
+            if assembly["name"] in ("FL", "RL"):
+                motor = assembly["motor"]
+                motor["motorType"] = "brushed"
+                motor["speedInput"] = "ratedRpmAtVoltage"
+                motor["ratedRpm"] = 10000.0
+                motor["ratedVoltage"] = 12.0
+                motor.pop("phaseResistanceOhm", None)
+                motor.pop("armatureResistanceOhm", None)
+                motor.pop("escCurrentLimitA", None)
+        setup_path.write_text(json.dumps(brushed_setup), encoding="utf-8")
+        result = subprocess.run([str(exe), "--test-motor-actuator", str(root / "manifest.json")],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        setup_path.write_text(json.dumps(setup), encoding="utf-8")
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        assert "6167 RPM no-load" in result.stdout
+        assert "Manual speed override passed: 4000 RPM target reached" in result.stdout
 
         result = subprocess.run([str(exe), "--test-weapon-motor", str(root / "manifest.json")],
                                 text=True, capture_output=True)
@@ -243,13 +387,66 @@ def main(exe, workdir=None):
         assert east_wall.attrib["size"].split()[0] == "0.05"
         assert east_wall.attrib["margin"] == "0.01"
         assert east_wall.attrib["solref"] == "0.001 1"
-        assert len(model.findall("contact/pair")) == 2
+        assert len(floor_scrape_pairs(model)) == 3
+        assert len(robot_internal_pairs(model)) == 2
+        assert all(pair.attrib["solref"] == "0.003 1"
+                   for pair in robot_internal_pairs(model))
+        assert has_pair(model, "floor", "cad_part_0")
+        frame_floor_pair = next(pair for pair in floor_scrape_pairs(model)
+                                if "cad_part_0" in (pair.attrib.get("geom1"), pair.attrib.get("geom2")))
+        assert frame_floor_pair.attrib["solref"] == "0.02 2"
         for fork_id in (6, 7):
             fork_joint = model.find(f".//joint[@name='cad_joint_{fork_id}']")
             assert fork_joint is not None and fork_joint.attrib["limited"] == "true"
             low, high = (float(value) for value in fork_joint.attrib["range"].split())
             assert abs(low + math.pi / 2) < 1e-9 and abs(high - math.pi / 2) < 1e-9
             assert model.find(f".//velocity[@name='cad_assembly_{fork_id}_drive']") is None
+
+        # Fixed CAD forks stay collision-enabled while their floor response is
+        # damped by a floor-specific pair; other collisions keep default response.
+        setup_path = root / "combatsim_setup.json"
+        setup = json.loads(setup_path.read_text(encoding="utf-8"))
+        fixed_fork_path = "Parts/Forks/Contact/0007.stl"
+        setup["partAssignments"][fixed_fork_path] = 0
+        setup_path.write_text(json.dumps(setup), encoding="utf-8")
+        result = subprocess.run([str(exe), "--validate-bundle", str(root / "manifest.json")],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        fixed_model = ET.parse(root / "combatsim_generated.xml").getroot()
+        assert has_pair(fixed_model, "floor", "cad_part_7")
+        fixed_fork_pair = next(pair for pair in floor_scrape_pairs(fixed_model)
+                               if "cad_part_7" in (pair.attrib.get("geom1"), pair.attrib.get("geom2")))
+        assert fixed_fork_pair.attrib["solref"] == "0.02 2"
+        fixed_fork = fixed_model.find(".//geom[@name='cad_part_7']")
+        assert fixed_fork is not None
+        assert "priority" not in fixed_fork.attrib and "solref" not in fixed_fork.attrib
+        setup["partAssignments"][fixed_fork_path] = 6
+        setup_path.write_text(json.dumps(setup), encoding="utf-8")
+        print("Chassis and fixed fork floor-contact damping passed")
+
+        setup["partAssignments"][fixed_fork_path] = 0
+        setup["partOverrides"] = {fixed_fork_path: {"collisionEnabled": False}}
+        setup_path.write_text(json.dumps(setup), encoding="utf-8")
+        result = subprocess.run([str(exe), "--validate-bundle", str(root / "manifest.json")],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        disabled_model = ET.parse(root / "combatsim_generated.xml").getroot()
+        disabled_fork = disabled_model.find(".//geom[@name='cad_part_7']")
+        assert disabled_fork is not None and disabled_fork.attrib["contype"] == "0"
+        assert not has_pair(disabled_model, "floor", "cad_part_7")
+        assert not any("cad_part_7" in (pair.attrib.get("geom1"), pair.attrib.get("geom2"))
+                       for pair in robot_internal_pairs(disabled_model))
+        print("Collision-disabled fixed fork skips explicit floor and frame pairs")
+        setup["partAssignments"][fixed_fork_path] = 6
+        setup.pop("partOverrides", None)
+        setup_path.write_text(json.dumps(setup), encoding="utf-8")
+
         weapon = model.find(".//body[@name='cad_assembly_1']")
         inertial = weapon.find("inertial")
         combined_com = [float(value) for value in inertial.attrib["pos"].split()]
@@ -267,7 +464,6 @@ def main(exe, workdir=None):
 
         # Manual mass edits scale each part's Fusion inertia while preserving
         # its shape (radius of gyration), then recompute the group COM and shift.
-        setup_path = root / "combatsim_setup.json"
         setup = json.loads(setup_path.read_text(encoding="utf-8"))
         setup["partOverrides"] = {parts[1]["file"]: {"massKg": 0.2}}
         setup["assemblies"][6]["forkCollidesWithFrame"] = False
@@ -285,8 +481,8 @@ def main(exe, workdir=None):
         assert int(fork_toggle.group(2)) > 0
         generated = (root / "combatsim_generated.xml").read_text(encoding="utf-8")
         model = ET.fromstring(generated)
-        assert len(model.findall("contact/pair")) == 1
-        assert model.find("contact/pair").attrib["geom1"] == "cad_part_7"
+        assert len(floor_scrape_pairs(model)) == 3
+        assert len(robot_internal_pairs(model)) == 1
         weapon = model.find(".//body[@name='cad_assembly_1']")
         inertial = weapon.find("inertial")
         combined_com = [float(value) for value in inertial.attrib["pos"].split()]
@@ -312,13 +508,17 @@ def main(exe, workdir=None):
             raise SystemExit(result.returncode)
         assert "CAD gravity forks: 2; explicit fork-frame pairs: 0; initial fork-frame contacts: 0;" in result.stdout
         generated = (root / "combatsim_generated.xml").read_text(encoding="utf-8")
-        assert len(ET.fromstring(generated).findall("contact/pair")) == 0
+        model = ET.fromstring(generated)
+        assert len(floor_scrape_pairs(model)) == 3
+        assert len(robot_internal_pairs(model)) == 0
         print("Per-fork main-frame collision toggle passed")
 
         hole_root = root / "hole_test"
         ring_file = "Parts/Weapon/ring.stl"
         frame_file = "Parts/Frame/frame.stl"
-        chamfered_ring_stl(hole_root / ring_file)
+        # Weapon is the axis destination, but its mesh has no hole. The only
+        # selectable round reference is Frame, which remains outside Weapon.
+        tetra_stl(hole_root / ring_file)
         chamfered_ring_stl(hole_root / frame_file)
         hole_manifest = {
             "schemaVersion": 2,
@@ -327,7 +527,7 @@ def main(exe, workdir=None):
             "parts": [
                 {"file": ring_file, "partName": "Ring", "bodyName": "Weapon/Ring",
                  "occurrencePath": ["Weapon", "Ring"], "massKg": 0.01,
-                 "unitToMeters": 0.001, "positionFusionMeters": [0, 0, 0],
+                 "unitToMeters": 0.001, "positionFusionMeters": [0.10, 0.10, 0],
                  "rotationFusionWxyz": [1, 0, 0, 0]},
                 {"file": frame_file, "partName": "Frame", "bodyName": "Frame",
                  "occurrencePath": ["Frame"], "massKg": 0.05,
@@ -349,6 +549,92 @@ def main(exe, workdir=None):
         print(result.stderr, end="", file=sys.stderr)
         if result.returncode:
             raise SystemExit(result.returncode)
+        assert "Outside-assembly reference part fitted Weapon axis without reassignment" in result.stdout
+        result = subprocess.run([str(exe), "--test-axis-point", str(hole_manifest_path),
+                                 "1", "1", "0.010", "0", "0.004"],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        assert "highlighted a 64-point round rim" in result.stdout
+
+        result = subprocess.run([str(exe), "--validate-bundle", str(hole_manifest_path)],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        result = subprocess.run([str(exe), "--test-axis-hover",
+                                 str(hole_root / "combatsim_preview.xml"),
+                                 str(hole_manifest_path)], text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        assert "CAD-only preview rays" in result.stdout
+        assert "reference part 1" in result.stdout
+        assert "highlight loop" in result.stdout
+
+        setup = json.loads(setup_path.read_text(encoding="utf-8"))
+        wheel_layout = [
+            ([-0.1, -0.04, 0], [-1, 0, 0]),
+            ([-0.1, 0.04, 0], [1, 0, 0]),
+            ([0.1, -0.04, 0], [-1, 0, 0]),
+            ([0.1, 0.04, 0], [1, 0, 0]),
+        ]
+        for assembly, (pivot, axis) in zip(setup["assemblies"][1:5], wheel_layout):
+            assembly["pivotMeters"] = pivot
+            assembly["axis"] = axis
+        setup_path.write_text(json.dumps(setup), encoding="utf-8")
+        result = subprocess.run([str(exe), "--validate-bundle", str(root / "manifest.json")],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        assert "forward signs L=[1,-1] R=[1,-1]" in result.stdout
+        oriented_model = ET.parse(root / "combatsim_generated.xml").getroot()
+        player_quat = [float(value) for value in
+                       oriented_model.find(".//body[@name='Player_Robot']").attrib["quat"].split()]
+        assert abs(player_quat[0] - math.sqrt(0.5)) < 1e-6
+        assert abs(player_quat[3] + math.sqrt(0.5)) < 1e-6
+        print("Wheel-layout heading, mirrored axle signs, and face-to-face spawn orientation passed")
+
+        long_root = root / "long_path_case"
+        long_components = ["occurrence_{:02d}_{}".format(i, "x" * 20)
+                           for i in range(10)]
+        long_file = Path("Parts", *long_components, "0000_frame.stl")
+        tetra_stl(long_root / long_file)
+        long_manifest = {
+            "schemaVersion": 2,
+            "designName": "Long mesh path test",
+            "unitToMeters": 0.001,
+            "parts": [{"file": long_file.as_posix(), "partName": "Frame",
+                       "bodyName": "Frame", "occurrencePath": ["Frame"],
+                       "massKg": 0.35, "unitToMeters": 0.001,
+                       "positionFusionMeters": [0, 0, 0],
+                       "rotationFusionWxyz": [1, 0, 0, 0]}],
+        }
+        long_manifest_path = long_root / "manifest.json"
+        long_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        long_manifest_path.write_text(json.dumps(long_manifest), encoding="utf-8")
+        result = subprocess.run([str(exe), "--validate-bundle", str(long_manifest_path)],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        assert "CAD wheel drive mapping:" in result.stdout
+        assert "CAD axis-fit tests skipped" in result.stdout
+        long_cache = long_root / "Parts" / "_CombatSimCache"
+        cached_meshes = list(long_cache.rglob("mesh_*.stl"))
+        assert len(cached_meshes) == 1, "long Windows paths were not copied to the short asset cache"
+        preview_mesh = ET.parse(long_root / "combatsim_preview.xml").find(".//mesh")
+        assert preview_mesh is not None
+        assert "_CombatSimCache" in preview_mesh.attrib["file"]
+        assert "mesh_0.stl" in preview_mesh.attrib["file"]
+        print("Windows long-path CAD mesh import and MuJoCo asset loading passed")
 
 
 if __name__ == "__main__":
