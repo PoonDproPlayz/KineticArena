@@ -27,6 +27,8 @@ constexpr double pi = 3.14159265358979323846;
 constexpr double drive_command_ramp_seconds = 0.30;
 using json = nlohmann::json;
 constexpr int max_input_channels = 16;
+constexpr float min_arena_size_m = 0.75f;
+constexpr float max_arena_size_m = 10.0f;
 const ImVec4 ui_ink(0.90f, 0.93f, 0.97f, 1.0f);
 const ImVec4 ui_blue(0.39f, 0.70f, 1.00f, 1.0f);
 const ImVec4 ui_teal(0.30f, 0.84f, 0.82f, 1.0f);
@@ -36,8 +38,15 @@ const ImVec4 ui_coral(1.00f, 0.57f, 0.45f, 1.0f);
 const ImVec4 ui_amber(1.00f, 0.75f, 0.36f, 1.0f);
 const ImVec4 ui_red(1.00f, 0.42f, 0.44f, 1.0f);
 
+struct ArenaSizePreset {
+  std::string name;
+  float size_m = 2.0f;
+};
+
 struct AppSettings {
   int spawn_layout = 0;  // 0 = center line, 1 = opposite diagonal.
+  float arena_size_m = 2.0f;  // Full side length of the square fighting area.
+  std::vector<ArenaSizePreset> arena_presets;
   float ambient_light = 0.12f;
   float key_light = 0.68f;
   float fill_light = 0.24f;
@@ -56,6 +65,21 @@ void load_app_settings(AppSettings& settings) {
     if (!input) return;
     const json saved = json::parse(input);
     settings.spawn_layout = std::clamp(saved.value("spawnLayout", settings.spawn_layout), 0, 1);
+    settings.arena_size_m = std::clamp(saved.value("arenaSizeM", settings.arena_size_m),
+                                       min_arena_size_m, max_arena_size_m);
+    const auto presets = saved.find("arenaPresets");
+    if (presets != saved.end() && presets->is_array()) {
+      for (const auto& preset : *presets) {
+        if (!preset.is_object() || !preset.contains("name") ||
+            !preset["name"].is_string() || !preset.contains("sizeM") ||
+            !preset["sizeM"].is_number()) continue;
+        const std::string name = preset["name"].get<std::string>();
+        const float size_m = preset["sizeM"].get<float>();
+        if (name.empty() || name.size() > 64 || !std::isfinite(size_m)) continue;
+        settings.arena_presets.push_back({name,
+          std::clamp(size_m, min_arena_size_m, max_arena_size_m)});
+      }
+    }
     // Older preferences used a much brighter look that made clear panels glow.
     // Migrate those values once while preserving the user's spawn selection.
     if (saved.value("lightingVersion", 0) >= 1) {
@@ -78,7 +102,15 @@ bool save_app_settings(const AppSettings& settings) {
   const std::filesystem::path path = std::filesystem::path(preference_path) / "visual_settings.json";
   SDL_free(preference_path);
   try {
+    json arena_presets = json::array();
+    for (const auto& preset : settings.arena_presets) {
+      if (preset.name.empty() || preset.name.size() > 64 || !std::isfinite(preset.size_m)) continue;
+      arena_presets.push_back({{"name", preset.name},
+        {"sizeM", std::clamp(preset.size_m, min_arena_size_m, max_arena_size_m)}});
+    }
     json saved{{"lightingVersion", 1}, {"spawnLayout", settings.spawn_layout},
+      {"arenaSizeM", settings.arena_size_m},
+      {"arenaPresets", std::move(arena_presets)},
       {"ambientLight", settings.ambient_light}, {"keyLight", settings.key_light},
       {"fillLight", settings.fill_light}, {"cameraFill", settings.camera_fill}};
     std::ofstream output(path, std::ios::trunc);
@@ -730,7 +762,64 @@ Vec3 robot_geometry_center(const mjModel* model, const mjData* data, int root_bo
           (low[2] + high[2]) * 0.5};
 }
 
-void apply_arena_spawn_layout(const mjModel* model, mjData* data, int layout) {
+double clamp_arena_size_m(double size_m) {
+  return std::clamp(size_m, double(min_arena_size_m), double(max_arena_size_m));
+}
+
+void set_arena_geom(mjModel* model, const char* name, Vec3 position, Vec3 size) {
+  const int geom = mj_name2id(model, mjOBJ_GEOM, name);
+  if (geom < 0 || geom >= model->ngeom) return;
+  for (int axis = 0; axis < 3; ++axis) {
+    model->geom_pos[3 * geom + axis] = position[axis];
+    model->geom_size[3 * geom + axis] = size[axis];
+    model->geom_aabb[6 * geom + axis] = 0.0;
+    model->geom_aabb[6 * geom + axis + 3] = size[axis];
+  }
+  // Keep MuJoCo's broadphase radius in sync with the changed box dimensions.
+  model->geom_rbound[geom] = std::sqrt(size[0] * size[0] + size[1] * size[1] +
+                                       size[2] * size[2]);
+}
+
+void apply_arena_size(mjModel* model, double size_m) {
+  if (!model) return;
+  const double half = clamp_arena_size_m(size_m) * 0.5;
+  const int floor = mj_name2id(model, mjOBJ_GEOM, "floor");
+  if (floor >= 0 && floor < model->ngeom) {
+    model->geom_size[3 * floor] = half;
+    model->geom_size[3 * floor + 1] = half;
+    model->geom_aabb[6 * floor + 3] = half;
+    model->geom_aabb[6 * floor + 4] = half;
+  }
+
+  constexpr double catch_depth = 0.30;
+  constexpr double catch_margin = 0.02;
+  constexpr double panel_thickness = 0.004;
+  constexpr double wall_height = 0.5;
+  const double wall_center = half + catch_depth;
+  const double panel_center = half + panel_thickness;
+  const double catch_span = half + catch_margin;
+  set_arena_geom(model, "north_wall", {0, wall_center, wall_height},
+                 {catch_span, catch_depth, wall_height});
+  set_arena_geom(model, "south_wall", {0, -wall_center, wall_height},
+                 {catch_span, catch_depth, wall_height});
+  set_arena_geom(model, "east_wall", {wall_center, 0, wall_height},
+                 {catch_depth, catch_span, wall_height});
+  set_arena_geom(model, "west_wall", {-wall_center, 0, wall_height},
+                 {catch_depth, catch_span, wall_height});
+  set_arena_geom(model, "north_wall_acrylic", {0, panel_center, wall_height},
+                 {half, panel_thickness, wall_height});
+  set_arena_geom(model, "south_wall_acrylic", {0, -panel_center, wall_height},
+                 {half, panel_thickness, wall_height});
+  set_arena_geom(model, "east_wall_acrylic", {panel_center, 0, wall_height},
+                 {panel_thickness, half, wall_height});
+  set_arena_geom(model, "west_wall_acrylic", {-panel_center, 0, wall_height},
+                 {panel_thickness, half, wall_height});
+  set_arena_geom(model, "roof", {0, 0, 1.15}, {catch_span, catch_span, 0.15});
+  set_arena_geom(model, "roof_acrylic", {0, 0, 1.004}, {half, half, panel_thickness});
+}
+
+void apply_arena_spawn_layout(const mjModel* model, mjData* data, int layout,
+                              double arena_size_m) {
   if (!model || !data) return;
   mj_resetData(model, data);
   mj_forward(model, data);
@@ -760,9 +849,9 @@ void apply_arena_spawn_layout(const mjModel* model, mjData* data, int layout) {
                (highs[i][1] - lows[i][1]) * 0.5));
   }
   constexpr double wall_clearance = 0.01;
-  const double arena_inner_half_extent = 1.0;
+  const double arena_inner_half_extent = clamp_arena_size_m(arena_size_m) * 0.5;
   const double safe_offset = std::max(0.0, arena_inner_half_extent - wall_clearance - maximum_half_extent);
-  const double preferred_offset = layout == 1 ? 0.42 : 0.55;
+  const double preferred_offset = arena_inner_half_extent * (layout == 1 ? 0.42 : 0.55);
   const double offset = std::min(preferred_offset, safe_offset);
   const double targets[2][2] = {{-offset, layout == 1 ? -offset : 0.0},
                                  { offset, layout == 1 ?  offset : 0.0}};
@@ -3275,10 +3364,10 @@ int main(int argc, char** argv) {
       const int joint = free_joint_for_body(test_model, roots[i]);
       if (joint < 0) { valid = false; continue; }
       const int qpos = test_model->jnt_qposadr[joint];
-      apply_arena_spawn_layout(test_model, test_data, 0);
+      apply_arena_spawn_layout(test_model, test_data, 0, 2.0);
       std::copy(test_data->qpos + qpos + 3, test_data->qpos + qpos + 7, center_quat[i]);
     }
-    apply_arena_spawn_layout(test_model, test_data, 0);
+    apply_arena_spawn_layout(test_model, test_data, 0, 2.0);
     Vec3 player_center = robot_geometry_center(test_model, test_data, roots[0]);
     Vec3 target_center = robot_geometry_center(test_model, test_data, roots[1]);
     valid = valid && player_center[0] < 0.0 && target_center[0] > 0.0 &&
@@ -3290,7 +3379,7 @@ int main(int argc, char** argv) {
       valid = valid && low[0] >= -0.9901 && high[0] <= 0.9901 &&
         low[1] >= -0.9901 && high[1] <= 0.9901;
     }
-    apply_arena_spawn_layout(test_model, test_data, 1);
+    apply_arena_spawn_layout(test_model, test_data, 1, 2.0);
     player_center = robot_geometry_center(test_model, test_data, roots[0]);
     target_center = robot_geometry_center(test_model, test_data, roots[1]);
     valid = valid && player_center[0] < 0.0 && player_center[1] < 0.0 &&
@@ -3301,7 +3390,7 @@ int main(int argc, char** argv) {
       std::abs(player_center[1] + target_center[1]) < 1e-4;
     const Vec3 diagonal_player = player_center;
     const Vec3 diagonal_target = target_center;
-    apply_arena_spawn_layout(test_model, test_data, 1);  // Reset must retain selected layout.
+    apply_arena_spawn_layout(test_model, test_data, 1, 2.0);  // Reset must retain selected layout.
     player_center = robot_geometry_center(test_model, test_data, roots[0]);
     target_center = robot_geometry_center(test_model, test_data, roots[1]);
     valid = valid && std::abs(player_center[0] - diagonal_player[0]) < 1e-4 &&
@@ -3326,10 +3415,51 @@ int main(int argc, char** argv) {
         alignment += expected[component] * test_data->qpos[qpos + 3 + component];
       valid = valid && std::abs(std::abs(alignment) - 1.0) < 1e-6;
     }
+    constexpr double resized_arena_m = 3.5;
+    apply_arena_size(test_model, resized_arena_m);
+    apply_arena_spawn_layout(test_model, test_data, 0, resized_arena_m);
+    valid = valid && std::abs(test_model->geom_size[3 * floor] - resized_arena_m * 0.5) < 1e-6 &&
+      std::abs(test_model->geom_size[3 * floor + 1] - resized_arena_m * 0.5) < 1e-6;
+    for (const char* name : {"north_wall", "south_wall", "east_wall", "west_wall"}) {
+      const int wall = mj_name2id(test_model, mjOBJ_GEOM, name);
+      if (wall < 0) { valid = false; continue; }
+      const bool x_axis = std::string(name).find("east") != std::string::npos ||
+                          std::string(name).find("west") != std::string::npos;
+      const double inner_face = x_axis
+        ? std::abs(test_model->geom_pos[3 * wall]) - test_model->geom_size[3 * wall]
+        : std::abs(test_model->geom_pos[3 * wall + 1]) - test_model->geom_size[3 * wall + 1];
+      valid = valid && std::abs(inner_face - resized_arena_m * 0.5) < 1e-6;
+    }
+    for (int i = 0; i < 2; ++i) {
+      Vec3 low{}, high{};
+      robot_geometry_bounds(test_model, test_data, roots[i], low, high);
+      valid = valid && low[0] >= -resized_arena_m * 0.5 - 1e-4 &&
+        high[0] <= resized_arena_m * 0.5 + 1e-4 &&
+        low[1] >= -resized_arena_m * 0.5 - 1e-4 &&
+        high[1] <= resized_arena_m * 0.5 + 1e-4;
+    }
+    const int player_free = free_joint_for_body(test_model, roots[0]);
+    if (player_free < 0) {
+      valid = false;
+    } else {
+      const int player_qpos = test_model->jnt_qposadr[player_free];
+      const int player_dof = test_model->jnt_dofadr[player_free];
+      test_data->qpos[player_qpos] = 1.1;
+      test_data->qpos[player_qpos + 1] = 0.0;
+      test_data->qpos[player_qpos + 2] = 0.065;
+      test_data->qvel[player_dof] = 50.0;
+      mj_forward(test_model, test_data);
+      double peak_x = test_data->qpos[player_qpos];
+      for (int step = 0; step < 300; ++step) {
+        mj_step(test_model, test_data);
+        peak_x = std::max(peak_x, double(test_data->qpos[player_qpos]));
+      }
+      valid = valid && peak_x < resized_arena_m * 0.5 + 0.85;
+    }
     if (valid)
-      std::puts("Arena check passed: matte laminate floor, calm lighting, 8 mm acrylic panels, hidden catch walls, safe center-line and diagonal spawns, and selected-layout reset.");
+      std::puts("Arena check passed: adjustable square arena in meters, matte laminate floor, calm lighting, 8 mm acrylic panels, hidden catch walls, safe center-line and diagonal spawns, and selected-layout reset.");
     else
-      std::fprintf(stderr, "Arena check failed: floor, lights, acrylic panels, wall boundary, safe spawns, or reset layout are incorrect.\n");
+      std::fprintf(stderr, "Arena check failed: arena dimensions, floor, lights, acrylic panels, wall boundary, safe spawns, or reset layout are incorrect.\n");
     mj_deleteData(test_data);
     mj_deleteModel(test_model);
     return valid ? 0 : 1;
@@ -3523,7 +3653,11 @@ int main(int argc, char** argv) {
   load_mixer_settings(input_mixer);
   AppSettings app_settings;
   load_app_settings(app_settings);
-  apply_arena_spawn_layout(model, data, app_settings.spawn_layout);
+  char arena_preset_name[65]{};
+  std::string arena_preset_status;
+  apply_arena_size(model, app_settings.arena_size_m);
+  apply_arena_spawn_layout(model, data, app_settings.spawn_layout,
+                           app_settings.arena_size_m);
   apply_arena_lighting(model, app_settings);
   SDL_Joystick* joystick = nullptr;
   SDL_JoystickID joystick_id = 0;
@@ -3532,7 +3666,8 @@ int main(int argc, char** argv) {
   if (saved_guid != input_mixer.preferred_guid) save_mixer_settings(input_mixer);
 
   mjvCamera camera; mjv_defaultCamera(&camera);
-  camera.distance = 3.5; camera.elevation = -55; camera.azimuth = 90;
+  camera.distance = std::clamp(3.5 * double(app_settings.arena_size_m) / 2.0, 1.5, 15.0);
+  camera.elevation = -55; camera.azimuth = 90;
   mjvCamera setup_camera; mjv_defaultCamera(&setup_camera);
   setup_camera.distance = 1.0; setup_camera.elevation = -45; setup_camera.azimuth = 45;
   mjvOption options; mjv_defaultOption(&options);
@@ -3644,7 +3779,9 @@ int main(int argc, char** argv) {
       if (next_model) mj_deleteModel(next_model);
       return false;
     }
-    apply_arena_spawn_layout(next_model, next_data, app_settings.spawn_layout);
+    apply_arena_size(next_model, app_settings.arena_size_m);
+    apply_arena_spawn_layout(next_model, next_data, app_settings.spawn_layout,
+                             app_settings.arena_size_m);
     apply_arena_lighting(next_model, app_settings);
     mjr_freeContext(&context); mjv_freeScene(&scene);
     mj_deleteData(data); mj_deleteModel(model);
@@ -4221,13 +4358,98 @@ int main(int argc, char** argv) {
       ImGui::BeginChild("Arena settings panel", ImVec2(panel_width, display.y - 110.0f),
                         ImGuiChildFlags_Borders);
       ImGui::TextColored(ui_amber, "ARENA SETTINGS");
-      ImGui::TextDisabled("Saved on this computer and applied to the next reset or model load.");
+      ImGui::TextDisabled("Changes are saved on this computer and applied to the current arena.");
+      const bool spawn_locked = lan_bundle_swapped || lan_connected;
+      ImGui::SeparatorText("Arena size");
+      ImGui::TextWrapped("The arena is square. This sets the inside floor and wall-to-wall side length in meters.");
+      const float previous_arena_size_m = app_settings.arena_size_m;
+      bool arena_size_changed = false;
+      char current_arena_label[48]{};
+      std::snprintf(current_arena_label, sizeof(current_arena_label), "%.2f m",
+                    app_settings.arena_size_m);
+      const std::array<ArenaSizePreset, 3> built_in_presets{{
+        {"Small", 1.0f}, {"Standard", 2.0f}, {"Large", 3.5f}}};
+      if (spawn_locked) ImGui::BeginDisabled();
+      ImGui::SetNextItemWidth(std::min(480.0f, panel_width - 40.0f));
+      if (ImGui::BeginCombo("Arena preset", current_arena_label)) {
+        auto choose_preset = [&](const ArenaSizePreset& preset, const std::string& label) {
+          if (ImGui::Selectable(label.c_str())) {
+            const float selected_size = float(clamp_arena_size_m(preset.size_m));
+            arena_size_changed |= std::abs(app_settings.arena_size_m - selected_size) > 1e-5f;
+            app_settings.arena_size_m = selected_size;
+            arena_preset_status.clear();
+          }
+        };
+        for (const auto& preset : built_in_presets) {
+          char label[96]{};
+          std::snprintf(label, sizeof(label), "%s (%.2f m)", preset.name.c_str(), preset.size_m);
+          choose_preset(preset, label);
+        }
+        if (!app_settings.arena_presets.empty()) ImGui::Separator();
+        for (const auto& preset : app_settings.arena_presets) {
+          char label[128]{};
+          std::snprintf(label, sizeof(label), "%s (%.2f m)", preset.name.c_str(), preset.size_m);
+          choose_preset(preset, label);
+        }
+        ImGui::EndCombo();
+      }
+      ImGui::SetNextItemWidth(std::min(480.0f, panel_width - 40.0f));
+      arena_size_changed |= ImGui::SliderFloat("Arena side length (m)",
+        &app_settings.arena_size_m, min_arena_size_m, max_arena_size_m, "%.2f m");
+      ImGui::SetNextItemWidth(std::min(480.0f, panel_width - 40.0f));
+      ImGui::InputText("New preset name", arena_preset_name, sizeof(arena_preset_name));
+      std::string new_preset_name(arena_preset_name);
+      const size_t name_start = new_preset_name.find_first_not_of(" \t\r\n");
+      if (name_start == std::string::npos) new_preset_name.clear();
+      else {
+        const size_t name_end = new_preset_name.find_last_not_of(" \t\r\n");
+        new_preset_name = new_preset_name.substr(name_start, name_end - name_start + 1);
+      }
+      ImGui::BeginDisabled(new_preset_name.empty());
+      if (ImGui::Button("Save current size as preset", ImVec2(220.0f, 34.0f))) {
+        auto existing = std::find_if(app_settings.arena_presets.begin(),
+          app_settings.arena_presets.end(), [&](const ArenaSizePreset& preset) {
+            return preset.name == new_preset_name;
+          });
+        if (existing == app_settings.arena_presets.end()) {
+          app_settings.arena_presets.push_back({new_preset_name, app_settings.arena_size_m});
+          arena_preset_status = "Saved preset: " + new_preset_name;
+        } else {
+          existing->size_m = app_settings.arena_size_m;
+          arena_preset_status = "Updated preset: " + new_preset_name;
+        }
+        arena_preset_name[0] = '\0';
+        save_app_settings(app_settings);
+      }
+      ImGui::EndDisabled();
+      if (!arena_preset_status.empty()) ImGui::TextColored(ui_green, "%s", arena_preset_status.c_str());
+      if (spawn_locked) ImGui::EndDisabled();
+      if (spawn_locked)
+        ImGui::TextDisabled("Arena settings are locked while a LAN match is connected.");
+      if (arena_size_changed) {
+        app_settings.arena_size_m = float(clamp_arena_size_m(app_settings.arena_size_m));
+        apply_arena_size(model, app_settings.arena_size_m);
+        // MuJoCo compiles bounded plane tiles into the renderer context, so rebuild it
+        // after changing the floor geom size to extend its laminate color to the new edge.
+        mjr_freeContext(&context);
+        mjr_makeContext(model, &context, mjFONTSCALE_100);
+        apply_arena_spawn_layout(model, data, app_settings.spawn_layout,
+                                 app_settings.arena_size_m);
+        if (previous_arena_size_m > 0.0f)
+          camera.distance = std::clamp(camera.distance * app_settings.arena_size_m /
+                                        previous_arena_size_m, 0.5, 15.0);
+        paused = true;
+        controls.weapon_command = 0.0;
+        opponent_controls.weapon_command = 0.0;
+        controls.filtered_wheel_speeds.clear();
+        opponent_controls.filtered_wheel_speeds.clear();
+        save_app_settings(app_settings);
+      }
       ImGui::SeparatorText("Bot starting positions");
       const char* spawn_label = app_settings.spawn_layout == 0
         ? "Opposite ends of center line" : "Opposite arena diagonals";
       ImGui::SetNextItemWidth(std::min(480.0f, panel_width - 40.0f));
       bool spawn_changed = false;
-      const bool spawn_locked = lan_bundle_swapped || lan_connected;
       if (spawn_locked) ImGui::BeginDisabled();
       if (ImGui::BeginCombo("Spawn layout", spawn_label)) {
         if (ImGui::Selectable("Opposite ends of center line", app_settings.spawn_layout == 0)) {
@@ -4245,7 +4467,8 @@ int main(int argc, char** argv) {
         ImGui::TextDisabled("Spawn layout is locked while a LAN model is loaded.");
       if (spawn_changed) {
         save_app_settings(app_settings);
-        apply_arena_spawn_layout(model, data, app_settings.spawn_layout);
+        apply_arena_spawn_layout(model, data, app_settings.spawn_layout,
+                                 app_settings.arena_size_m);
         controls.weapon_command = 0.0;
         opponent_controls.weapon_command = 0.0;
         controls.filtered_wheel_speeds.clear();
@@ -4329,7 +4552,8 @@ int main(int argc, char** argv) {
       ImGui::SameLine();
       if (lan_client) ImGui::BeginDisabled();
       if (ImGui::Button("Reset robot", ImVec2(132, 40))) {
-        apply_arena_spawn_layout(model, data, app_settings.spawn_layout);
+        apply_arena_spawn_layout(model, data, app_settings.spawn_layout,
+                                 app_settings.arena_size_m);
         controls.weapon_command = 0.0;
         controls.filtered_wheel_speeds.clear();
         opponent_controls.filtered_wheel_speeds.clear();

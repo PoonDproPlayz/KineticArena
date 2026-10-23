@@ -40,10 +40,14 @@ CMake fetches SDL3 and Dear ImGui at configure time. `MUJOCO_ROOT` must contain
 The 0.4 ms model timestep is independent of display frame rate. The app opens
 to a Home screen with **Practice drive**, **Configure bot**, and **Controller
 mixing** buttons; a persistent top navigation bar switches between Home,
-Drive, and Bot workshop. **Arena settings** on Home adjusts ambient, key, fill,
-and camera lighting and selects either a face-to-face center-line spawn or
-opposite-diagonal spawn. These preferences save per user and apply on reset or
-model load. Drive also has a **Controller mixer** button.
+Drive, and Bot workshop. **Arena settings** on Home sets the square arena side
+length in meters (0.75–10 m, default 2 m), adjusts ambient, key, fill, and
+camera lighting, and selects either a face-to-face center-line spawn or
+opposite-diagonal spawn. Choose the built-in Small, Standard, or Large preset,
+or save the current size under a custom preset name for later use. Custom
+presets and arena settings save per user. Resizing updates the current floor,
+clear side panels, hidden collision walls, and spawn positions, then pauses and
+resets the bots. Drive also has a **Controller mixer** button.
 W/S drive and A/D turn the main bot; Space spins its weapon. I/K drive and J/L
 turn the opponent; M spins its weapon. A gamepad uses the left stick and left
 shoulder or south button to control the main bot. Controller mixing opens a setup window for
@@ -71,7 +75,8 @@ robot preview. Text wrapping and control widths stay fixed as either panel is
 resized; narrow panels clip content until widened. The layout updates when the
 resize handle is released.
 
-The arena stays at 2,500 Hz. Its visible side skins are 8 mm clear acrylic;
+The arena stays at 2,500 Hz. Its square side length is adjustable in meters in
+Arena settings; 2 m is the default. Its visible side skins are 8 mm clear acrylic;
 separate invisible collision volumes extend 60 cm outside each inner wall face
 to catch fast impacts without making the panels look like solid blue blocks.
 The roof has the same hidden catch volume. A 1 cm spawn margin keeps each
