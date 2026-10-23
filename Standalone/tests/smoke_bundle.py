@@ -111,6 +111,13 @@ def main(exe, workdir=None):
 
     repo_root = Path(__file__).resolve().parents[2]
     stock_model = repo_root / "Assets" / "CombatSim" / "Models" / "CombatRobot500g.xml"
+    result = subprocess.run([str(exe), "--test-arena-spawns", str(stock_model)],
+                            text=True, capture_output=True)
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    if result.returncode:
+        raise SystemExit(result.returncode)
+    assert "matte laminate floor" in result.stdout
     result = subprocess.run([str(exe), "--test-wall-impact", str(stock_model)],
                             text=True, capture_output=True)
     print(result.stdout, end="")
@@ -118,7 +125,7 @@ def main(exe, workdir=None):
     if result.returncode:
         raise SystemExit(result.returncode)
     assert "Wall impact at 2500 Hz and 100.0 m/s" in result.stdout
-    assert "Wall impact stayed inside the arena at both update rates." in result.stdout
+    assert "Wall and roof impacts stayed inside the hidden catch volumes" in result.stdout
     result = subprocess.run([str(exe), "--test-transform-gizmo", str(stock_model)],
                             text=True, capture_output=True)
     print(result.stdout, end="")
@@ -178,6 +185,7 @@ def main(exe, workdir=None):
         (root / "combatsim_setup.json").write_text(json.dumps({
             "schemaVersion": 1,
             "batteryVoltage": 11.1,
+            "showAxisMarkers": False,
             "assemblies": [{"name": n, "kind": k, "pivotMeters": pivot,
                             "axis": axis,
                             "motor": {"enabled": n in ("FL", "RL", "Weapon"),
@@ -259,6 +267,7 @@ def main(exe, workdir=None):
             raise SystemExit(result.returncode)
         assert "0.34 kg total mass" in result.stdout
         assert "opposite spawn" in result.stdout
+        assert "guest-only axis visibility" in result.stdout
         assert "player collision" in result.stdout
         opponent_model = ET.parse(root / "combatsim_generated.xml").getroot()
         assert has_pair(opponent_model, "floor", "opponent_part_0")
@@ -356,6 +365,7 @@ def main(exe, workdir=None):
         print(result.stderr, end="", file=sys.stderr)
         if result.returncode:
             raise SystemExit(result.returncode)
+        assert "Assembly axis markers: hidden" in result.stdout
         assert "CAD wheel drive mapping: left=2 right=2; forward signs L=[1,-1] R=[-1,1]" in result.stdout
         assert "CAD shared motor groups: A=2 wheels" in result.stdout
         fork_test = re.search(
@@ -367,6 +377,14 @@ def main(exe, workdir=None):
         assert float(fork_test.group(2)) <= math.pi / 2 + 0.1, "fork exceeded its default travel limit"
         print("Both-side turn mapping and fitted-axis direction normalization passed")
         print("Passive fork hinge, gravity swing, and main-frame contact passed")
+        result = subprocess.run([str(exe), "--test-arena-spawns",
+                                 str(root / "combatsim_generated.xml")],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        assert "safe center-line and diagonal spawns, and selected-layout reset" in result.stdout
         generated = (root / "combatsim_generated.xml").read_text(encoding="utf-8")
         assert generated.count('<velocity name="cad_assembly_') == 4
         assert generated.count('<motor name="cad_assembly_') == 3
@@ -378,15 +396,25 @@ def main(exe, workdir=None):
         assert 'cad_part_2' in generated  # blade shares the weapon joint
         model = ET.fromstring(generated)
         assert abs(float(model.find("option").attrib["timestep"]) - 0.0004) < 1e-12
+        floor = model.find(".//geom[@name='floor']")
+        assert floor is not None and floor.attrib["material"] == "arena_floor_laminate"
+        floor_material = model.find(".//material[@name='arena_floor_laminate']")
+        assert floor_material is not None and float(floor_material.attrib["rgba"].split()[0]) > 0.75
+        assert model.find(".//light[@name='arena_key_light']") is not None
+        assert model.find(".//light[@name='arena_fill_light']") is not None
         assert model.find(".//motor[@name='cad_assembly_2_drive']") is not None
         assert model.find(".//motor[@name='cad_assembly_3_drive']") is not None
         assert model.find(".//motor[@name='cad_assembly_1_drive']") is not None
         east_wall = model.find(".//geom[@name='east_wall']")
         assert east_wall is not None
-        assert east_wall.attrib["pos"].split()[0] == "1.05"
-        assert east_wall.attrib["size"].split()[0] == "0.05"
+        assert east_wall.attrib["pos"].split()[0] == "1.30"
+        assert east_wall.attrib["size"].split()[0] == "0.30"
         assert east_wall.attrib["margin"] == "0.01"
         assert east_wall.attrib["solref"] == "0.001 1"
+        east_panel = model.find(".//geom[@name='east_wall_acrylic']")
+        assert east_panel is not None
+        assert east_panel.attrib["size"].split()[0] == "0.004"
+        assert east_panel.attrib["contype"] == east_panel.attrib["conaffinity"] == "0"
         assert len(floor_scrape_pairs(model)) == 3
         assert len(robot_internal_pairs(model)) == 2
         assert all(pair.attrib["solref"] == "0.003 1"
@@ -599,6 +627,30 @@ def main(exe, workdir=None):
                        oriented_model.find(".//body[@name='Player_Robot']").attrib["quat"].split()]
         assert abs(player_quat[0] - math.sqrt(0.5)) < 1e-6
         assert abs(player_quat[3] + math.sqrt(0.5)) < 1e-6
+        setup_path = root / "combatsim_setup.json"
+        setup = json.loads(setup_path.read_text(encoding="utf-8"))
+        setup["botRotationDegrees"] = 30.0
+        setup_path.write_text(json.dumps(setup), encoding="utf-8")
+        result = subprocess.run([str(exe), "--validate-bundle", str(root / "manifest.json")],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        rotated_model = ET.parse(root / "combatsim_generated.xml").getroot()
+        rotated_quat = [float(value) for value in
+                        rotated_model.find(".//body[@name='Player_Robot']").attrib["quat"].split()]
+        assert abs(rotated_quat[0] - math.sqrt(3) / 2) < 1e-6
+        assert abs(rotated_quat[3] + 0.5) < 1e-6
+        setup["botRotationDegrees"] = 0.0
+        setup_path.write_text(json.dumps(setup), encoding="utf-8")
+        result = subprocess.run([str(exe), "--validate-bundle", str(root / "manifest.json")],
+                                text=True, capture_output=True)
+        if result.returncode:
+            print(result.stdout, end="")
+            print(result.stderr, end="", file=sys.stderr)
+            raise SystemExit(result.returncode)
+        print("Configured whole-bot yaw rotates the root pose while preserving the fitted CAD axes")
         print("Wheel-layout heading, mirrored axle signs, and face-to-face spawn orientation passed")
 
         long_root = root / "long_path_case"
@@ -635,6 +687,28 @@ def main(exe, workdir=None):
         assert "_CombatSimCache" in preview_mesh.attrib["file"]
         assert "mesh_0.stl" in preview_mesh.attrib["file"]
         print("Windows long-path CAD mesh import and MuJoCo asset loading passed")
+
+        disk_model_before = (long_root / "combatsim_generated.xml").read_bytes()
+        disk_preview_before = (long_root / "combatsim_preview.xml").read_bytes()
+        result = subprocess.run([str(exe), "--test-memory-bundle", str(long_manifest_path)],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        assert "In-memory CAD passed:" in result.stdout
+        assert (long_root / "combatsim_generated.xml").read_bytes() == disk_model_before
+        assert (long_root / "combatsim_preview.xml").read_bytes() == disk_preview_before
+        print("Received CAD stayed in RAM and did not rewrite bundle-side model files")
+
+        result = subprocess.run([str(exe), "--test-lan-session", str(long_manifest_path),
+                                 str(opponent_manifest)],
+                                text=True, capture_output=True, timeout=30)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        assert "LAN self-test passed:" in result.stdout
 
 
 if __name__ == "__main__":

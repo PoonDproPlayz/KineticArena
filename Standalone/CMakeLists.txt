@@ -21,13 +21,13 @@ set_target_properties(mujoco PROPERTIES
   IMPORTED_LOCATION "${MUJOCO_ROOT}/bin/mujoco.dll"
   INTERFACE_INCLUDE_DIRECTORIES "${MUJOCO_ROOT}/include")
 
-add_executable(CombatSimStandalone main.cpp FusionBundle.cpp
+add_executable(CombatSimStandalone main.cpp FusionBundle.cpp LanSession.cpp
   ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp ${imgui_SOURCE_DIR}/imgui_widgets.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
 target_include_directories(CombatSimStandalone PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
-target_link_libraries(CombatSimStandalone PRIVATE mujoco SDL3::SDL3-shared nlohmann_json::nlohmann_json opengl32)
+target_link_libraries(CombatSimStandalone PRIVATE mujoco SDL3::SDL3-shared nlohmann_json::nlohmann_json opengl32 ws2_32 bcrypt)
 add_custom_command(TARGET CombatSimStandalone POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "${MUJOCO_ROOT}/bin/mujoco.dll" "$<TARGET_FILE_DIR:CombatSimStandalone>"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:SDL3::SDL3-shared>" "$<TARGET_FILE_DIR:CombatSimStandalone>")

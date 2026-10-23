@@ -5,6 +5,7 @@
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_opengl3.h"
 #include "FusionBundle.h"
+#include "LanSession.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -12,11 +13,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -33,6 +36,60 @@ const ImVec4 ui_coral(1.00f, 0.57f, 0.45f, 1.0f);
 const ImVec4 ui_amber(1.00f, 0.75f, 0.36f, 1.0f);
 const ImVec4 ui_red(1.00f, 0.42f, 0.44f, 1.0f);
 
+struct AppSettings {
+  int spawn_layout = 0;  // 0 = center line, 1 = opposite diagonal.
+  float ambient_light = 0.12f;
+  float key_light = 0.68f;
+  float fill_light = 0.24f;
+  float camera_fill = 0.07f;
+};
+
+bool save_app_settings(const AppSettings& settings);
+
+void load_app_settings(AppSettings& settings) {
+  char* preference_path = SDL_GetPrefPath("CombatSim", "CombatSim");
+  if (!preference_path) return;
+  const std::filesystem::path path = std::filesystem::path(preference_path) / "visual_settings.json";
+  SDL_free(preference_path);
+  try {
+    std::ifstream input(path);
+    if (!input) return;
+    const json saved = json::parse(input);
+    settings.spawn_layout = std::clamp(saved.value("spawnLayout", settings.spawn_layout), 0, 1);
+    // Older preferences used a much brighter look that made clear panels glow.
+    // Migrate those values once while preserving the user's spawn selection.
+    if (saved.value("lightingVersion", 0) >= 1) {
+      settings.ambient_light = std::clamp(saved.value("ambientLight", settings.ambient_light), 0.0f, 0.8f);
+      settings.key_light = std::clamp(saved.value("keyLight", settings.key_light), 0.0f, 2.0f);
+      settings.fill_light = std::clamp(saved.value("fillLight", settings.fill_light), 0.0f, 2.0f);
+      settings.camera_fill = std::clamp(saved.value("cameraFill", settings.camera_fill), 0.0f, 1.0f);
+    } else {
+      input.close();
+      save_app_settings(settings);
+    }
+  } catch (const std::exception&) {
+    // A malformed preference file should not prevent the simulator from starting.
+  }
+}
+
+bool save_app_settings(const AppSettings& settings) {
+  char* preference_path = SDL_GetPrefPath("CombatSim", "CombatSim");
+  if (!preference_path) return false;
+  const std::filesystem::path path = std::filesystem::path(preference_path) / "visual_settings.json";
+  SDL_free(preference_path);
+  try {
+    json saved{{"lightingVersion", 1}, {"spawnLayout", settings.spawn_layout},
+      {"ambientLight", settings.ambient_light}, {"keyLight", settings.key_light},
+      {"fillLight", settings.fill_light}, {"cameraFill", settings.camera_fill}};
+    std::ofstream output(path, std::ios::trunc);
+    if (!output) return false;
+    output << saved.dump(2) << '\n';
+    return output.good();
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
 void push_button_palette(ImVec4 base, ImVec4 hovered, ImVec4 active) {
   ImGui::PushStyleColor(ImGuiCol_Button, base);
   ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hovered);
@@ -40,6 +97,32 @@ void push_button_palette(ImVec4 base, ImVec4 hovered, ImVec4 active) {
 }
 
 void pop_button_palette() { ImGui::PopStyleColor(3); }
+
+mjModel* LoadModelFromMemory(const std::string& xml,
+                             const std::vector<MemoryBundleAsset>& assets,
+                             char* error, int error_size) {
+  if (xml.empty() || xml.size() > size_t(std::numeric_limits<int>::max())) {
+    if (error && error_size > 0) std::snprintf(error, size_t(error_size), "Invalid in-memory MJCF size.");
+    return nullptr;
+  }
+  mjVFS vfs;
+  mj_defaultVFS(&vfs);
+  bool ok = mj_addBufferVFS(&vfs, "session.xml", xml.data(), int(xml.size())) == 0;
+  for (const auto& asset : assets) {
+    if (asset.name.empty() || asset.bytes.empty() ||
+        asset.bytes.size() > size_t(std::numeric_limits<int>::max()) ||
+        mj_addBufferVFS(&vfs, asset.name.c_str(), asset.bytes.data(),
+                        int(asset.bytes.size())) != 0) {
+      ok = false;
+      if (error && error_size > 0)
+        std::snprintf(error, size_t(error_size), "Could not add a CAD mesh to MuJoCo's memory VFS.");
+      break;
+    }
+  }
+  mjModel* model = ok ? mj_loadXML("session.xml", &vfs, error, error_size) : nullptr;
+  mj_deleteVFS(&vfs);
+  return model;
+}
 
 struct InputChannel {
   bool button = false;
@@ -613,6 +696,109 @@ int free_joint_for_body(const mjModel* model, int body) {
     if (model->jnt_type[joint] == mjJNT_FREE) return joint;
   }
   return -1;
+}
+
+void robot_geometry_bounds(const mjModel* model, const mjData* data, int root_body,
+                           Vec3& low, Vec3& high) {
+  low = {std::numeric_limits<double>::infinity(),
+         std::numeric_limits<double>::infinity(),
+         std::numeric_limits<double>::infinity()};
+  high = {-std::numeric_limits<double>::infinity(),
+          -std::numeric_limits<double>::infinity(),
+          -std::numeric_limits<double>::infinity()};
+  for (int geom = 0; geom < model->ngeom; ++geom) {
+    int body = model->geom_bodyid[geom];
+    while (body > 0 && body != root_body) body = model->body_parentid[body];
+    if (body != root_body) continue;
+    const double radius = std::max(0.0, model->geom_rbound[geom]);
+    for (int axis = 0; axis < 3; ++axis) {
+      const double center = data->geom_xpos[3 * geom + axis];
+      low[axis] = std::min(low[axis], center - radius);
+      high[axis] = std::max(high[axis], center + radius);
+    }
+  }
+  if (!std::isfinite(low[0])) {
+    low = high = {data->xpos[3 * root_body], data->xpos[3 * root_body + 1],
+                  data->xpos[3 * root_body + 2]};
+  }
+}
+
+Vec3 robot_geometry_center(const mjModel* model, const mjData* data, int root_body) {
+  Vec3 low{}, high{};
+  robot_geometry_bounds(model, data, root_body, low, high);
+  return {(low[0] + high[0]) * 0.5, (low[1] + high[1]) * 0.5,
+          (low[2] + high[2]) * 0.5};
+}
+
+void apply_arena_spawn_layout(const mjModel* model, mjData* data, int layout) {
+  if (!model || !data) return;
+  mj_resetData(model, data);
+  mj_forward(model, data);
+  const int roots[2] = {mj_name2id(model, mjOBJ_BODY, "Player_Robot"),
+                        mj_name2id(model, mjOBJ_BODY, "Target_Robot")};
+  const double diagonal_turn = layout == 1 ? pi / 4.0 : 0.0;
+  for (int root : roots) {
+    const int joint = free_joint_for_body(model, root);
+    if (joint < 0) continue;
+    const int qpos = model->jnt_qposadr[joint];
+    const double half = diagonal_turn * 0.5;
+    const mjtNum delta[4] = {std::cos(half), 0.0, 0.0, std::sin(half)};
+    mjtNum rotated[4];
+    mju_mulQuat(rotated, delta, data->qpos + qpos + 3);
+    const double norm = std::sqrt(rotated[0] * rotated[0] + rotated[1] * rotated[1] +
+                                  rotated[2] * rotated[2] + rotated[3] * rotated[3]);
+    if (norm > 1e-12 && std::isfinite(norm))
+      for (int i = 0; i < 4; ++i) data->qpos[qpos + 3 + i] = rotated[i] / norm;
+  }
+  mj_forward(model, data);
+  std::array<Vec3, 2> lows{}, highs{};
+  double maximum_half_extent = 0.0;
+  for (int i = 0; i < 2; ++i) {
+    robot_geometry_bounds(model, data, roots[i], lows[i], highs[i]);
+    maximum_half_extent = std::max(maximum_half_extent,
+      std::max((highs[i][0] - lows[i][0]) * 0.5,
+               (highs[i][1] - lows[i][1]) * 0.5));
+  }
+  constexpr double wall_clearance = 0.01;
+  const double arena_inner_half_extent = 1.0;
+  const double safe_offset = std::max(0.0, arena_inner_half_extent - wall_clearance - maximum_half_extent);
+  const double preferred_offset = layout == 1 ? 0.42 : 0.55;
+  const double offset = std::min(preferred_offset, safe_offset);
+  const double targets[2][2] = {{-offset, layout == 1 ? -offset : 0.0},
+                                 { offset, layout == 1 ?  offset : 0.0}};
+  for (int i = 0; i < 2; ++i) {
+    const int root = roots[i];
+    const int joint = free_joint_for_body(model, root);
+    if (joint < 0) continue;
+    const int qpos = model->jnt_qposadr[joint];
+    const Vec3 center = robot_geometry_center(model, data, root);
+    data->qpos[qpos] += targets[i][0] - center[0];
+    data->qpos[qpos + 1] += targets[i][1] - center[1];
+  }
+  mj_forward(model, data);
+}
+
+void apply_arena_lighting(mjModel* model, const AppSettings& settings) {
+  if (!model) return;
+  for (int i = 0; i < 3; ++i) {
+    model->vis.headlight.ambient[i] = settings.ambient_light;
+    model->vis.headlight.diffuse[i] = settings.camera_fill;
+    model->vis.headlight.specular[i] = settings.camera_fill * 0.12f;
+  }
+  model->vis.headlight.active = 1;
+  auto set_light = [&](const char* name, float strength,
+                       const std::array<float, 3>& diffuse,
+                       float specular) {
+    const int id = mj_name2id(model, mjOBJ_LIGHT, name);
+    if (id < 0 || id >= model->nlight) return;
+    model->light_active[id] = strength > 0.001f;
+    for (int channel = 0; channel < 3; ++channel) {
+      model->light_diffuse[3 * id + channel] = diffuse[channel] * strength;
+      model->light_specular[3 * id + channel] = specular * strength;
+    }
+  };
+  set_light("arena_key_light", settings.key_light, {0.88f, 0.85f, 0.78f}, 0.08f);
+  set_light("arena_fill_light", settings.fill_light, {0.42f, 0.48f, 0.54f}, 0.015f);
 }
 
 bool translate_free_body_axis(const mjModel* model, mjData* data, int body,
@@ -1383,6 +1569,284 @@ void drive(const mjModel* model, mjData* data, Controls& c, SDL_Gamepad* pad,
 int main(int argc, char** argv) {
   FusionBundle bundle;
   FusionBundle opponent_bundle;
+  LanSession lan;
+  if (argc >= 3 && std::string(argv[1]) == "--test-memory-bundle") {
+    if (!bundle.Load(argv[2])) {
+      std::fprintf(stderr, "Source bundle load failed: %s\n", bundle.Error().c_str());
+      return 1;
+    }
+    std::vector<unsigned char> package;
+    if (!bundle.ExportSessionPackage(package)) {
+      std::fprintf(stderr, "In-memory package export failed: %s\n", bundle.Error().c_str());
+      return 1;
+    }
+    FusionBundle received;
+    if (!received.LoadSessionPackage(package) || !received.IsMemoryLoaded()) {
+      std::fprintf(stderr, "In-memory package load failed: %s\n", received.Error().c_str());
+      return 1;
+    }
+    std::vector<unsigned char> roundtrip;
+    if (!received.ExportSessionPackage(roundtrip) || roundtrip != package) {
+      std::fprintf(stderr, "In-memory package round trip changed bundle data.\n");
+      return 1;
+    }
+    if (received.Save()) {
+      std::fprintf(stderr, "Session-loaded CAD unexpectedly allowed saving to disk.\n");
+      return 1;
+    }
+    std::filesystem::path forbidden_preview;
+    if (received.GeneratePreview(forbidden_preview)) {
+      std::fprintf(stderr, "Session-loaded CAD unexpectedly generated a disk preview.\n");
+      return 1;
+    }
+    std::vector<unsigned char> malformed = package;
+    malformed[0] ^= 0xFF;
+    FusionBundle rejected;
+    if (rejected.LoadSessionPackage(malformed) || rejected.HasBundle()) {
+      std::fprintf(stderr, "Malformed in-memory package was not rejected.\n");
+      return 1;
+    }
+    malformed.assign(package.begin(), package.begin() + 15);
+    if (rejected.LoadSessionPackage(malformed)) {
+      std::fprintf(stderr, "Truncated in-memory package was not rejected.\n");
+      return 1;
+    }
+    std::string xml;
+    std::vector<MemoryBundleAsset> assets;
+    if (!received.GenerateInMemory(xml, assets, &received)) {
+      std::fprintf(stderr, "In-memory MJCF generation failed: %s\n", received.Error().c_str());
+      return 1;
+    }
+    std::array<char, 8192> diagnostic{};
+    mjModel* memory_model = LoadModelFromMemory(xml, assets, diagnostic.data(),
+                                                 int(diagnostic.size()));
+    if (!memory_model) {
+      std::fprintf(stderr, "MuJoCo VFS rejected the in-memory model: %s\n", diagnostic.data());
+      return 1;
+    }
+    mjData* memory_data = mj_makeData(memory_model);
+    const int player = mj_name2id(memory_model, mjOBJ_BODY, "Player_Robot");
+    const int target = mj_name2id(memory_model, mjOBJ_BODY, "Target_Robot");
+    const bool valid = memory_data && player > 0 && target > 0 && assets.size() > 0 &&
+                       memory_model->opt.timestep <= 0.0004 + 1e-12;
+    const int body_count = memory_model->nbody;
+    const int geom_count = memory_model->ngeom;
+    if (memory_data) {
+      for (int step = 0; step < 100; ++step) mj_step(memory_model, memory_data);
+    }
+    const bool finite = memory_data && std::isfinite(memory_data->time) &&
+      std::all_of(memory_data->qpos, memory_data->qpos + memory_model->nq,
+                  [](mjtNum value) { return std::isfinite(value); });
+    if (memory_data) mj_deleteData(memory_data);
+    mj_deleteModel(memory_model);
+    if (!valid || !finite) {
+      std::fprintf(stderr, "In-memory MuJoCo model failed body, solver, or stepping checks.\n");
+      return 1;
+    }
+    std::printf("In-memory CAD passed: %zu-byte package round trip, %zu VFS meshes, "
+                "%d bodies, %d geoms, 100 simulation steps; disk save/preview blocked.\n",
+                package.size(), assets.size(), body_count, geom_count);
+    return 0;
+  }
+  if (argc >= 4 && std::string(argv[1]) == "--test-lan-session") {
+    if (!bundle.Load(argv[2])) {
+      std::fprintf(stderr, "LAN test host bundle load failed: %s\n", bundle.Error().c_str());
+      return 1;
+    }
+    if (!opponent_bundle.Load(argv[3])) {
+      std::fprintf(stderr, "LAN test joining bundle load failed: %s\n", opponent_bundle.Error().c_str());
+      return 1;
+    }
+    std::vector<unsigned char> host_package, joining_package;
+    if (!bundle.ExportSessionPackage(host_package) ||
+        !opponent_bundle.ExportSessionPackage(joining_package)) {
+      std::fprintf(stderr, "LAN test package export failed: %s\n",
+                   !bundle.Error().empty() ? bundle.Error().c_str() : opponent_bundle.Error().c_str());
+      return 1;
+    }
+    constexpr char test_key[] = "c9f4a18d37e06b52d1a88f4c7203be16";
+    LanSession host, client;
+    std::string error;
+    if (!host.StartHost(0, host_package, test_key, error)) {
+      std::fprintf(stderr, "LAN self-test host start failed: %s\n", error.c_str());
+      return 1;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (host.BoundPort() == 0 && host.GetState() != LanSession::State::Failed &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if (host.BoundPort() == 0 || host.GetState() != LanSession::State::Waiting) {
+      std::fprintf(stderr, "LAN self-test host listener failed: %s\n", host.Error().c_str());
+      host.Stop();
+      return 1;
+    }
+    if (!client.StartClient("127.0.0.1", host.BoundPort(), joining_package, test_key, error)) {
+      std::fprintf(stderr, "LAN self-test client start failed: %s\n", error.c_str());
+      host.Stop();
+      return 1;
+    }
+    auto both_in_state = [&](LanSession::State expected, int milliseconds) {
+      const auto until = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(milliseconds);
+      while (std::chrono::steady_clock::now() < until) {
+        if (host.GetState() == LanSession::State::Failed ||
+            client.GetState() == LanSession::State::Failed) return false;
+        if (host.GetState() == expected && client.GetState() == expected) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      return host.GetState() == expected && client.GetState() == expected;
+    };
+    if (!both_in_state(LanSession::State::PackageReady, 10000)) {
+      std::fprintf(stderr, "LAN encrypted package handshake failed: host='%s', client='%s'\n",
+                   host.Error().c_str(), client.Error().c_str());
+      host.Stop(); client.Stop();
+      return 1;
+    }
+    std::vector<unsigned char> from_host, from_client;
+    if (!host.TakeRemotePackage(from_host) || !client.TakeRemotePackage(from_client) ||
+        from_host != joining_package || from_client != host_package) {
+      std::fprintf(stderr, "LAN peers received different in-memory bot bundles.\n");
+      host.Stop(); client.Stop();
+      return 1;
+    }
+
+    FusionBundle host_player, host_guest, client_player, client_guest;
+    const bool memory_bundles_loaded =
+      host_player.LoadSessionPackage(host_package) &&
+      host_guest.LoadSessionPackage(from_host) &&
+      client_player.LoadSessionPackage(from_client) &&
+      client_guest.LoadSessionPackage(joining_package);
+    std::string host_xml, client_xml;
+    std::vector<MemoryBundleAsset> host_assets, client_assets;
+    const bool models_generated = memory_bundles_loaded &&
+      host_player.GenerateInMemory(host_xml, host_assets, &host_guest) &&
+      client_player.GenerateInMemory(client_xml, client_assets, &client_guest);
+    std::array<char, 8192> host_diagnostic{}, client_diagnostic{};
+    mjModel* host_model = models_generated
+      ? LoadModelFromMemory(host_xml, host_assets, host_diagnostic.data(),
+                            int(host_diagnostic.size())) : nullptr;
+    mjModel* client_model = models_generated
+      ? LoadModelFromMemory(client_xml, client_assets, client_diagnostic.data(),
+                            int(client_diagnostic.size())) : nullptr;
+    bool same_model = host_model && client_model &&
+      host_model->nq == client_model->nq && host_model->nv == client_model->nv &&
+      host_model->nu == client_model->nu && host_model->nbody == client_model->nbody &&
+      host_model->ngeom == client_model->ngeom;
+    if (same_model) {
+      for (int i = 0; i < host_model->nbody; ++i) {
+        const char* host_name = mj_id2name(host_model, mjOBJ_BODY, i);
+        const char* client_name = mj_id2name(client_model, mjOBJ_BODY, i);
+        if ((!host_name) != (!client_name) ||
+            (host_name && std::strcmp(host_name, client_name) != 0)) same_model = false;
+      }
+      for (int i = 0; i < host_model->nu; ++i) {
+        const char* host_name = mj_id2name(host_model, mjOBJ_ACTUATOR, i);
+        const char* client_name = mj_id2name(client_model, mjOBJ_ACTUATOR, i);
+        if ((!host_name) != (!client_name) ||
+            (host_name && std::strcmp(host_name, client_name) != 0)) same_model = false;
+      }
+    }
+    if (host_model) mj_deleteModel(host_model);
+    if (client_model) mj_deleteModel(client_model);
+    for (auto& asset : host_assets) std::fill(asset.bytes.begin(), asset.bytes.end(), 0);
+    for (auto& asset : client_assets) std::fill(asset.bytes.begin(), asset.bytes.end(), 0);
+    if (!same_model) {
+      std::fprintf(stderr, "Host and client did not build the same MuJoCo model layout: host='%s', client='%s'\n",
+                   host_diagnostic.data(), client_diagnostic.data());
+      host.Stop(); client.Stop();
+      return 1;
+    }
+    host.MarkReady();
+    client.MarkReady();
+    if (!both_in_state(LanSession::State::Connected, 5000)) {
+      std::fprintf(stderr, "LAN readiness handshake failed: host='%s', client='%s'\n",
+                   host.Error().c_str(), client.Error().c_str());
+      host.Stop(); client.Stop();
+      return 1;
+    }
+    if (!client.SendInput({0.75f, -0.25f, 1.0f})) {
+      std::fprintf(stderr, "LAN controller input send failed.\n");
+      host.Stop(); client.Stop();
+      return 1;
+    }
+    const auto input_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    LanSession::Input input{};
+    do {
+      input = host.LatestRemoteInput();
+      if (std::abs(input.throttle - 0.75f) < 1e-6f &&
+          std::abs(input.turn + 0.25f) < 1e-6f &&
+          std::abs(input.weapon - 1.0f) < 1e-6f) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    } while (std::chrono::steady_clock::now() < input_deadline);
+    if (std::abs(input.throttle - 0.75f) >= 1e-6f ||
+        std::abs(input.turn + 0.25f) >= 1e-6f ||
+        std::abs(input.weapon - 1.0f) >= 1e-6f) {
+      std::fprintf(stderr, "LAN input replication timed out.\n");
+      host.Stop(); client.Stop();
+      return 1;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const LanSession::Input timed_out_input = host.LatestRemoteInput();
+    if (timed_out_input.throttle != 0.0f || timed_out_input.turn != 0.0f ||
+        timed_out_input.weapon != 0.0f) {
+      std::fprintf(stderr, "LAN input timeout did not release stale opponent controls.\n");
+      host.Stop(); client.Stop();
+      return 1;
+    }
+    const double qpos[]{1.0, 2.0, 0.7071067811865476, 0.7071067811865476};
+    const double qvel[]{-0.5, 3.25, 0.125};
+    if (!host.SendSnapshot(12.5, qpos, 4, qvel, 3)) {
+      std::fprintf(stderr, "LAN physics snapshot send failed.\n");
+      host.Stop(); client.Stop();
+      return 1;
+    }
+    LanSession::Snapshot snapshot;
+    const auto snapshot_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!client.TakeLatestSnapshot(snapshot) &&
+           std::chrono::steady_clock::now() < snapshot_deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const bool snapshot_ok = snapshot.time == 12.5 && snapshot.qpos.size() == 4 &&
+      snapshot.qvel.size() == 3 && snapshot.qpos[2] == qpos[2] &&
+      snapshot.qvel[1] == qvel[1];
+    host.Stop();
+    client.Stop();
+    if (!snapshot_ok) {
+      std::fprintf(stderr, "LAN physics snapshot replication timed out or changed values.\n");
+      return 1;
+    }
+
+    LanSession locked_host, wrong_key_client;
+    if (!locked_host.StartHost(0, host_package, test_key, error)) {
+      std::fprintf(stderr, "LAN authentication test host failed: %s\n", error.c_str());
+      return 1;
+    }
+    const auto auth_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (locked_host.BoundPort() == 0 &&
+           std::chrono::steady_clock::now() < auth_deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    if (!locked_host.BoundPort() ||
+        !wrong_key_client.StartClient("127.0.0.1", locked_host.BoundPort(), joining_package,
+                                      "00000000000000000000000000000000", error)) {
+      std::fprintf(stderr, "LAN wrong-key test could not start: %s\n", error.c_str());
+      locked_host.Stop(); wrong_key_client.Stop();
+      return 1;
+    }
+    const auto auth_check_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (wrong_key_client.GetState() != LanSession::State::Failed &&
+           std::chrono::steady_clock::now() < auth_check_deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const bool rejected_wrong_key = wrong_key_client.GetState() == LanSession::State::Failed;
+    locked_host.Stop();
+    wrong_key_client.Stop();
+    if (!rejected_wrong_key) {
+      std::fprintf(stderr, "LAN accepted a peer using the wrong session key.\n");
+      return 1;
+    }
+    std::printf("LAN self-test passed: AES-GCM peer authentication, two distinct RAM bundles, "
+                "matching host/client MuJoCo layouts, readiness gate, opponent controls, "
+                "authoritative state snapshots, and wrong-key rejection.\n");
+    return 0;
+  }
   if (argc >= 2 && std::string(argv[1]) == "--test-input-mixer") {
     std::array<float, max_input_channels> input{0.6f, 0.25f, 1.0f};
     std::array<float, max_input_channels> left_weights{};
@@ -1528,6 +1992,23 @@ int main(int argc, char** argv) {
       return 1;
     }
     mj_forward(test_model, test_data);
+    mjvScene axis_scene;
+    mjv_defaultScene(&axis_scene);
+    mjv_makeScene(test_model, &axis_scene, 512);
+    if (bundle.ShowAxisMarkers())
+      bundle.AddAxisMarkers(test_model, test_data, axis_scene);
+    const int host_axis_marker_count = axis_scene.ngeom;
+    if (opponent_bundle.ShowAxisMarkers())
+      opponent_bundle.AddAxisMarkers(test_model, test_data, axis_scene, true);
+    const int guest_axis_marker_count = axis_scene.ngeom - host_axis_marker_count;
+    mjv_freeScene(&axis_scene);
+    if (bundle.ShowAxisMarkers() || !opponent_bundle.ShowAxisMarkers() ||
+        host_axis_marker_count != 0 || guest_axis_marker_count != 8) {
+      std::fprintf(stderr,
+          "LAN client axis visibility did not show only the joining player's bot axes.\n");
+      mj_deleteData(test_data); mj_deleteModel(test_model);
+      return 1;
+    }
     const int target_qpos = test_model->jnt_qposadr[target_joint];
     if (std::abs(test_data->qpos[target_qpos] - 0.55) > 1e-6 ||
         std::abs(test_data->qpos[target_qpos + 1]) > 1e-6 ||
@@ -1593,7 +2074,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "Imported opponent did not produce player-to-opponent collision contacts.\n");
       return 1;
     }
-    std::puts("Opponent bundle passed: two wheel drives, weapon, and fork load with 0.34 kg total mass; opposite spawn faces the player and AI drives forward; fork/frame contact and player collision work.");
+    std::puts("Opponent bundle passed: two wheel drives, weapon, and fork load with 0.34 kg total mass; opposite spawn faces the player; guest-only axis visibility; fork/frame contact and player collision work.");
     return 0;
   }
   if (argc >= 3 && std::string(argv[1]) == "--test-transform-gizmo") {
@@ -2372,7 +2853,7 @@ int main(int argc, char** argv) {
   if (argc >= 2 && std::string(argv[1]) == "--test-wall-impact") {
     const std::filesystem::path wall_model = argc >= 3 ? argv[2] :
       std::filesystem::path("Assets/CombatSim/Models/CombatRobot500g.xml");
-    auto run_wall_case = [&](double timestep, double impact_speed) {
+    auto run_wall_case = [&](double timestep, double impact_speed, bool vertical = false) {
       std::array<char, 4096> diagnostic{};
       mjModel* checked = mj_loadXML(wall_model.string().c_str(), nullptr,
                                     diagnostic.data(), diagnostic.size());
@@ -2395,30 +2876,38 @@ int main(int argc, char** argv) {
       checked_data->qpos[target_qpos] = -0.55;
       checked_data->qpos[target_qpos + 1] = 0.68;
       checked_data->qpos[target_qpos + 2] = 0.065;
-      checked_data->qvel[player_dof] = impact_speed;
+      checked_data->qvel[player_dof + (vertical ? 2 : 0)] = impact_speed;
       mj_forward(checked, checked_data);
-      double peak_x = checked_data->qpos[player_qpos];
+      double peak_position = checked_data->qpos[player_qpos + (vertical ? 2 : 0)];
       const int steps = int(std::ceil(0.12 / timestep));
       for (int i = 0; i < steps; ++i) {
         mj_step(checked, checked_data);
-        peak_x = std::max(peak_x, checked_data->qpos[player_qpos]);
+        peak_position = std::max(peak_position,
+          checked_data->qpos[player_qpos + (vertical ? 2 : 0)]);
       }
-      const double end_x = checked_data->qpos[player_qpos];
-      std::printf("Wall impact at %.0f Hz and %.1f m/s: peak center X=%.4f m, final X=%.4f m\n",
-        1.0 / timestep, impact_speed, peak_x, end_x);
+      const double end_position = checked_data->qpos[player_qpos + (vertical ? 2 : 0)];
+      std::printf("%s impact at %.0f Hz and %.1f m/s: peak robot center=%.4f m, final=%.4f m\n",
+        vertical ? "Roof" : "Wall", 1.0 / timestep, impact_speed,
+        peak_position, end_position);
       mj_deleteData(checked_data); mj_deleteModel(checked);
-      return peak_x;
+      return peak_position;
     };
     const double at_2500 = run_wall_case(0.0004, 24.0);
     const double at_10000 = run_wall_case(0.0001, 24.0);
     const double at_2500_fast = run_wall_case(0.0004, 100.0);
     const double at_10000_fast = run_wall_case(0.0001, 100.0);
+    const double at_2500_extreme = run_wall_case(0.0004, 180.0);
+    const double at_10000_extreme = run_wall_case(0.0001, 180.0);
+    const double roof_2500 = run_wall_case(0.0004, 100.0, true);
+    const double roof_10000 = run_wall_case(0.0001, 100.0, true);
     if (at_2500 > 1.25 || at_10000 > 1.25 ||
-        at_2500_fast > 0.84 || at_10000_fast > 0.84) {
-      std::fprintf(stderr, "Robot exceeded the acceptable wall-impact penetration envelope.\n");
+        at_2500_fast > 0.84 || at_10000_fast > 0.84 ||
+        at_2500_extreme > 1.25 || at_10000_extreme > 1.25 ||
+        roof_2500 > 1.25 || roof_10000 > 1.25) {
+      std::fprintf(stderr, "Robot escaped the arena's hidden wall or roof catch volumes.\n");
       return 1;
     }
-    std::puts("Wall impact stayed inside the arena at both update rates.");
+    std::puts("Wall and roof impacts stayed inside the hidden catch volumes at both update rates, including 180 m/s lateral impact.");
     return 0;
   }
   if (argc >= 3 && std::string(argv[1]) == "--inspect-model") {
@@ -2735,8 +3224,120 @@ int main(int argc, char** argv) {
     mjv_freeScene(&checked_scene); mj_deleteData(checked_data); mj_deleteModel(checked);
     return fit ? 0 : 1;
   }
+  if (argc >= 2 && std::string(argv[1]) == "--test-arena-spawns") {
+    const std::filesystem::path test_path = argc >= 3 ? argv[2] :
+      "Assets/CombatSim/Models/CombatRobot500g.xml";
+    std::array<char, 4096> diagnostic{};
+    mjModel* test_model = mj_loadXML(test_path.string().c_str(), nullptr,
+                                      diagnostic.data(), int(diagnostic.size()));
+    if (!test_model) {
+      std::fprintf(stderr, "Could not load arena model: %s\n", diagnostic.data());
+      return 1;
+    }
+    mjData* test_data = mj_makeData(test_model);
+    if (!test_data) { mj_deleteModel(test_model); return 1; }
+    const int floor = mj_name2id(test_model, mjOBJ_GEOM, "floor");
+    const int floor_material = floor >= 0 ? test_model->geom_matid[floor] : -1;
+    const int key = mj_name2id(test_model, mjOBJ_LIGHT, "arena_key_light");
+    const int fill = mj_name2id(test_model, mjOBJ_LIGHT, "arena_fill_light");
+    bool valid = floor >= 0 && test_model->geom_rgba[4 * floor + 3] >= 0.999f &&
+      floor_material >= 0 && test_model->mat_rgba[4 * floor_material] >= 0.75f &&
+      test_model->mat_rgba[4 * floor_material + 1] >= 0.75f &&
+      test_model->mat_rgba[4 * floor_material + 2] >= 0.70f &&
+      key >= 0 && fill >= 0;
+    for (const char* name : {"north_wall_acrylic", "south_wall_acrylic",
+                             "east_wall_acrylic", "west_wall_acrylic"}) {
+      const int panel = mj_name2id(test_model, mjOBJ_GEOM, name);
+      if (panel < 0 || test_model->geom_contype[panel] != 0 ||
+          test_model->geom_conaffinity[panel] != 0) {
+        valid = false;
+        continue;
+      }
+      const int thickness_axis = (std::string(name).find("east") != std::string::npos ||
+                                  std::string(name).find("west") != std::string::npos) ? 0 : 1;
+      valid = valid && std::abs(test_model->geom_size[3 * panel + thickness_axis] - 0.004) < 1e-6;
+    }
+    for (const char* name : {"north_wall", "south_wall", "east_wall", "west_wall"}) {
+      const int wall = mj_name2id(test_model, mjOBJ_GEOM, name);
+      if (wall < 0) { valid = false; continue; }
+      const bool x_axis = std::string(name).find("east") != std::string::npos ||
+                          std::string(name).find("west") != std::string::npos;
+      const double inner_face = x_axis
+        ? std::abs(test_model->geom_pos[3 * wall]) - test_model->geom_size[3 * wall]
+        : std::abs(test_model->geom_pos[3 * wall + 1]) - test_model->geom_size[3 * wall + 1];
+      valid = valid && std::abs(inner_face - 1.0) < 1e-6 &&
+        test_model->geom_rgba[4 * wall + 3] == 0.0f;
+    }
+    const int roots[2] = {mj_name2id(test_model, mjOBJ_BODY, "Player_Robot"),
+                          mj_name2id(test_model, mjOBJ_BODY, "Target_Robot")};
+    mjtNum center_quat[2][4]{};
+    for (int i = 0; i < 2; ++i) {
+      const int joint = free_joint_for_body(test_model, roots[i]);
+      if (joint < 0) { valid = false; continue; }
+      const int qpos = test_model->jnt_qposadr[joint];
+      apply_arena_spawn_layout(test_model, test_data, 0);
+      std::copy(test_data->qpos + qpos + 3, test_data->qpos + qpos + 7, center_quat[i]);
+    }
+    apply_arena_spawn_layout(test_model, test_data, 0);
+    Vec3 player_center = robot_geometry_center(test_model, test_data, roots[0]);
+    Vec3 target_center = robot_geometry_center(test_model, test_data, roots[1]);
+    valid = valid && player_center[0] < 0.0 && target_center[0] > 0.0 &&
+      std::abs(player_center[0] + target_center[0]) < 1e-4 &&
+      std::abs(player_center[1]) < 1e-4 && std::abs(target_center[1]) < 1e-4;
+    for (int i = 0; i < 2; ++i) {
+      Vec3 low{}, high{};
+      robot_geometry_bounds(test_model, test_data, roots[i], low, high);
+      valid = valid && low[0] >= -0.9901 && high[0] <= 0.9901 &&
+        low[1] >= -0.9901 && high[1] <= 0.9901;
+    }
+    apply_arena_spawn_layout(test_model, test_data, 1);
+    player_center = robot_geometry_center(test_model, test_data, roots[0]);
+    target_center = robot_geometry_center(test_model, test_data, roots[1]);
+    valid = valid && player_center[0] < 0.0 && player_center[1] < 0.0 &&
+      target_center[0] > 0.0 && target_center[1] > 0.0 &&
+      std::abs(player_center[0] - player_center[1]) < 1e-4 &&
+      std::abs(target_center[0] - target_center[1]) < 1e-4 &&
+      std::abs(player_center[0] + target_center[0]) < 1e-4 &&
+      std::abs(player_center[1] + target_center[1]) < 1e-4;
+    const Vec3 diagonal_player = player_center;
+    const Vec3 diagonal_target = target_center;
+    apply_arena_spawn_layout(test_model, test_data, 1);  // Reset must retain selected layout.
+    player_center = robot_geometry_center(test_model, test_data, roots[0]);
+    target_center = robot_geometry_center(test_model, test_data, roots[1]);
+    valid = valid && std::abs(player_center[0] - diagonal_player[0]) < 1e-4 &&
+      std::abs(player_center[1] - diagonal_player[1]) < 1e-4 &&
+      std::abs(target_center[0] - diagonal_target[0]) < 1e-4 &&
+      std::abs(target_center[1] - diagonal_target[1]) < 1e-4;
+    for (int i = 0; i < 2; ++i) {
+      Vec3 low{}, high{};
+      robot_geometry_bounds(test_model, test_data, roots[i], low, high);
+      valid = valid && low[0] >= -0.9901 && high[0] <= 0.9901 &&
+        low[1] >= -0.9901 && high[1] <= 0.9901;
+    }
+    for (int i = 0; i < 2; ++i) {
+      const int joint = free_joint_for_body(test_model, roots[i]);
+      if (joint < 0) { valid = false; continue; }
+      const int qpos = test_model->jnt_qposadr[joint];
+      mjtNum expected_delta[4] = {std::cos(pi / 8.0), 0.0, 0.0, std::sin(pi / 8.0)};
+      mjtNum expected[4];
+      mju_mulQuat(expected, expected_delta, center_quat[i]);
+      double alignment = 0.0;
+      for (int component = 0; component < 4; ++component)
+        alignment += expected[component] * test_data->qpos[qpos + 3 + component];
+      valid = valid && std::abs(std::abs(alignment) - 1.0) < 1e-6;
+    }
+    if (valid)
+      std::puts("Arena check passed: matte laminate floor, calm lighting, 8 mm acrylic panels, hidden catch walls, safe center-line and diagonal spawns, and selected-layout reset.");
+    else
+      std::fprintf(stderr, "Arena check failed: floor, lights, acrylic panels, wall boundary, safe spawns, or reset layout are incorrect.\n");
+    mj_deleteData(test_data);
+    mj_deleteModel(test_model);
+    return valid ? 0 : 1;
+  }
   if (argc >= 3 && std::string(argv[1]) == "--validate-bundle") {
     if (!bundle.Load(argv[2])) { std::fprintf(stderr, "%s\n", bundle.Error().c_str()); return 1; }
+    std::printf("Assembly axis markers: %s\n",
+                bundle.ShowAxisMarkers() ? "shown" : "hidden");
     std::filesystem::path preview_generated;
     if (!bundle.GeneratePreview(preview_generated)) { std::fprintf(stderr, "%s\n", bundle.Error().c_str()); return 1; }
     std::array<char, 8192> preview_diagnostic{};
@@ -2920,6 +3521,10 @@ int main(int argc, char** argv) {
   SDL_Gamepad* pad = first_gamepad();
   InputMixer input_mixer;
   load_mixer_settings(input_mixer);
+  AppSettings app_settings;
+  load_app_settings(app_settings);
+  apply_arena_spawn_layout(model, data, app_settings.spawn_layout);
+  apply_arena_lighting(model, app_settings);
   SDL_Joystick* joystick = nullptr;
   SDL_JoystickID joystick_id = 0;
   const std::string saved_guid = input_mixer.preferred_guid;
@@ -2993,7 +3598,7 @@ int main(int argc, char** argv) {
   ImGui_ImplSDL3_InitForOpenGL(window, gl);
   ImGui_ImplOpenGL3_Init("#version 330");
 
-  enum class AppScreen { Home, Drive, Configure };
+  enum class AppScreen { Home, Drive, Configure, Settings };
   enum class GizmoMode { Move, Rotate };
   AppScreen screen = AppScreen::Home;
   int config_bot = 0;  // 0 = player, 1 = opponent.
@@ -3009,9 +3614,122 @@ int main(int argc, char** argv) {
   Vec3 rotation_pivot{};
   Vec3 rotation_local_pivot{};
   bool mixer_popup_open = false;
+  bool lan_popup_open = false;
   std::string runtime_error;
+  char lan_address[256] = "127.0.0.1";
+  char lan_port_text[16] = "29811";
+  char lan_passphrase[65]{};
+  std::string generated_passphrase;
+  LanSession::GeneratePassphrase(generated_passphrase);
+  std::snprintf(lan_passphrase, sizeof(lan_passphrase), "%s", generated_passphrase.c_str());
+  std::filesystem::path previous_player_manifest;
+  std::filesystem::path previous_opponent_manifest;
+  std::vector<unsigned char> local_client_package;
+  bool lan_bundle_swapped = false;
+  bool lan_model_installed = false;
+  bool lan_match_started = false;
   double accumulator = 0.0;
   auto last = std::chrono::steady_clock::now();
+  auto wipe_package = [](std::vector<unsigned char>& bytes) {
+    volatile unsigned char* data = bytes.empty() ? nullptr : bytes.data();
+    for (size_t i = 0; i < bytes.size(); ++i) data[i] = 0;
+    bytes.clear();
+    bytes.shrink_to_fit();
+  };
+  auto install_model = [&](mjModel* next_model) {
+    mjData* next_data = next_model ? mj_makeData(next_model) : nullptr;
+    if (!next_data) {
+      runtime_error = next_model ? "MuJoCo could not allocate model data." :
+        "MuJoCo could not compile the generated model.";
+      if (next_model) mj_deleteModel(next_model);
+      return false;
+    }
+    apply_arena_spawn_layout(next_model, next_data, app_settings.spawn_layout);
+    apply_arena_lighting(next_model, app_settings);
+    mjr_freeContext(&context); mjv_freeScene(&scene);
+    mj_deleteData(data); mj_deleteModel(model);
+    model = next_model; data = next_data;
+    gizmo_drag_active = false; gizmo_drag_axis = -1;
+    model->vis.quality.offsamples = 0;
+    mjv_makeScene(model, &scene, 2000); mjr_makeContext(model, &context, mjFONTSCALE_100);
+    controls.left.clear(); controls.right.clear(); controls.weapon.clear();
+    controls.filtered_wheel_speeds.clear();
+    bundle.BindControls(model, controls.left, controls.right, controls.weapon,
+                        controls.motor_models, controls.weapon_motor_models,
+                        controls.manual_velocity_actuators, controls.battery_voltage);
+    controls.weapon_sign = 1.0; controls.weapon_command = 0.0;
+    opponent_controls.left.clear(); opponent_controls.right.clear();
+    opponent_controls.weapon.clear(); opponent_controls.filtered_wheel_speeds.clear();
+    opponent_bundle.BindControls(model, opponent_controls.left, opponent_controls.right,
+      opponent_controls.weapon, opponent_controls.motor_models,
+      opponent_controls.weapon_motor_models, opponent_controls.manual_velocity_actuators,
+      opponent_controls.battery_voltage, true);
+    opponent_controls.weapon_sign = 1.0; opponent_controls.weapon_command = 0.0;
+    accumulator = 0.0; paused = true; runtime_error.clear();
+    return true;
+  };
+  auto rebuild_configured_model = [&](bool in_memory) {
+    if (in_memory) {
+      std::string xml;
+      std::vector<MemoryBundleAsset> assets;
+      if (!bundle.GenerateInMemory(xml, assets,
+            opponent_bundle.HasBundle() ? &opponent_bundle : nullptr)) {
+        runtime_error = bundle.Error();
+        return false;
+      }
+      std::array<char, 8192> diagnostic{};
+      mjModel* next_model = LoadModelFromMemory(xml, assets, diagnostic.data(),
+                                                 int(diagnostic.size()));
+      for (auto& asset : assets) {
+        volatile unsigned char* bytes = asset.bytes.empty() ? nullptr : asset.bytes.data();
+        for (size_t i = 0; i < asset.bytes.size(); ++i) bytes[i] = 0;
+      }
+      if (!next_model) {
+        if (diagnostic[0]) runtime_error = diagnostic.data();
+        return false;
+      }
+      return install_model(next_model);
+    }
+    std::filesystem::path generated;
+    if (!bundle.Generate(generated, opponent_bundle.HasBundle() ? &opponent_bundle : nullptr)) {
+      runtime_error = bundle.Error();
+      return false;
+    }
+    std::array<char, 8192> diagnostic{};
+    mjModel* next_model = mj_loadXML(generated.string().c_str(), nullptr,
+                                      diagnostic.data(), int(diagnostic.size()));
+    if (!next_model) {
+      if (diagnostic[0]) runtime_error = diagnostic.data();
+      return false;
+    }
+    return install_model(next_model);
+  };
+  auto end_lan_session = [&] {
+    lan.Stop();
+    if (lan_bundle_swapped) {
+      bool player_restored = false;
+      if (!previous_player_manifest.empty())
+        player_restored = bundle.Load(previous_player_manifest);
+      else
+        bundle.Clear();
+      if (!previous_opponent_manifest.empty())
+        opponent_bundle.Load(previous_opponent_manifest);
+      else
+        opponent_bundle.Clear();
+      if (player_restored) rebuild_configured_model(false);
+      else runtime_error = "LAN ended, but the original player bundle could not be restored.";
+    }
+    wipe_package(local_client_package);
+    previous_player_manifest.clear();
+    previous_opponent_manifest.clear();
+    lan_bundle_swapped = false;
+    lan_model_installed = false;
+    lan_match_started = false;
+    opponent_ai_enabled = true;
+    placement_mode = false;
+    screen = AppScreen::Home;
+    paused = true;
+  };
   while (running) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -3139,39 +3857,147 @@ int main(int argc, char** argv) {
       }
 
     }
+    if (lan.GetState() == LanSession::State::PackageReady && !lan_model_installed) {
+      std::vector<unsigned char> remote_package;
+      bool received = lan.TakeRemotePackage(remote_package);
+      if (received && lan.GetRole() == LanSession::Role::Host) {
+        if (!opponent_bundle.LoadSessionPackage(remote_package)) {
+          runtime_error = "Opponent bundle rejected: " + opponent_bundle.Error();
+          received = false;
+        } else {
+          lan_bundle_swapped = true;
+        }
+      } else if (received && lan.GetRole() == LanSession::Role::Client) {
+        if (!bundle.LoadSessionPackage(remote_package)) {
+          runtime_error = "Host bundle rejected: " + bundle.Error();
+          received = false;
+        } else {
+          lan_bundle_swapped = true;
+        }
+        if (received && !opponent_bundle.LoadSessionPackage(local_client_package)) {
+          runtime_error = "Your bot could not be loaded into the LAN model: " +
+            opponent_bundle.Error();
+          received = false;
+        }
+        if (received) {
+          wipe_package(local_client_package);
+        }
+      }
+      wipe_package(remote_package);
+      if (received && rebuild_configured_model(true)) {
+        lan_model_installed = true;
+        bundle.DiscardSessionMeshBuffers();
+        opponent_bundle.DiscardSessionMeshBuffers();
+        lan.MarkReady();
+      } else if (received) {
+        lan.Stop();
+      } else {
+        lan.Stop();
+      }
+    }
+    if (lan.GetState() == LanSession::State::Connected && !lan_match_started) {
+      lan_match_started = true;
+      screen = AppScreen::Drive;
+      paused = lan.GetRole() == LanSession::Role::Client;
+      opponent_ai_enabled = false;
+      runtime_error.clear();
+    }
+    const bool lan_connected = lan.GetState() == LanSession::State::Connected;
+    const bool lan_client = lan_connected && lan.GetRole() == LanSession::Role::Client;
+    const bool lan_host = lan_connected && lan.GetRole() == LanSession::Role::Host;
+    const bool local_bot_is_guest = lan_bundle_swapped &&
+      lan.GetRole() == LanSession::Role::Client;
+    const Controls& telemetry_controls = local_bot_is_guest ? opponent_controls : controls;
+    const FusionBundle& telemetry_bundle = local_bot_is_guest ? opponent_bundle : bundle;
+    const bool window_has_input_focus = SDL_GetKeyboardFocus() == window;
+    if (lan_client) {
+      const bool* keys = SDL_GetKeyboardState(nullptr);
+      const bool keyboard_enabled = window_has_input_focus &&
+        !ImGui::GetIO().WantCaptureKeyboard;
+      KeyboardControls command = keyboard_enabled
+        ? read_keyboard_controls(keys) : KeyboardControls{};
+      if (pad && window_has_input_focus) {
+        const float gamepad_throttle = -axis_with_deadzone(
+          pad, SDL_GAMEPAD_AXIS_LEFTY, controls.deadzone);
+        const float gamepad_turn = -axis_with_deadzone(
+          pad, SDL_GAMEPAD_AXIS_LEFTX, controls.deadzone);
+        if (std::abs(gamepad_throttle) > 1e-4f) command.throttle = gamepad_throttle;
+        if (std::abs(gamepad_turn) > 1e-4f) command.turn = gamepad_turn;
+        command.weapon = command.weapon ||
+          SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) ||
+          SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_SOUTH);
+      }
+      lan.SendInput({command.throttle, command.turn, command.weapon ? 1.0f : 0.0f});
+      LanSession::Snapshot snapshot;
+      if (lan.TakeLatestSnapshot(snapshot)) {
+        if (snapshot.qpos.size() != size_t(model->nq) ||
+            snapshot.qvel.size() != size_t(model->nv)) {
+          runtime_error = "LAN model state does not match the host model.";
+          paused = true;
+          lan.Stop();
+        } else {
+          std::copy(snapshot.qpos.begin(), snapshot.qpos.end(), data->qpos);
+          std::copy(snapshot.qvel.begin(), snapshot.qvel.end(), data->qvel);
+          data->time = snapshot.time;
+          mj_forward(model, data);
+        }
+      }
+    }
+    if (lan.GetState() == LanSession::State::Failed) {
+      if (lan_match_started) paused = true;
+      if (!lan.Error().empty()) runtime_error = "LAN session: " + lan.Error();
+    }
+
     const auto now = std::chrono::steady_clock::now();
     accumulator += std::min(0.1, std::chrono::duration<double>(now - last).count());
     last = now;
     if (paused || screen != AppScreen::Drive) accumulator = 0.0;
     int steps = 0;
-    while (!paused && screen == AppScreen::Drive && accumulator >= model->opt.timestep && steps++ < 250) {
-      const bool keyboard_enabled = !ImGui::GetIO().WantCaptureKeyboard;
+    while (!lan_client && !paused && screen == AppScreen::Drive &&
+           accumulator >= model->opt.timestep && steps++ < 250) {
+      const bool keyboard_enabled = window_has_input_focus &&
+        !ImGui::GetIO().WantCaptureKeyboard;
       const bool* keys = SDL_GetKeyboardState(nullptr);
       const KeyboardControls player_keyboard = keyboard_enabled
         ? read_keyboard_controls(keys) : KeyboardControls{};
       const KeyboardControls opponent_keyboard = keyboard_enabled
         ? read_keyboard_controls(keys, true) : KeyboardControls{};
-      drive(model, data, controls, pad, joystick, input_mixer, player_keyboard, true);
+      drive(model, data, controls,
+            window_has_input_focus ? pad : nullptr,
+            window_has_input_focus ? joystick : nullptr,
+            input_mixer, player_keyboard, true);
       const bool opponent_ai_ready = opponent_ai_delay_elapsed(data->time);
-      const KeyboardControls opponent_command = opponent_ai_enabled
-        ? (opponent_ai_ready
-            ? opponent_ram_ai(model, data, opponent_controls,
-                              opponent_ai_aggression_percent)
-            : KeyboardControls{})
-        : opponent_keyboard;
+      const LanSession::Input remote = lan_host ? lan.LatestRemoteInput() :
+        LanSession::Input{};
+      const KeyboardControls opponent_command = lan_host
+        ? KeyboardControls{remote.throttle, remote.turn, remote.weapon > 0.5f}
+        : opponent_ai_enabled
+          ? (opponent_ai_ready
+              ? opponent_ram_ai(model, data, opponent_controls,
+                                opponent_ai_aggression_percent)
+              : KeyboardControls{})
+          : opponent_keyboard;
       drive(model, data, opponent_controls, nullptr, nullptr, input_mixer,
             opponent_command, false);
       mj_step(model, data);
       accumulator -= model->opt.timestep;
     }
     if (steps >= 250) accumulator = 0.0;
+    if (lan_host)
+      lan.SendSnapshot(data->time, data->qpos, model->nq, data->qvel, model->nv);
 
     int width = 0, height = 0;
     SDL_GetWindowSizeInPixels(window, &width, &height);
     mjrRect viewport{0, 0, width, height};
     mjr_setBuffer(mjFB_WINDOW, &context);
+    apply_arena_lighting(model, app_settings);
     mjv_updateScene(model, data, &options, nullptr, &camera, mjCAT_ALL, &scene);
-    bundle.AddAxisMarkers(model, data, scene);
+    if (local_bot_is_guest) {
+      if (opponent_bundle.ShowAxisMarkers())
+        opponent_bundle.AddAxisMarkers(model, data, scene, true);
+    } else if (bundle.ShowAxisMarkers()) {
+      bundle.AddAxisMarkers(model, data, scene);
+    }
     if (screen == AppScreen::Drive && placement_mode) {
       const int player_root = mj_name2id(model, mjOBJ_BODY, "Player_Robot");
       gizmo_length = std::clamp(camera.distance * 0.11, 0.18, 0.65);
@@ -3183,6 +4009,7 @@ int main(int argc, char** argv) {
     bool load_requested = false, apply_requested = false;
     FusionBundle* setup_bundle = &bundle;
     bool mixer_popup_requested = false;
+    bool lan_popup_requested = false;
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     constexpr ImGuiWindowFlags fixed_window = ImGuiWindowFlags_NoTitleBar |
       ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
@@ -3199,6 +4026,11 @@ int main(int argc, char** argv) {
     ImGui::SameLine(152);
     auto nav_button = [&](const char* label, AppScreen target) {
       const bool active = screen == target;
+      const bool disabled = target == AppScreen::Configure &&
+        (lan_bundle_swapped || (lan.GetState() != LanSession::State::Idle &&
+         lan.GetState() != LanSession::State::Stopped &&
+         lan.GetState() != LanSession::State::Failed));
+      if (disabled) ImGui::BeginDisabled();
       const ImVec4 active_color = target == AppScreen::Drive ? ImVec4(0.20f, 0.50f, 0.38f, 1.0f) :
         target == AppScreen::Configure ? ImVec4(0.34f, 0.40f, 0.68f, 1.0f) :
         ImVec4(0.24f, 0.43f, 0.64f, 1.0f);
@@ -3212,6 +4044,7 @@ int main(int argc, char** argv) {
         screen = target;
         paused = target != AppScreen::Drive;
       }
+      if (disabled) ImGui::EndDisabled();
     };
     nav_button("Home", AppScreen::Home);
     ImGui::SameLine(); nav_button("Drive", AppScreen::Drive);
@@ -3271,7 +4104,7 @@ int main(int argc, char** argv) {
       const float item_height = std::clamp(display.y * 0.095f, 56.0f, 70.0f);
       const float menu_y = std::min(home_min.y + 285.0f,
           std::max(status_y + 27.0f,
-                   display.y - (3.0f * item_height + 2.0f * 7.0f + 78.0f)));
+                   display.y - (5.0f * item_height + 4.0f * 7.0f + 78.0f)));
       float menu_item_y = menu_y;
       auto menu_item = [&](const char* id, const char* index, const char* title,
                            const char* subtitle, ImVec4 item_accent, bool primary,
@@ -3311,6 +4144,10 @@ int main(int argc, char** argv) {
           ui_blue, false, [&] { screen = AppScreen::Configure; paused = true; });
       menu_item("##menu_mixer", "03", "CONTROLLER SETUP", "Map joystick channels and response curves",
           ui_violet, false, [&] { mixer_popup_requested = true; });
+      menu_item("##menu_settings", "04", "ARENA SETTINGS", "Adjust lighting and choose bot starting positions",
+          ui_amber, false, [&] { screen = AppScreen::Settings; paused = true; });
+      menu_item("##menu_lan", "05", "LAN MULTIPLAYER", "Host a match or join another bot on your network",
+          ui_coral, false, [&] { lan_popup_requested = true; });
 
       if (!compact_home) {
         const float info_x = display.x - 374.0f;
@@ -3372,6 +4209,82 @@ int main(int argc, char** argv) {
       ImGui::End();
       ImGui::PopStyleVar();
       ImGui::PopStyleColor(2);
+    } else if (screen == AppScreen::Settings) {
+      ImGui::SetNextWindowPos(ImVec2(0, 62), ImGuiCond_Always);
+      ImGui::SetNextWindowSize(ImVec2(display.x, std::max(1.0f, display.y - 62.0f)),
+                               ImGuiCond_Always);
+      ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.055f, 0.075f, 0.105f, 0.96f));
+      ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
+      ImGui::Begin("##arena_settings", nullptr, fixed_window);
+      const float panel_width = std::min(760.0f, std::max(360.0f, display.x - 48.0f));
+      ImGui::SetCursorPosX(std::max(24.0f, (display.x - panel_width) * 0.5f));
+      ImGui::BeginChild("Arena settings panel", ImVec2(panel_width, display.y - 110.0f),
+                        ImGuiChildFlags_Borders);
+      ImGui::TextColored(ui_amber, "ARENA SETTINGS");
+      ImGui::TextDisabled("Saved on this computer and applied to the next reset or model load.");
+      ImGui::SeparatorText("Bot starting positions");
+      const char* spawn_label = app_settings.spawn_layout == 0
+        ? "Opposite ends of center line" : "Opposite arena diagonals";
+      ImGui::SetNextItemWidth(std::min(480.0f, panel_width - 40.0f));
+      bool spawn_changed = false;
+      const bool spawn_locked = lan_bundle_swapped || lan_connected;
+      if (spawn_locked) ImGui::BeginDisabled();
+      if (ImGui::BeginCombo("Spawn layout", spawn_label)) {
+        if (ImGui::Selectable("Opposite ends of center line", app_settings.spawn_layout == 0)) {
+          spawn_changed = app_settings.spawn_layout != 0;
+          app_settings.spawn_layout = 0;
+        }
+        if (ImGui::Selectable("Opposite arena diagonals", app_settings.spawn_layout == 1)) {
+          spawn_changed = app_settings.spawn_layout != 1;
+          app_settings.spawn_layout = 1;
+        }
+        ImGui::EndCombo();
+      }
+      if (spawn_locked) ImGui::EndDisabled();
+      if (spawn_locked)
+        ImGui::TextDisabled("Spawn layout is locked while a LAN model is loaded.");
+      if (spawn_changed) {
+        save_app_settings(app_settings);
+        apply_arena_spawn_layout(model, data, app_settings.spawn_layout);
+        controls.weapon_command = 0.0;
+        opponent_controls.weapon_command = 0.0;
+        controls.filtered_wheel_speeds.clear();
+        opponent_controls.filtered_wheel_speeds.clear();
+      }
+      ImGui::TextWrapped(app_settings.spawn_layout == 0
+        ? "Bots start on opposite ends of the arena's center line, facing each other."
+        : "Bots start at opposite diagonal positions and turn together to face across the arena.");
+      ImGui::SeparatorText("Arena lighting");
+      bool lighting_changed = false;
+      ImGui::SetNextItemWidth(std::min(480.0f, panel_width - 40.0f));
+      lighting_changed |= ImGui::SliderFloat("Ambient fill", &app_settings.ambient_light,
+                                               0.0f, 0.8f, "%.2f");
+      ImGui::SetNextItemWidth(std::min(480.0f, panel_width - 40.0f));
+      lighting_changed |= ImGui::SliderFloat("Main arena light", &app_settings.key_light,
+                                               0.0f, 2.0f, "%.2f x");
+      ImGui::SetNextItemWidth(std::min(480.0f, panel_width - 40.0f));
+      lighting_changed |= ImGui::SliderFloat("Soft fill light", &app_settings.fill_light,
+                                               0.0f, 2.0f, "%.2f x");
+      ImGui::SetNextItemWidth(std::min(480.0f, panel_width - 40.0f));
+      lighting_changed |= ImGui::SliderFloat("Camera fill", &app_settings.camera_fill,
+                                               0.0f, 1.0f, "%.2f");
+      if (lighting_changed) save_app_settings(app_settings);
+      if (ImGui::Button("Reset lighting", ImVec2(150.0f, 36.0f))) {
+        app_settings.ambient_light = 0.12f;
+        app_settings.key_light = 0.68f;
+        app_settings.fill_light = 0.24f;
+        app_settings.camera_fill = 0.07f;
+        save_app_settings(app_settings);
+      }
+      ImGui::Separator();
+      ImGui::TextColored(ui_green, "Arena floor opacity: 100%%");
+      if (ImGui::Button("Back to Home", ImVec2(150.0f, 36.0f))) {
+        screen = AppScreen::Home;
+        paused = true;
+      }
+      ImGui::EndChild();
+      ImGui::End();
+      ImGui::PopStyleColor(2);
     } else if (screen == AppScreen::Drive) {
       static float drive_sidebar_width = 380.0f;
       static float requested_drive_sidebar_width = 380.0f;
@@ -3394,7 +4307,11 @@ int main(int argc, char** argv) {
       ImGui::TextColored(ui_green, "PRACTICE DRIVE");
       ImGui::TextDisabled("MuJoCo simulation  |  %.0f Hz", 1.0 / model->opt.timestep);
       ImGui::Spacing();
-      if (placement_mode) {
+      if (lan_client) {
+        ImGui::BeginDisabled();
+        ImGui::Button("Host controls simulation", ImVec2(190, 40));
+        ImGui::EndDisabled();
+      } else if (placement_mode) {
         ImGui::BeginDisabled();
         ImGui::Button("Paused for placement", ImVec2(166, 40));
         ImGui::EndDisabled();
@@ -3410,12 +4327,16 @@ int main(int argc, char** argv) {
         pop_button_palette();
       }
       ImGui::SameLine();
+      if (lan_client) ImGui::BeginDisabled();
       if (ImGui::Button("Reset robot", ImVec2(132, 40))) {
-        mj_resetData(model, data); mj_forward(model, data); controls.weapon_command = 0.0;
+        apply_arena_spawn_layout(model, data, app_settings.spawn_layout);
+        controls.weapon_command = 0.0;
         controls.filtered_wheel_speeds.clear();
         opponent_controls.filtered_wheel_speeds.clear();
         gizmo_drag_active = false; gizmo_drag_axis = -1;
       }
+      if (lan_client) ImGui::EndDisabled();
+      if (lan_connected) ImGui::BeginDisabled();
       if (ImGui::Button(placement_mode ? "Finish moving robot" : "Move", ImVec2(190, 40))) {
         placement_mode = !placement_mode;
         gizmo_drag_active = false;
@@ -3435,6 +4356,7 @@ int main(int argc, char** argv) {
           }
         }
       }
+      if (lan_connected) ImGui::EndDisabled();
       if (placement_mode) {
         ImGui::TextColored(gizmo_mode == GizmoMode::Move ? ui_teal : ui_amber,
             "%s MODE  |  R toggles Move / Rotate",
@@ -3449,74 +4371,100 @@ int main(int argc, char** argv) {
       if (ImGui::Button("Controller mixer", ImVec2(280.0f, 38.0f))) {
         mixer_popup_requested = true;
       }
+      if (lan_match_started) {
+        ImGui::TextColored(ui_green, "%s multiplayer match",
+          lan.GetRole() == LanSession::Role::Host ? "Hosting" : "Joined");
+        if (lan.GetRole() == LanSession::Role::Host)
+          ImGui::TextDisabled("You drive your bot with WASD; guest uses WASD for theirs.");
+        else
+          ImGui::TextDisabled("You drive your bot with WASD and Space. Host runs physics.");
+        if (ImGui::Button("End LAN match", ImVec2(280.0f, 34.0f)))
+          end_lan_session();
+      } else if (ImGui::Button("LAN multiplayer", ImVec2(280.0f, 38.0f))) {
+        lan_popup_requested = true;
+      }
       ImGui::Text("Simulation time  %.2f s", data->time);
       ImGui::SeparatorText("Opponent control");
-      ImGui::Checkbox("Aim and ram AI", &opponent_ai_enabled);
-      ImGui::SetNextItemWidth(280.0f);
-      ImGui::SliderFloat("Aggression", &opponent_ai_aggression_percent,
-                         25.0f, 100.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp);
-      ImGui::TextDisabled("Scales the opponent's drive speed and turn rate.");
-      if (opponent_ai_enabled && (opponent_controls.left.empty() ||
+      if (lan_connected) {
+        ImGui::TextColored(ui_green, "Remote player controls the opponent bot.");
+      } else {
+        ImGui::Checkbox("Aim and ram AI", &opponent_ai_enabled);
+        ImGui::SetNextItemWidth(280.0f);
+        ImGui::SliderFloat("Aggression", &opponent_ai_aggression_percent,
+                           25.0f, 100.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::TextDisabled("Scales the opponent's drive speed and turn rate.");
+      }
+      if (!lan_connected && opponent_ai_enabled && (opponent_controls.left.empty() ||
                                   opponent_controls.right.empty())) {
         ImGui::TextColored(ui_amber,
           "AI is waiting for an opponent bundle with left and right wheel drives.");
-      } else if (opponent_ai_enabled && !opponent_ai_delay_elapsed(data->time)) {
+      } else if (!lan_connected && opponent_ai_enabled && !opponent_ai_delay_elapsed(data->time)) {
         ImGui::TextColored(ui_amber, "AI starts in %.1f s",
             std::max(0.0, opponent_ai_start_delay_seconds - data->time));
-      } else if (opponent_ai_enabled) {
+      } else if (!lan_connected && opponent_ai_enabled) {
         ImGui::TextColored(ui_green, "AI active: turns toward the player and rams forward");
         if (!opponent_controls.weapon.empty())
           ImGui::TextDisabled("Opponent weapon spins while AI is active.");
-      } else {
+      } else if (!lan_connected) {
         ImGui::TextDisabled("Manual opponent: I/K drive, J/L turn, M weapon.");
       }
-      ImGui::SeparatorText("Drive settings");
-      ImGui::Checkbox("Manual wheel RPM override", &controls.manual_wheel_rpm_override);
-      if (controls.manual_wheel_rpm_override) {
-        ImGui::SetNextItemWidth(280.0f);
-        ImGui::InputFloat("Forced wheel RPM (0-5000)", &controls.wheel_rpm,
-                          50.0f, 250.0f, "%.0f");
-        if (!std::isfinite(controls.wheel_rpm)) controls.wheel_rpm = 0.0f;
-        controls.wheel_rpm = std::clamp(controls.wheel_rpm, 0.0f, 5000.0f);
-        ImGui::TextWrapped("Override uses a speed servo and bypasses drive motor torque. Set 4000 RPM here for a forced-speed check.");
-      } else {
-        const auto left_estimate = side_motor_speed_estimate(controls.left,
-          controls.motor_models, controls.battery_voltage);
-        const auto right_estimate = side_motor_speed_estimate(controls.right,
-          controls.motor_models, controls.battery_voltage);
-        ImGui::Text("Motor no-load estimate  L %.0f | R %.0f RPM",
-                    left_estimate.rpm, right_estimate.rpm);
-        if (left_estimate.modeled_wheels == 0 || right_estimate.modeled_wheels == 0)
-          ImGui::TextWrapped("A side without motor data uses the 424 RPM fallback. Configure its motor in Configure for a motor-based estimate.");
-        else
-        ImGui::TextWrapped("Full throttle targets the motor speed estimate after pack-voltage and gear-ratio scaling. Loaded RPM comes from motor torque and simulated wheel load.");
-      }
-      const bool weapon_torque_enabled = weapon_uses_torque_model(controls);
+      const bool weapon_torque_enabled = weapon_uses_torque_model(telemetry_controls);
       const double weapon_rpm_limit = weapon_torque_enabled
-        ? weapon_no_load_rpm(controls) : controls.weapon_rpm;
-      if (weapon_torque_enabled) {
-        ImGui::TextWrapped("Weapon motor no-load estimate: %.0f RPM", weapon_rpm_limit);
-        const double weapon_spinup_seconds = bundle.EstimatedWeaponSpinupSeconds();
-        if (weapon_spinup_seconds > 0.0 && std::isfinite(weapon_spinup_seconds))
-          ImGui::TextWrapped("Estimated 0-to-90%% no-load spin-up: %.2f s", weapon_spinup_seconds);
-        else
-          ImGui::TextWrapped("Estimated weapon spin-up is unavailable until its motor data and inertia are valid.");
-        ImGui::TextWrapped("Estimate uses the motor torque curve and modeled weapon inertia; battery sag, impacts, and thermal derating are not included.");
-        if (input_mixer.enabled && joystick)
-          ImGui::TextWrapped("The controller mixer's Weapon output applies motor torque. Zero output lets the weapon coast down.");
-        else
-          ImGui::TextWrapped("Hold Space or the gamepad weapon button to apply player weapon motor torque. Opponent weapon uses M. Releasing lets each weapon coast under the modeled losses.");
+        ? weapon_no_load_rpm(telemetry_controls) : telemetry_controls.weapon_rpm;
+      if (local_bot_is_guest) {
+        ImGui::TextDisabled("Host runs physics; these live RPMs are for your bot.");
+        if (weapon_torque_enabled) {
+          ImGui::Text("Weapon motor no-load estimate: %.0f RPM", weapon_rpm_limit);
+          const double spinup_seconds = telemetry_bundle.EstimatedWeaponSpinupSeconds();
+          if (spinup_seconds > 0.0 && std::isfinite(spinup_seconds))
+            ImGui::Text("Estimated weapon spin-up: %.2f s", spinup_seconds);
+        }
       } else {
-        ImGui::SetNextItemWidth(280.0f);
-        ImGui::SliderFloat("Weapon target RPM", &controls.weapon_rpm, 0, 30000, "%.0f RPM");
-        ImGui::SetNextItemWidth(280.0f);
-        ImGui::SliderFloat("Weapon spin-up", &controls.spinup_seconds, 0.1f, 5.0f, "%.1f s");
+        ImGui::SeparatorText("Drive settings");
+        ImGui::Checkbox("Manual wheel RPM override", &controls.manual_wheel_rpm_override);
+        if (controls.manual_wheel_rpm_override) {
+          ImGui::SetNextItemWidth(280.0f);
+          ImGui::InputFloat("Forced wheel RPM (0-5000)", &controls.wheel_rpm,
+                            50.0f, 250.0f, "%.0f");
+          if (!std::isfinite(controls.wheel_rpm)) controls.wheel_rpm = 0.0f;
+          controls.wheel_rpm = std::clamp(controls.wheel_rpm, 0.0f, 5000.0f);
+          ImGui::TextWrapped("Override uses a speed servo and bypasses drive motor torque. Set 4000 RPM here for a forced-speed check.");
+        } else {
+          const auto left_estimate = side_motor_speed_estimate(telemetry_controls.left,
+            telemetry_controls.motor_models, telemetry_controls.battery_voltage);
+          const auto right_estimate = side_motor_speed_estimate(telemetry_controls.right,
+            telemetry_controls.motor_models, telemetry_controls.battery_voltage);
+          ImGui::Text("Motor no-load estimate  L %.0f | R %.0f RPM",
+                      left_estimate.rpm, right_estimate.rpm);
+          if (left_estimate.modeled_wheels == 0 || right_estimate.modeled_wheels == 0)
+            ImGui::TextWrapped("A side without motor data uses the 424 RPM fallback. Configure its motor in Configure for a motor-based estimate.");
+          else
+            ImGui::TextWrapped("Full throttle targets the motor speed estimate after pack-voltage and gear-ratio scaling. Loaded RPM comes from motor torque and simulated wheel load.");
+        }
+        if (weapon_torque_enabled) {
+          ImGui::TextWrapped("Weapon motor no-load estimate: %.0f RPM", weapon_rpm_limit);
+          const double weapon_spinup_seconds = telemetry_bundle.EstimatedWeaponSpinupSeconds();
+          if (weapon_spinup_seconds > 0.0 && std::isfinite(weapon_spinup_seconds))
+            ImGui::TextWrapped("Estimated 0-to-90%% no-load spin-up: %.2f s", weapon_spinup_seconds);
+          else
+            ImGui::TextWrapped("Estimated weapon spin-up is unavailable until its motor data and inertia are valid.");
+          ImGui::TextWrapped("Estimate uses the motor torque curve and modeled weapon inertia; battery sag, impacts, and thermal derating are not included.");
+          if (input_mixer.enabled && joystick)
+            ImGui::TextWrapped("The controller mixer's Weapon output applies motor torque. Zero output lets the weapon coast down.");
+          else
+            ImGui::TextWrapped("Hold Space or the gamepad weapon button to apply player weapon motor torque. Opponent weapon uses M. Releasing lets each weapon coast under the modeled losses.");
+        } else {
+          ImGui::SetNextItemWidth(280.0f);
+          ImGui::SliderFloat("Weapon target RPM", &controls.weapon_rpm, 0, 30000, "%.0f RPM");
+          ImGui::SetNextItemWidth(280.0f);
+          ImGui::SliderFloat("Weapon spin-up", &controls.spinup_seconds, 0.1f, 5.0f, "%.1f s");
+        }
       }
-      ImGui::SeparatorText("Live telemetry");
-      ImGui::Text("Weapon actual");
+      ImGui::SeparatorText(local_bot_is_guest ? "Your bot telemetry" : "Player bot telemetry");
+      ImGui::Text(local_bot_is_guest ? "Your weapon actual" : "Weapon actual");
       double weapon_actual = 0.0;
       int weapon_readings = 0;
-      for (int id : controls.weapon) {
+      for (int id : telemetry_controls.weapon) {
         const double rpm = actuator_rpm(model, data, id);
         if (std::isfinite(rpm)) { weapon_actual += std::abs(rpm); ++weapon_readings; }
       }
@@ -3554,15 +4502,15 @@ int main(int argc, char** argv) {
         if (valid) ImGui::TextColored(ui_ink,
                                       "  Average: %+.0f RPM", sum / valid);
       };
-      draw_wheel_telemetry("Left", controls.left);
-      draw_wheel_telemetry("Right", controls.right);
+      draw_wheel_telemetry("Left", telemetry_controls.left);
+      draw_wheel_telemetry("Right", telemetry_controls.right);
       ImGui::TextWrapped("Wheel slip compares tread motion with the floor at each contact patch. Slip is flagged above 0.18 m/s.");
       ImGui::SeparatorText("Controls");
       ImGui::TextWrapped("W / S drive forward and reverse. A / D steer; with no throttle, both sides counter-rotate for a spot turn. Hold Space to spin the weapon.");
       ImGui::TextWrapped("Open Controller mixer to map USB joystick channels and tune motor/weapon mixes.");
       ImGui::Text("Drive joints: left %d  |  right %d",
-                  int(controls.left.size()), int(controls.right.size()));
-      if (controls.left.empty() || controls.right.empty())
+                  int(telemetry_controls.left.size()), int(telemetry_controls.right.size()));
+      if (telemetry_controls.left.empty() || telemetry_controls.right.empty())
         ImGui::TextWrapped("Assign at least one wheel assembly to each side in Configure, then Apply and preview.");
       if (!runtime_error.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui_red);
@@ -3754,6 +4702,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < setup_model->ngeom; ++i)
           setup_model->geom_group[i] = setup_bundle->PreviewVisible(i) ? 0 : 5;
         options.geomgroup[5] = 0;
+        apply_arena_lighting(setup_model, app_settings);
         mjv_updateScene(setup_model, setup_data, &options, nullptr, &setup_camera, mjCAT_ALL, &setup_scene);
         const ImVec2 canvas_min = ImGui::GetCursorScreenPos();
         const ImVec2 mouse = ImGui::GetIO().MousePos;
@@ -3786,7 +4735,8 @@ int main(int argc, char** argv) {
         mjtNum camera_head[3], camera_forward[3], camera_up[3];
         mjv_cameraInModel(camera_head, camera_forward, camera_up, &setup_scene);
         setup_bundle->AddSetupAxisMarkers(setup_scene,
-          {camera_head[0], camera_head[1], camera_head[2]});
+          {camera_head[0], camera_head[1], camera_head[2]},
+          setup_bundle->ShowAxisMarkers());
         mjr_setBuffer(mjFB_OFFSCREEN, &setup_context);
         mjr_render({0, 0, preview_width, preview_height}, &setup_scene, &setup_context);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -3847,6 +4797,137 @@ int main(int argc, char** argv) {
       ImGui::End();
       ImGui::PopStyleColor(2);
     }
+    if (lan_popup_requested) {
+      lan_popup_open = true;
+      ImGui::OpenPopup("LAN multiplayer");
+    }
+    if (lan_popup_open) {
+      ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+                              ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+      ImGui::SetNextWindowSize(ImVec2(std::min(660.0f, display.x - 36.0f),
+                                      std::min(590.0f, display.y - 36.0f)),
+                               ImGuiCond_Appearing);
+      ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.075f, 0.09f, 0.12f, 0.99f));
+      ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.30f, 0.39f, 0.47f, 1.0f));
+      if (ImGui::BeginPopupModal("LAN multiplayer", &lan_popup_open,
+          ImGuiWindowFlags_NoCollapse)) {
+        ImGui::TextColored(ui_coral, "PEER-TO-PEER LAN MATCH");
+        ImGui::TextWrapped("Both players load their own configured Fusion bot. Each player uses W/A/S/D and Space for their own bot. The host runs MuJoCo; the joining player sends controls and receives live physics state.");
+        ImGui::Separator();
+        const LanSession::State session_state = lan.GetState();
+        const bool can_start = session_state == LanSession::State::Idle ||
+          session_state == LanSession::State::Stopped ||
+          session_state == LanSession::State::Failed;
+        if (!bundle.HasBundle()) {
+          ImGui::TextColored(ui_amber, "Load and apply a player bot in Configure before starting a match.");
+        } else if (bundle.ManifestPath().empty()) {
+          ImGui::TextColored(ui_amber, "For this first version, start from a bot loaded from a local Fusion manifest.");
+        } else {
+          ImGui::TextColored(ui_green, "Local bot ready: %d CAD bodies", bundle.PartCount());
+        }
+        ImGui::SetNextItemWidth(300.0f);
+        ImGui::InputText("Host IPv4 / name", lan_address, sizeof(lan_address));
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::InputText("TCP port", lan_port_text, sizeof(lan_port_text));
+        ImGui::SetNextItemWidth(350.0f);
+        ImGui::InputText("Session key (share privately)", lan_passphrase,
+                         sizeof(lan_passphrase));
+        if (lan.GetRole() == LanSession::Role::Host) {
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Copy key")) SDL_SetClipboardText(lan_passphrase);
+        }
+        const unsigned long requested_port = std::strtoul(lan_port_text, nullptr, 10);
+        const bool valid_port = requested_port > 0 && requested_port <= 65535;
+        const bool local_ready = bundle.HasBundle() && !bundle.ManifestPath().empty() &&
+          !bundle.IsMemoryLoaded() && !lan_bundle_swapped;
+        ImGui::BeginDisabled(!can_start || !local_ready || !valid_port);
+        if (ImGui::Button("Host match", ImVec2(150.0f, 38.0f))) {
+          std::vector<unsigned char> package;
+          if (!bundle.ExportSessionPackage(package)) {
+            runtime_error = bundle.Error();
+          } else {
+            previous_player_manifest = bundle.ManifestPath();
+            previous_opponent_manifest = opponent_bundle.ManifestPath();
+            std::string error;
+            if (!lan.StartHost(uint16_t(requested_port), std::move(package),
+                               lan_passphrase, error)) runtime_error = error;
+            else {
+              lan_bundle_swapped = false;
+              lan_model_installed = false;
+              lan_match_started = false;
+              runtime_error.clear();
+            }
+            wipe_package(package);
+          }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Join match", ImVec2(150.0f, 38.0f))) {
+          std::vector<unsigned char> package;
+          if (!bundle.ExportSessionPackage(package)) {
+            runtime_error = bundle.Error();
+          } else {
+            wipe_package(local_client_package);
+            local_client_package = package;
+            previous_player_manifest = bundle.ManifestPath();
+            previous_opponent_manifest = opponent_bundle.ManifestPath();
+            std::string error;
+            if (!lan.StartClient(lan_address, uint16_t(requested_port),
+                                 std::move(package), lan_passphrase, error)) {
+              runtime_error = error;
+              wipe_package(local_client_package);
+            } else {
+              lan_bundle_swapped = false;
+              lan_model_installed = false;
+              lan_match_started = false;
+              runtime_error.clear();
+            }
+            wipe_package(package);
+          }
+        }
+        ImGui::EndDisabled();
+
+        ImGui::Spacing();
+        switch (session_state) {
+          case LanSession::State::Starting:
+            ImGui::TextColored(ui_amber, "Starting LAN transport..."); break;
+          case LanSession::State::Waiting:
+            ImGui::TextColored(ui_green, "Hosting on port %u; waiting for one player.",
+                               unsigned(lan.BoundPort()));
+            ImGui::TextWrapped("Share your PC's local IPv4 address, this port, and the session key. On Windows, allow CombatSim through the private-network firewall prompt.");
+            break;
+          case LanSession::State::PackageReady:
+            ImGui::TextColored(ui_amber, "Bot received. Validating CAD and building the shared MuJoCo model..."); break;
+          case LanSession::State::Ready:
+            ImGui::TextColored(ui_amber, "Your model is ready; waiting for the other PC to finish loading..."); break;
+          case LanSession::State::Connected:
+            ImGui::TextColored(ui_green, lan.GetRole() == LanSession::Role::Host
+              ? "Connected. You host physics and drive your bot with WASD; guest uses WASD for theirs."
+              : "Connected. Host runs physics; you drive your bot with WASD and Space.");
+            break;
+          case LanSession::State::Failed:
+            ImGui::TextColored(ui_red, "LAN session failed: %s", lan.Error().c_str()); break;
+          default:
+            ImGui::TextDisabled("No LAN session is active."); break;
+        }
+        if (lan_bundle_swapped || (session_state != LanSession::State::Idle &&
+            session_state != LanSession::State::Stopped)) {
+          if (ImGui::Button("End / reset LAN session", ImVec2(210.0f, 34.0f)))
+            end_lan_session();
+        }
+        ImGui::Separator();
+        ImGui::TextWrapped("CAD packages are encrypted in transit and received meshes are loaded in RAM without extracting files. This prevents ordinary bundle-file browsing; a determined peer can still inspect geometry from process memory or the rendered model, so it is not copy-proof or anti-cheat.");
+        ImGui::TextDisabled("For the first LAN version, both PCs must be on a reachable network. It does not relay through the internet or configure router port forwarding.");
+        if (!runtime_error.empty())
+          ImGui::TextColored(ui_red, "%s", runtime_error.c_str());
+        ImGui::SetCursorPosX(std::max(16.0f, ImGui::GetWindowWidth() - 112.0f));
+        if (ImGui::Button("Close", ImVec2(88.0f, 34.0f))) {
+          lan_popup_open = false;
+          ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+      }
+      ImGui::PopStyleColor(2);
+    }
     if (mixer_popup_requested) {
       mixer_popup_open = true;
       ImGui::OpenPopup("Controller mixer setup");
@@ -3904,43 +4985,10 @@ int main(int argc, char** argv) {
       } else if (setup_bundle->HasBundle()) runtime_error = setup_bundle->Error();
     }
     if (apply_requested) {
-      std::filesystem::path generated;
-      if (bundle.Generate(generated, opponent_bundle.HasBundle() ? &opponent_bundle : nullptr)) {
-        std::array<char, 8192> preview_error{};
-        mjModel* next_model = mj_loadXML(generated.string().c_str(), nullptr, preview_error.data(), preview_error.size());
-        mjData* next_data = next_model ? mj_makeData(next_model) : nullptr;
-        if (!next_data) {
-          runtime_error = next_model ? "MuJoCo could not allocate model data." : preview_error.data();
-          if (next_model) mj_deleteModel(next_model);
-        } else {
-          mj_forward(next_model, next_data);
-          mjr_freeContext(&context); mjv_freeScene(&scene);
-          mj_deleteData(data); mj_deleteModel(model);
-          model = next_model; data = next_data;
-          gizmo_drag_active = false; gizmo_drag_axis = -1;
-          model->vis.quality.offsamples = 0;
-          mjv_makeScene(model, &scene, 2000); mjr_makeContext(model, &context, mjFONTSCALE_100);
-          controls.left.clear(); controls.right.clear(); controls.weapon.clear();
-          controls.filtered_wheel_speeds.clear();
-          bundle.BindControls(model, controls.left, controls.right, controls.weapon,
-                              controls.motor_models, controls.weapon_motor_models,
-                              controls.manual_velocity_actuators,
-                              controls.battery_voltage);
-          controls.weapon_sign = 1.0; controls.weapon_command = 0.0;
-          opponent_controls.left.clear();
-          opponent_controls.right.clear();
-          opponent_controls.weapon.clear();
-          opponent_controls.filtered_wheel_speeds.clear();
-          opponent_bundle.BindControls(model, opponent_controls.left,
-              opponent_controls.right, opponent_controls.weapon,
-              opponent_controls.motor_models, opponent_controls.weapon_motor_models,
-              opponent_controls.manual_velocity_actuators,
-              opponent_controls.battery_voltage, true);
-          opponent_controls.weapon_sign = 1.0;
-          opponent_controls.weapon_command = 0.0;
-          accumulator = 0.0; paused = true; runtime_error.clear();
-        }
-      } else runtime_error = bundle.Error();
+      if (lan_bundle_swapped)
+        runtime_error = "End the LAN match before changing the shared bot model.";
+      else
+        rebuild_configured_model(false);
     }
     ImGui::Render(); ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     SDL_GL_SwapWindow(window);

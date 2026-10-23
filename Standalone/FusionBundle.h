@@ -3,6 +3,7 @@
 #include <mujoco/mujoco.h>
 #include <SDL3/SDL.h>
 #include <array>
+#include <cstdint>
 #include <filesystem>
 #include <mutex>
 #include <map>
@@ -43,6 +44,7 @@ struct CadPart {
   std::string name;
   std::string file;
   std::filesystem::path absolute_file;
+  std::vector<unsigned char> mesh_data;  // Present for bundles received in RAM.
   std::vector<std::string> occurrence_path;
   std::string material;
   std::string appearance;
@@ -69,6 +71,11 @@ struct CadPart {
   bool collision_enabled = true;
 };
 
+struct MemoryBundleAsset {
+  std::string name;
+  std::vector<unsigned char> bytes;
+};
+
 struct CadAssembly {
   std::string name;
   AssemblyKind kind = AssemblyKind::Fixed;
@@ -83,15 +90,21 @@ struct CadAssembly {
 
 class FusionBundle {
  public:
+  ~FusionBundle();
   bool Load(const std::filesystem::path& manifest);
+  bool ExportSessionPackage(std::vector<unsigned char>& package);
+  bool LoadSessionPackage(const std::vector<unsigned char>& package);
   bool Save();
   bool Generate(std::filesystem::path& output, const FusionBundle* opponent = nullptr);
+  bool GenerateInMemory(std::string& xml, std::vector<MemoryBundleAsset>& assets,
+                        const FusionBundle* opponent = nullptr);
   bool GeneratePreview(std::filesystem::path& output);
   bool SetForkCount(int count);
   bool AssemblyEnabled(int assembly) const;
   bool PartIncludedInSimulation(int part_index) const;
   DriveLayout WheelDriveLayout() const { return drive_layout_; }
   void SetWheelDriveLayout(DriveLayout layout);
+  bool ShowAxisMarkers() const { return show_axis_markers_; }
   const std::string& TwoWheelDriveAxle() const { return two_wd_axle_; }
   void SetTwoWheelDriveAxle(const std::string& axle);
   void Draw(SDL_Window* window, bool& load_requested, bool& apply_requested);
@@ -133,26 +146,36 @@ class FusionBundle {
                     std::map<int, int>& manual_velocity_actuators,
                     double& battery_voltage, bool opponent = false) const;
   void PickFace(int part_index, const std::array<double, 3>& cad_point);
-  void AddAxisMarkers(const mjModel* model, const mjData* data, mjvScene& scene) const;
+  void AddAxisMarkers(const mjModel* model, const mjData* data, mjvScene& scene,
+                      bool opponent = false) const;
   void AddSetupAxisMarkers(mjvScene& scene,
-                           std::array<double, 3> camera_position = {}) const;
+                           std::array<double, 3> camera_position = {},
+                           bool show_assembly_axes = true) const;
   bool HasBundle() const { return !parts_.empty(); }
   const std::string& Error() const { return error_; }
+  bool IsMemoryLoaded() const { return memory_loaded_; }
+  const std::filesystem::path& ManifestPath() const { return manifest_; }
+  void DiscardSessionMeshBuffers();
   const std::string& PickMessage() const { return pick_message_; }
   double& BatteryVoltage() { return battery_voltage_; }
+  double BotRotationDegrees() const { return bot_rotation_degrees_; }
 
  private:
   void DrawPart(size_t index);
   void DrawTree(const std::vector<std::string>& parent);
+  std::string SetupJson() const;
   std::array<double, 3> GroupCenter(int assembly) const;
   std::filesystem::path manifest_;
+  std::string manifest_json_;
   std::string design_name_;
   std::string error_;
   std::vector<CadPart> parts_;
   std::vector<CadAssembly> assemblies_;
   double battery_voltage_ = 0.0;
+  double bot_rotation_degrees_ = 0.0;
   DriveLayout drive_layout_ = DriveLayout::FourWheel;
   std::string two_wd_axle_ = "front";
+  bool show_axis_markers_ = true;
   char path_buffer_[1024]{};
   int selected_part_ = -1;
   int hovered_part_ = -1;
@@ -165,4 +188,12 @@ class FusionBundle {
   std::string fork_message_;
   std::mutex dialog_mutex_;
   std::string pending_path_;
+  bool memory_loaded_ = false;
+  bool LoadContent(const std::string& manifest_json,
+                   const std::filesystem::path& root,
+                   const std::map<std::string, std::vector<unsigned char>>* meshes,
+                   const std::string& setup_json);
+  bool GenerateImpl(std::filesystem::path* output, std::string* xml,
+                    std::vector<MemoryBundleAsset>* assets,
+                    const FusionBundle* opponent);
 };

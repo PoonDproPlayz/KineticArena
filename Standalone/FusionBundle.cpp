@@ -17,6 +17,7 @@
 #include <limits>
 #include <locale>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -26,6 +27,30 @@ using json = nlohmann::json;
 using Vec3 = std::array<double, 3>;
 using Quat = std::array<double, 4>;
 using Mat3 = std::array<double, 9>;
+
+void Wipe(std::vector<unsigned char>& bytes) {
+  volatile unsigned char* data = bytes.empty() ? nullptr : bytes.data();
+  for (size_t i = 0; i < bytes.size(); ++i) data[i] = 0;
+  bytes.clear();
+  bytes.shrink_to_fit();
+}
+
+void Wipe(std::string& value) {
+  volatile char* data = value.empty() ? nullptr : value.data();
+  for (size_t i = 0; i < value.size(); ++i) data[i] = 0;
+  value.clear();
+  value.shrink_to_fit();
+}
+
+void WipeParts(std::vector<CadPart>& parts) {
+  for (auto& part : parts) Wipe(part.mesh_data);
+  parts.clear();
+}
+
+void WipeMeshes(std::map<std::string, std::vector<unsigned char>>& meshes) {
+  for (auto& [name, bytes] : meshes) Wipe(bytes);
+  meshes.clear();
+}
 
 std::filesystem::path NativePath(const std::filesystem::path& value) {
 #if defined(_WIN32)
@@ -346,23 +371,22 @@ std::string TextInertia(const Mat3& value) {
          Number(value[1]) + " " + Number(value[2]) + " " + Number(value[5]);
 }
 
-void ReadStlBounds(const std::filesystem::path& path, double scale, Vec3 position, Quat rotation,
-                   Vec3& low, Vec3& high) {
-  std::ifstream file(path, std::ios::binary);
-  if (!file) throw std::runtime_error("Cannot read STL: " + path.string());
+void ReadStlBoundsStream(std::istream& file, const std::string& label,
+                         double scale, Vec3 position, Quat rotation,
+                         Vec3& low, Vec3& high) {
   file.seekg(0, std::ios::end);
   const auto bytes = file.tellg();
   file.seekg(80);
   uint32_t count = 0;
   file.read(reinterpret_cast<char*>(&count), 4);
   if (!file || count == 0 || bytes != std::streamoff(84) + std::streamoff(count) * 50)
-    throw std::runtime_error("Expected a nonempty binary STL: " + path.string());
+    throw std::runtime_error("Expected a nonempty binary STL: " + label);
   low.fill(std::numeric_limits<double>::infinity());
   high.fill(-std::numeric_limits<double>::infinity());
   for (uint32_t t = 0; t < count; ++t) {
     char triangle[50];
     file.read(triangle, sizeof(triangle));
-    if (!file) throw std::runtime_error("Truncated STL: " + path.string());
+    if (!file) throw std::runtime_error("Truncated STL: " + label);
     for (int v = 0; v < 3; ++v) {
       float xyz[3];
       std::memcpy(xyz, triangle + 12 + v * 12, 12);
@@ -372,17 +396,43 @@ void ReadStlBounds(const std::filesystem::path& path, double scale, Vec3 positio
   }
 }
 
+void ReadStlBounds(const std::filesystem::path& path, double scale, Vec3 position, Quat rotation,
+                   Vec3& low, Vec3& high) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file) throw std::runtime_error("Cannot read STL: " + path.string());
+  ReadStlBoundsStream(file, path.string(), scale, position, rotation, low, high);
+}
+
+void ReadStlBounds(const std::vector<unsigned char>& bytes, const std::string& label,
+                   double scale, Vec3 position, Quat rotation, Vec3& low, Vec3& high) {
+  const std::string contents(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  std::istringstream file(contents, std::ios::in | std::ios::binary);
+  ReadStlBoundsStream(file, label, scale, position, rotation, low, high);
+}
+
+std::unique_ptr<std::istream> OpenMesh(const CadPart& part) {
+  if (!part.mesh_data.empty()) {
+    const std::string contents(reinterpret_cast<const char*>(part.mesh_data.data()),
+                               part.mesh_data.size());
+    return std::make_unique<std::istringstream>(contents,
+                                                std::ios::in | std::ios::binary);
+  }
+  auto file = std::make_unique<std::ifstream>(part.absolute_file, std::ios::binary);
+  if (!*file) return {};
+  return file;
+}
+
 bool SnapToFeatureEdge(const CadPart& part, Vec3 hit, Vec3& midpoint) {
   struct Edge { Vec3 a, b, normal; int faces = 1; double min_dot = 1.0; };
   using Key = std::array<long long, 6>;
   std::map<Key, Edge> edges;
-  std::ifstream file(part.absolute_file, std::ios::binary);
+  auto file = OpenMesh(part);
   if (!file) return false;
-  file.seekg(80);
-  uint32_t count = 0; file.read(reinterpret_cast<char*>(&count), 4);
-  for (uint32_t t = 0; t < count && file; ++t) {
-    char triangle[50]; file.read(triangle, sizeof(triangle));
-    if (!file) break;
+  file->seekg(80);
+  uint32_t count = 0; file->read(reinterpret_cast<char*>(&count), 4);
+  for (uint32_t t = 0; t < count && *file; ++t) {
+    char triangle[50]; file->read(triangle, sizeof(triangle));
+    if (!*file) break;
     Vec3 v[3];
     std::array<long long, 3> key[3];
     for (int i = 0; i < 3; ++i) {
@@ -442,13 +492,13 @@ std::vector<std::vector<Vec3>> ReadFeatureLoops(const CadPart& part) {
   struct Edge { int faces = 0; Vec3 normal{}; double min_dot = 1; };
   std::map<EdgeKey, Edge> edges;
   std::map<Key, Vec3> positions;
-  std::ifstream file(part.absolute_file, std::ios::binary);
+  auto file = OpenMesh(part);
   if (!file) return {};
-  file.seekg(80);
-  uint32_t count = 0; file.read(reinterpret_cast<char*>(&count), 4);
-  for (uint32_t t = 0; t < count && file; ++t) {
-    char triangle[50]; file.read(triangle, sizeof(triangle));
-    if (!file) break;
+  file->seekg(80);
+  uint32_t count = 0; file->read(reinterpret_cast<char*>(&count), 4);
+  for (uint32_t t = 0; t < count && *file; ++t) {
+    char triangle[50]; file->read(triangle, sizeof(triangle));
+    if (!*file) break;
     Vec3 v[3]; Key keys[3];
     for (int i = 0; i < 3; ++i) {
       float xyz[3]; std::memcpy(xyz, triangle + 12 + i*12, 12);
@@ -691,14 +741,31 @@ double EstimateMotorSpinupSeconds(const MotorSpec& motor, double battery_voltage
 
 bool FusionBundle::Load(const std::filesystem::path& manifest) {
   try {
-    std::ifstream input(manifest);
+    std::ifstream input(manifest, std::ios::binary);
     if (!input) throw std::runtime_error("Cannot open manifest: " + manifest.string());
-    const json source = json::parse(input);
+    const std::string manifest_json{std::istreambuf_iterator<char>(input),
+                                    std::istreambuf_iterator<char>()};
+    return LoadContent(manifest_json, manifest.parent_path(), nullptr, {});
+  } catch (const std::exception& e) { error_ = e.what(); return false; }
+}
+
+FusionBundle::~FusionBundle() {
+  Clear();
+}
+
+bool FusionBundle::LoadContent(
+    const std::string& manifest_json, const std::filesystem::path& root,
+    const std::map<std::string, std::vector<unsigned char>>* meshes,
+    const std::string& setup_json) {
+  std::vector<CadPart> loaded;
+  try {
+    const bool from_memory = meshes != nullptr;
+    const json source = json::parse(manifest_json);
     if (!source.contains("parts") || !source.at("parts").is_array() || source.at("parts").empty())
       throw std::runtime_error("Manifest has no parts array.");
-    std::vector<CadPart> loaded;
     std::vector<std::string> missing;
-    const auto folder = std::filesystem::weakly_canonical(NativePath(manifest.parent_path()));
+    const auto folder = from_memory ? std::filesystem::path{} :
+      std::filesystem::weakly_canonical(NativePath(root));
     const double default_scale = source.value("unitToMeters", 0.001);
     for (const auto& item : source.at("parts")) {
       CadPart part;
@@ -710,40 +777,51 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
       const auto normalized_relative = relative_file.lexically_normal();
       if (normalized_relative.empty() || *normalized_relative.begin() == "..")
         throw std::runtime_error("Unsafe or unsupported mesh path: " + part.file);
-      const auto resolved_path = std::filesystem::weakly_canonical(
-        NativePath(folder / normalized_relative));
-      const auto relative = resolved_path.lexically_relative(folder);
-      if (relative.empty() || *relative.begin() == ".." || resolved_path.extension() != ".stl")
+      if (normalized_relative.extension() != ".stl")
         throw std::runtime_error("Unsafe or unsupported mesh path: " + part.file);
-      // weakly_canonical strips the Win32 extended-length prefix, so restore it
-      // before filesystem checks and all later STL reads.
-      const auto native_path = NativePath(resolved_path);
-      if (!std::filesystem::is_regular_file(native_path)) {
-        missing.push_back(part.file); continue;
-      }
-      part.absolute_file = resolved_path;
-#if defined(_WIN32)
-      if (resolved_path.native().size() > 240) {
-        const auto cache_id = MeshCacheId(manifest);
-        auto cached_path = ShortMeshCachePath(
-          folder / "Parts" / "_CombatSimCache" / cache_id, loaded.size());
-        try {
-          std::filesystem::create_directories(cached_path.parent_path());
-          std::filesystem::copy_file(native_path, cached_path,
-            std::filesystem::copy_options::overwrite_existing);
-        } catch (const std::filesystem::filesystem_error&) {
-          // Read-only bundles can still be imported; keep their copied meshes
-          // in the user's short system temp directory for this session.
-          cached_path = ShortMeshCachePath(
-            std::filesystem::temp_directory_path() / "CombatSim" / cache_id,
-            loaded.size());
-          std::filesystem::create_directories(cached_path.parent_path());
-          std::filesystem::copy_file(native_path, cached_path,
-            std::filesystem::copy_options::overwrite_existing);
+      if (from_memory) {
+        const std::string key = normalized_relative.generic_u8string();
+        const auto found = meshes->find(key);
+        if (found == meshes->end() || found->second.empty()) {
+          missing.push_back(part.file); continue;
         }
-        part.absolute_file = cached_path;
-      }
+        part.mesh_data = found->second;
+      } else {
+        const auto resolved_path = std::filesystem::weakly_canonical(
+          NativePath(folder / normalized_relative));
+        const auto relative = resolved_path.lexically_relative(folder);
+        if (relative.empty() || *relative.begin() == "..")
+          throw std::runtime_error("Unsafe or unsupported mesh path: " + part.file);
+        // weakly_canonical strips the Win32 extended-length prefix, so restore it
+        // before filesystem checks and all later STL reads.
+        const auto native_path = NativePath(resolved_path);
+        if (!std::filesystem::is_regular_file(native_path)) {
+          missing.push_back(part.file); continue;
+        }
+        part.absolute_file = resolved_path;
+#if defined(_WIN32)
+        if (resolved_path.native().size() > 240) {
+          const auto cache_id = MeshCacheId(root / "manifest.json");
+          auto cached_path = ShortMeshCachePath(
+            folder / "Parts" / "_CombatSimCache" / cache_id, loaded.size());
+          try {
+            std::filesystem::create_directories(cached_path.parent_path());
+            std::filesystem::copy_file(native_path, cached_path,
+              std::filesystem::copy_options::overwrite_existing);
+          } catch (const std::filesystem::filesystem_error&) {
+            // Read-only bundles can still be imported; keep their copied meshes
+            // in the user's short system temp directory for this session.
+            cached_path = ShortMeshCachePath(
+              std::filesystem::temp_directory_path() / "CombatSim" / cache_id,
+              loaded.size());
+            std::filesystem::create_directories(cached_path.parent_path());
+            std::filesystem::copy_file(native_path, cached_path,
+              std::filesystem::copy_options::overwrite_existing);
+          }
+          part.absolute_file = cached_path;
+        }
 #endif
+      }
       part.name = item.value("partName", std::string("Part"));
       part.material = item.value("materialName", std::string("Unknown"));
       part.appearance = item.value("appearanceName", std::string());
@@ -803,9 +881,15 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
       }
       if (item.contains("colorRgba") && item.at("colorRgba").is_array())
         part.color = ReadArray<4>(item, "colorRgba", part.color);
-      ReadStlBounds(part.absolute_file, part.scale, part.position, part.rotation,
-                    part.min_bound, part.max_bound);
       loaded.push_back(std::move(part));
+      CadPart& loaded_part = loaded.back();
+      if (from_memory)
+        ReadStlBounds(loaded_part.mesh_data, loaded_part.file, loaded_part.scale,
+                      loaded_part.position, loaded_part.rotation,
+                      loaded_part.min_bound, loaded_part.max_bound);
+      else
+        ReadStlBounds(loaded_part.absolute_file, loaded_part.scale, loaded_part.position,
+                      loaded_part.rotation, loaded_part.min_bound, loaded_part.max_bound);
     }
     if (!missing.empty()) {
       std::ostringstream message;
@@ -834,15 +918,28 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
     }
     const auto saved = folder / "combatsim_setup.json";
     battery_voltage_ = 0.0;
+    bot_rotation_degrees_ = 0.0;
     drive_layout_ = DriveLayout::FourWheel;
     two_wd_axle_ = "front";
     int saved_axis_assembly = 1;
+    bool saved_show_axis_markers = true;
     bool saved_drive_layout_defined = false;
-    if (std::filesystem::is_regular_file(saved)) {
-      std::ifstream state_stream(saved);
-      const json state = json::parse(state_stream);
+    std::ifstream disk_state_stream;
+    std::istringstream memory_state_stream(setup_json);
+    std::istream* state_stream = nullptr;
+    if (from_memory && !setup_json.empty()) state_stream = &memory_state_stream;
+    else if (!from_memory && std::filesystem::is_regular_file(saved)) {
+      disk_state_stream.open(saved);
+      state_stream = &disk_state_stream;
+    }
+    if (state_stream) {
+      const json state = json::parse(*state_stream);
       saved_axis_assembly = state.value("axisAssembly", 1);
+      saved_show_axis_markers = state.value("showAxisMarkers", true);
       battery_voltage_ = state.value("batteryVoltage", 0.0);
+      bot_rotation_degrees_ = state.value("botRotationDegrees", 0.0);
+      if (!std::isfinite(bot_rotation_degrees_)) bot_rotation_degrees_ = 0.0;
+      bot_rotation_degrees_ = std::clamp(bot_rotation_degrees_, -3600.0, 3600.0);
       const std::string saved_drive_layout = state.value("driveLayout", std::string());
       saved_drive_layout_defined = !saved_drive_layout.empty();
       drive_layout_ = saved_drive_layout == "2WD" ? DriveLayout::TwoWheel :
@@ -952,10 +1049,16 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
       drive_layout_ = wheel_groups <= 2 ? DriveLayout::TwoWheel : DriveLayout::FourWheel;
     }
     for (auto& part : loaded) if (part.assembly < -1 || part.assembly >= int(groups.size())) part.assembly = 0;
-    manifest_ = std::filesystem::weakly_canonical(manifest);
+    WipeParts(parts_);
+    Wipe(manifest_json_);
+    manifest_ = from_memory ? std::filesystem::path{} :
+      std::filesystem::weakly_canonical(root / "manifest.json");
+    manifest_json_ = manifest_json;
     design_name_ = source.value("designName", std::string("Fusion bot"));
     parts_ = std::move(loaded);
     assemblies_ = std::move(groups);
+    memory_loaded_ = from_memory;
+    show_axis_markers_ = saved_show_axis_markers;
     const auto path = manifest_.string();
     std::snprintf(path_buffer_, sizeof(path_buffer_), "%s", path.c_str());
     error_.clear();
@@ -974,7 +1077,11 @@ bool FusionBundle::Load(const std::filesystem::path& manifest) {
         }
     }
     return true;
-  } catch (const std::exception& e) { error_ = e.what(); return false; }
+  } catch (const std::exception& e) {
+    WipeParts(loaded);
+    error_ = e.what();
+    return false;
+  }
 }
 
 bool FusionBundle::AssemblyEnabled(int assembly) const {
@@ -1077,52 +1184,279 @@ void FusionBundle::SetWheelDriveLayout(DriveLayout layout) {
   }
 }
 
+bool FusionBundle::ExportSessionPackage(std::vector<unsigned char>& package) {
+  Wipe(package);
+  std::map<std::string, std::vector<unsigned char>> files;
+  std::string manifest_text;
+  std::string setup_text;
+  try {
+    if (!HasBundle()) throw std::runtime_error("Load a bot bundle before starting a session.");
+    constexpr uint64_t max_package_bytes = 512ull * 1024ull * 1024ull;
+    manifest_text = manifest_json_;
+    setup_text = SetupJson();
+    if (!memory_loaded_) {
+      std::ifstream manifest_file(manifest_, std::ios::binary);
+      if (!manifest_file) throw std::runtime_error("Cannot read the loaded manifest for LAN play.");
+      manifest_text.assign(std::istreambuf_iterator<char>(manifest_file),
+                           std::istreambuf_iterator<char>());
+    }
+    if (manifest_text.empty() || manifest_text.size() > 16u * 1024u * 1024u ||
+        setup_text.size() > 16u * 1024u * 1024u)
+      throw std::runtime_error("Manifest or setup exceeds the LAN package limit.");
+
+    const json manifest_source = json::parse(manifest_text);
+    if (!manifest_source.contains("parts") || !manifest_source.at("parts").is_array() ||
+        manifest_source.at("parts").empty() || manifest_source.at("parts").size() > 4096)
+      throw std::runtime_error("Manifest has an invalid part list for LAN play.");
+    auto safe_name = [](const std::string& input) {
+      const std::filesystem::path path(input);
+      if (input.empty() || path.is_absolute() || path.has_root_name() ||
+          path.has_root_directory())
+        throw std::runtime_error("Unsafe asset path in LAN package.");
+      const auto normalized = path.lexically_normal();
+      if (normalized.empty() || *normalized.begin() == ".." ||
+          normalized.extension() != ".stl")
+        throw std::runtime_error("Unsupported asset path in LAN package.");
+      return normalized.generic_u8string();
+    };
+    for (const auto& item : manifest_source.at("parts")) {
+      const std::string name = safe_name(item.at("file").get<std::string>());
+      if (files.count(name)) continue;
+      if (memory_loaded_) {
+        const auto part = std::find_if(parts_.begin(), parts_.end(), [&](const CadPart& value) {
+          return safe_name(value.file) == name;
+        });
+        if (part == parts_.end() || part->mesh_data.empty())
+          throw std::runtime_error("Session mesh is missing from memory: " + name);
+        files.emplace(name, part->mesh_data);
+      } else {
+        const auto part = std::find_if(parts_.begin(), parts_.end(), [&](const CadPart& value) {
+          return safe_name(value.file) == name;
+        });
+        if (part == parts_.end()) throw std::runtime_error("Manifest mesh was not loaded: " + name);
+        std::ifstream mesh(part->absolute_file, std::ios::binary);
+        if (!mesh) throw std::runtime_error("Cannot read mesh for LAN play: " + name);
+        std::vector<unsigned char> bytes{std::istreambuf_iterator<char>(mesh),
+                                         std::istreambuf_iterator<char>()};
+        if (bytes.empty()) throw std::runtime_error("Empty mesh cannot be sent: " + name);
+        files.emplace(name, std::move(bytes));
+      }
+    }
+
+    uint64_t total = 20u + manifest_text.size() + setup_text.size();
+    for (const auto& [name, bytes] : files) {
+      if (name.size() > 65535 || bytes.empty())
+        throw std::runtime_error("LAN package contains an invalid mesh entry.");
+      total += 10u + name.size() + bytes.size();
+    }
+    if (total > max_package_bytes)
+      throw std::runtime_error("Bot bundle exceeds the 512 MiB LAN session limit.");
+    package.clear();
+    package.reserve(size_t(total));
+    auto put_u32 = [&](uint32_t value) {
+      for (int i = 0; i < 4; ++i)
+        package.push_back(static_cast<unsigned char>(value >> (8 * i)));
+    };
+    auto put_u64 = [&](uint64_t value) {
+      for (int i = 0; i < 8; ++i)
+        package.push_back(static_cast<unsigned char>(value >> (8 * i)));
+    };
+    auto put_u16 = [&](uint16_t value) {
+      package.push_back(static_cast<unsigned char>(value));
+      package.push_back(static_cast<unsigned char>(value >> 8));
+    };
+    const unsigned char magic[8] = {'C','S','B','P','K','G','0','1'};
+    package.insert(package.end(), std::begin(magic), std::end(magic));
+    put_u32(uint32_t(manifest_text.size()));
+    put_u32(uint32_t(setup_text.size()));
+    put_u32(uint32_t(files.size()));
+    package.insert(package.end(), manifest_text.begin(), manifest_text.end());
+    package.insert(package.end(), setup_text.begin(), setup_text.end());
+    for (const auto& [name, bytes] : files) {
+      put_u16(uint16_t(name.size()));
+      put_u64(uint64_t(bytes.size()));
+      package.insert(package.end(), name.begin(), name.end());
+      package.insert(package.end(), bytes.begin(), bytes.end());
+    }
+    WipeMeshes(files);
+    Wipe(manifest_text);
+    Wipe(setup_text);
+    return true;
+  } catch (const std::exception& e) {
+    Wipe(package);
+    WipeMeshes(files);
+    Wipe(manifest_text);
+    Wipe(setup_text);
+    error_ = e.what();
+    return false;
+  }
+}
+
+bool FusionBundle::LoadSessionPackage(const std::vector<unsigned char>& package) {
+  std::map<std::string, std::vector<unsigned char>> meshes;
+  std::string manifest_text;
+  std::string setup_text;
+  try {
+    constexpr uint64_t max_package_bytes = 512ull * 1024ull * 1024ull;
+    constexpr unsigned char magic[8] = {'C','S','B','P','K','G','0','1'};
+    if (package.size() < 20 || package.size() > max_package_bytes ||
+        !std::equal(std::begin(magic), std::end(magic), package.begin()))
+      throw std::runtime_error("Invalid or oversized in-memory bot package.");
+    size_t offset = 8;
+    auto read_u32 = [&]() {
+      if (package.size() - offset < 4) throw std::runtime_error("Truncated LAN package header.");
+      uint32_t value = 0;
+      for (int i = 0; i < 4; ++i) value |= uint32_t(package[offset++]) << (8 * i);
+      return value;
+    };
+    auto read_u64 = [&]() {
+      if (package.size() - offset < 8) throw std::runtime_error("Truncated LAN package header.");
+      uint64_t value = 0;
+      for (int i = 0; i < 8; ++i) value |= uint64_t(package[offset++]) << (8 * i);
+      return value;
+    };
+    auto read_u16 = [&]() {
+      if (package.size() - offset < 2) throw std::runtime_error("Truncated LAN package entry.");
+      const uint16_t value = uint16_t(package[offset]) |
+                             uint16_t(uint16_t(package[offset + 1]) << 8);
+      offset += 2;
+      return value;
+    };
+    const uint32_t manifest_size = read_u32();
+    const uint32_t setup_size = read_u32();
+    const uint32_t file_count = read_u32();
+    if (!manifest_size || manifest_size > 16u * 1024u * 1024u ||
+        setup_size > 16u * 1024u * 1024u || file_count == 0 || file_count > 4096)
+      throw std::runtime_error("LAN package header exceeds its allowed limits.");
+    if (uint64_t(manifest_size) + setup_size > package.size() - offset)
+      throw std::runtime_error("Truncated manifest in LAN package.");
+    manifest_text.assign(package.begin() + offset,
+                         package.begin() + offset + manifest_size);
+    offset += manifest_size;
+    setup_text.assign(package.begin() + offset,
+                      package.begin() + offset + setup_size);
+    offset += setup_size;
+    auto safe_name = [](const std::string& input) {
+      const std::filesystem::path path(input);
+      if (input.empty() || path.is_absolute() || path.has_root_name() ||
+          path.has_root_directory())
+        throw std::runtime_error("Unsafe asset path in LAN package.");
+      const auto normalized = path.lexically_normal();
+      if (normalized.empty() || *normalized.begin() == ".." ||
+          normalized.extension() != ".stl" || normalized.generic_u8string() != input)
+        throw std::runtime_error("Unsupported asset path in LAN package.");
+      return normalized.generic_u8string();
+    };
+    uint64_t total_mesh_bytes = 0;
+    for (uint32_t i = 0; i < file_count; ++i) {
+      const uint16_t name_size = read_u16();
+      const uint64_t data_size = read_u64();
+      if (!name_size || name_size > 4096 || !data_size ||
+          data_size > max_package_bytes || name_size > package.size() - offset ||
+          data_size > package.size() - offset - name_size)
+        throw std::runtime_error("Invalid or truncated mesh entry in LAN package.");
+      const std::string raw_name(package.begin() + offset,
+                                 package.begin() + offset + name_size);
+      offset += name_size;
+      const std::string name = safe_name(raw_name);
+      if (meshes.count(name))
+        throw std::runtime_error("Duplicate mesh in LAN package.");
+      std::vector<unsigned char> bytes(package.begin() + offset,
+          package.begin() + offset + size_t(data_size));
+      offset += size_t(data_size);
+      total_mesh_bytes += data_size;
+      if (total_mesh_bytes > max_package_bytes)
+        throw std::runtime_error("Duplicate or oversized mesh in LAN package.");
+      meshes.emplace(name, std::move(bytes));
+    }
+    if (offset != package.size()) throw std::runtime_error("Unexpected trailing bytes in LAN package.");
+    const json manifest_source = json::parse(manifest_text);
+    if (!manifest_source.contains("parts") || !manifest_source.at("parts").is_array() ||
+        manifest_source.at("parts").empty() || manifest_source.at("parts").size() > 4096)
+      throw std::runtime_error("Manifest has an invalid part list for LAN play.");
+    std::set<std::string> required;
+    for (const auto& item : manifest_source.at("parts")) {
+      const std::filesystem::path path(item.at("file").get<std::string>());
+      if (path.empty() || path.is_absolute() || path.has_root_name() || path.has_root_directory())
+        throw std::runtime_error("Unsafe mesh path in LAN manifest.");
+      const auto normalized = path.lexically_normal();
+      if (normalized.empty() || *normalized.begin() == ".." || normalized.extension() != ".stl")
+        throw std::runtime_error("Unsupported mesh path in LAN manifest.");
+      required.insert(normalized.generic_u8string());
+    }
+    if (required.size() != meshes.size())
+      throw std::runtime_error("LAN package mesh list does not match its manifest.");
+    for (const auto& name : required)
+      if (!meshes.count(name)) throw std::runtime_error("LAN package is missing mesh: " + name);
+    const bool loaded = LoadContent(manifest_text, {}, &meshes, setup_text);
+    WipeMeshes(meshes);
+    Wipe(manifest_text);
+    Wipe(setup_text);
+    return loaded;
+  } catch (const std::exception& e) {
+    WipeMeshes(meshes);
+    Wipe(manifest_text);
+    Wipe(setup_text);
+    error_ = e.what();
+    return false;
+  }
+}
+
+std::string FusionBundle::SetupJson() const {
+  if (!HasBundle()) throw std::runtime_error("Load a Fusion manifest first.");
+  json state;
+  state["schemaVersion"] = 1;
+  state["designName"] = design_name_;
+  state["driveLayout"] = drive_layout_ == DriveLayout::TwoWheel ? "2WD" : "4WD";
+  state["twoWdAxle"] = two_wd_axle_;
+  state["axisAssembly"] = axis_assembly_;
+  state["showAxisMarkers"] = show_axis_markers_;
+  state["batteryVoltage"] = battery_voltage_;
+  state["botRotationDegrees"] = bot_rotation_degrees_;
+  state["assemblies"] = json::array();
+  for (size_t i = 1; i < assemblies_.size(); ++i) {
+    const auto& g = assemblies_[i];
+    state["assemblies"].push_back({{"name", g.name}, {"kind", KindLabel(g.kind)},
+                                    {"pivotMeters", g.pivot}, {"axis", g.axis},
+                                    {"forkRangeDegrees", g.fork_range_degrees},
+                                    {"forkCollidesWithFrame", g.fork_collides_with_frame},
+                                    {"wheelPosition", g.wheel_position},
+                                    {"motor", {
+                                      {"enabled", g.motor.enabled},
+                                      {"motorType", MotorTypeKey(g.motor.type)},
+                                      {"speedInput", MotorSpeedInputKey(g.motor.speed_input)},
+                                      {"driveGroup", g.motor.drive_group},
+                                      {"motorCount", g.motor.motor_count},
+                                      {"kvRpmPerVolt", g.motor.kv_rpm_per_volt},
+                                      {"ratedRpm", g.motor.rated_rpm},
+                                      {"ratedVoltage", g.motor.rated_voltage},
+                                      {"peakCurrentA", g.motor.peak_current_a},
+                                      {"phaseResistanceOhm", g.motor.phase_resistance_ohm},
+                                      {"armatureResistanceOhm", g.motor.phase_resistance_ohm},
+                                      {"escCurrentLimitA", g.motor.esc_current_limit_a},
+                                      {"gearRatio", g.motor.gear_ratio_text},
+                                      {"gearboxEfficiency", g.motor.gearbox_efficiency}}}});
+  }
+  state["partAssignments"] = json::object();
+  state["partOverrides"] = json::object();
+  for (const auto& part : parts_) {
+    state["partAssignments"][part.file] = part.assembly;
+    state["partOverrides"][part.file] = {{"massKg", part.mass},
+      {"frictionEstimate", part.friction}, {"colorRgba", part.color},
+      {"previewVisible", part.preview_visible},
+      {"collisionEnabled", part.collision_enabled}};
+  }
+  return state.dump(2);
+}
+
 bool FusionBundle::Save() {
   try {
-    if (!HasBundle()) throw std::runtime_error("Load a Fusion manifest first.");
-    json state;
-    state["schemaVersion"] = 1;
-    state["designName"] = design_name_;
-    state["driveLayout"] = drive_layout_ == DriveLayout::TwoWheel ? "2WD" : "4WD";
-    state["twoWdAxle"] = two_wd_axle_;
-    state["axisAssembly"] = axis_assembly_;
-    state["batteryVoltage"] = battery_voltage_;
-    state["assemblies"] = json::array();
-    for (size_t i = 1; i < assemblies_.size(); ++i) {
-      const auto& g = assemblies_[i];
-      state["assemblies"].push_back({{"name", g.name}, {"kind", KindLabel(g.kind)},
-                                      {"pivotMeters", g.pivot}, {"axis", g.axis},
-                                      {"forkRangeDegrees", g.fork_range_degrees},
-                                      {"forkCollidesWithFrame", g.fork_collides_with_frame},
-                                      {"wheelPosition", g.wheel_position},
-                                      {"motor", {
-                                        {"enabled", g.motor.enabled},
-                                        {"motorType", MotorTypeKey(g.motor.type)},
-                                        {"speedInput", MotorSpeedInputKey(g.motor.speed_input)},
-                                        {"driveGroup", g.motor.drive_group},
-                                        {"motorCount", g.motor.motor_count},
-                                        {"kvRpmPerVolt", g.motor.kv_rpm_per_volt},
-                                        {"ratedRpm", g.motor.rated_rpm},
-                                        {"ratedVoltage", g.motor.rated_voltage},
-                                        {"peakCurrentA", g.motor.peak_current_a},
-                                        {"phaseResistanceOhm", g.motor.phase_resistance_ohm},
-                                        {"armatureResistanceOhm", g.motor.phase_resistance_ohm},
-                                        {"escCurrentLimitA", g.motor.esc_current_limit_a},
-                                        {"gearRatio", g.motor.gear_ratio_text},
-                                        {"gearboxEfficiency", g.motor.gearbox_efficiency}}}});
-    }
-    state["partAssignments"] = json::object();
-    state["partOverrides"] = json::object();
-    for (const auto& part : parts_) {
-      state["partAssignments"][part.file] = part.assembly;
-      state["partOverrides"][part.file] = {{"massKg", part.mass},
-        {"frictionEstimate", part.friction}, {"colorRgba", part.color},
-        {"previewVisible", part.preview_visible},
-        {"collisionEnabled", part.collision_enabled}};
-    }
+    if (memory_loaded_)
+      throw std::runtime_error("Session-loaded CAD stays in memory and cannot be saved from the app.");
+    const std::string state = SetupJson();
     std::ofstream output(manifest_.parent_path() / "combatsim_setup.json", std::ios::trunc);
     if (!output) throw std::runtime_error("Cannot write combatsim_setup.json beside the manifest.");
-    output << state.dump(2) << '\n';
+    output << state << '\n';
     if (!output) throw std::runtime_error("Failed writing combatsim_setup.json.");
     error_.clear();
     return true;
@@ -1241,6 +1575,8 @@ double FusionBundle::PreviewDistance() const {
 bool FusionBundle::GeneratePreview(std::filesystem::path& output) {
   try {
     if (!HasBundle()) throw std::runtime_error("Load a Fusion manifest first.");
+    if (memory_loaded_)
+      throw std::runtime_error("Session-loaded CAD is kept in memory and has no disk preview.");
     std::ostringstream xml; xml.imbue(std::locale::classic());
     xml << "<mujoco model=\"CAD setup\"><asset>\n";
     for (size_t i = 0; i < parts_.size(); ++i) {
@@ -1267,8 +1603,42 @@ bool FusionBundle::GeneratePreview(std::filesystem::path& output) {
 }
 
 bool FusionBundle::Generate(std::filesystem::path& output, const FusionBundle* opponent) {
+  return GenerateImpl(&output, nullptr, nullptr, opponent);
+}
+
+bool FusionBundle::GenerateInMemory(std::string& xml,
+                                    std::vector<MemoryBundleAsset>& assets,
+                                    const FusionBundle* opponent) {
+  return GenerateImpl(nullptr, &xml, &assets, opponent);
+}
+
+bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_output,
+                                std::vector<MemoryBundleAsset>* assets,
+                                const FusionBundle* opponent) {
   try {
+    const bool memory_output = xml_output && assets;
+    if (memory_output == (output != nullptr))
+      throw std::runtime_error("Select either disk or in-memory model generation.");
+    if (memory_output) {
+      xml_output->clear();
+      assets->clear();
+    }
     if (!HasBundle()) throw std::runtime_error("Load a Fusion manifest first.");
+    auto asset_name = [memory_output](bool is_opponent, size_t index) {
+      return std::string(is_opponent ? "opponent_asset_" : "cad_asset_") +
+        std::to_string(index) + ".stl";
+    };
+    auto add_asset = [&](const std::string& name, const CadPart& part) {
+      if (!memory_output) return;
+      std::vector<unsigned char> bytes = part.mesh_data;
+      if (bytes.empty()) {
+        std::ifstream input(part.absolute_file, std::ios::binary);
+        if (!input) throw std::runtime_error("Cannot read mesh for in-memory model: " + part.file);
+        bytes.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+      }
+      if (bytes.empty()) throw std::runtime_error("Empty mesh for in-memory model: " + part.file);
+      assets->push_back({name, std::move(bytes)});
+    };
     for (size_t i = 0; i < parts_.size(); ++i)
       if (PartIncludedInSimulation(int(i)) && !ValidMass(parts_[i].mass))
         throw std::runtime_error("Set a positive mass for included body: " + parts_[i].name +
@@ -1291,35 +1661,53 @@ bool FusionBundle::Generate(std::filesystem::path& output, const FusionBundle* o
       Include(part.min_bound, low, high); Include(part.max_bound, low, high);
     }
     const Vec3 center = Mul(Add(low, high), 0.5);
-    const Quat player_heading = FacingQuaternion(NativeDriveHeading(parts_, assemblies_, *this), 0.0);
+    const Quat player_heading = FacingQuaternion(
+      NativeDriveHeading(parts_, assemblies_, *this),
+      bot_rotation_degrees_ * 3.14159265358979323846 / 180.0);
     const Vec3 rotated_center = Rotate(player_heading, center);
     const Vec3 spawn{-0.62 - rotated_center[0], -rotated_center[1], 0.012 - low[2]};
     std::ostringstream xml; xml.imbue(std::locale::classic());
     xml << "<mujoco model=\"" << Escape(design_name_) << "\">\n"
         << "<compiler angle=\"radian\" autolimits=\"true\"/>\n"
         << "<option timestep=\"0.0004\" gravity=\"0 0 -9.81\" integrator=\"implicitfast\"/>\n"
+        << "<visual><headlight ambient=\"0.12 0.12 0.12\" diffuse=\"0.07 0.07 0.07\" specular=\"0.008 0.008 0.008\"/></visual>\n"
         << "<asset>\n";
+    xml << "<material name=\"arena_floor_laminate\" rgba=\"0.84 0.83 0.79 1\" specular=\"0.06\" shininess=\"0.12\" reflectance=\"0\"/>\n";
     for (size_t i = 0; i < parts_.size(); ++i) if (PartIncludedInSimulation(int(i))) {
       const auto& part = parts_[i];
+      const std::string mesh_file = memory_output ? asset_name(false, i) :
+        AssetReference(part.absolute_file, manifest_.parent_path());
       xml << "<mesh name=\"cad_mesh_" << i << "\" file=\""
-          << Escape(AssetReference(part.absolute_file, manifest_.parent_path()))
+          << Escape(mesh_file)
           << "\" scale=\"" << Text({part.scale, part.scale, part.scale}) << "\"/>\n";
+      add_asset(mesh_file, part);
     }
     if (has_opponent) for (size_t i = 0; i < opponent->parts_.size(); ++i)
       if (opponent->PartIncludedInSimulation(int(i))) {
         const auto& part = opponent->parts_[i];
+        const std::string mesh_file = memory_output ? asset_name(true, i) :
+          AssetPath(part.absolute_file);
         xml << "<mesh name=\"opponent_mesh_" << i << "\" file=\""
-            << Escape(AssetPath(part.absolute_file))
+            << Escape(mesh_file)
             << "\" scale=\""
             << Text({part.scale, part.scale, part.scale}) << "\"/>\n";
+        add_asset(mesh_file, part);
       }
     xml << "</asset>\n<worldbody>\n"
-        << "<geom name=\"floor\" type=\"plane\" size=\"1 1 0.02\" friction=\"1.4 0.02 0.001\" rgba=\"0.18 0.22 0.27 1\"/>\n"
-        << "<geom name=\"north_wall\" type=\"box\" pos=\"0 1.05 0.5\" size=\"1.02 0.05 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.4 0.67 0.82 0.18\"/>\n"
-        << "<geom name=\"south_wall\" type=\"box\" pos=\"0 -1.05 0.5\" size=\"1.02 0.05 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.4 0.67 0.82 0.18\"/>\n"
-        << "<geom name=\"east_wall\" type=\"box\" pos=\"1.05 0 0.5\" size=\"0.05 1 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.4 0.67 0.82 0.18\"/>\n"
-        << "<geom name=\"west_wall\" type=\"box\" pos=\"-1.05 0 0.5\" size=\"0.05 1 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.4 0.67 0.82 0.18\"/>\n"
-        << "<geom name=\"roof\" type=\"box\" pos=\"0 0 1.01\" size=\"1.02 1.02 0.01\" rgba=\"0.4 0.67 0.82 0.12\"/>\n"
+        << "<light name=\"arena_key_light\" directional=\"true\" pos=\"0 0 2\" dir=\"0.3 -0.4 -1\" diffuse=\"0.88 0.85 0.78\" specular=\"0.08 0.08 0.08\" ambient=\"0.01 0.01 0.01\"/>\n"
+        << "<light name=\"arena_fill_light\" directional=\"true\" pos=\"0 0 2\" dir=\"-0.5 0.3 -1\" diffuse=\"0.42 0.48 0.54\" specular=\"0.015 0.015 0.015\" ambient=\"0.005 0.005 0.005\"/>\n"
+        << "<geom name=\"floor\" type=\"plane\" size=\"1 1 0.02\" material=\"arena_floor_laminate\" friction=\"1.4 0.02 0.001\"/>\n"
+        << "<!-- Hidden deep collision volumes catch fast impacts; the visible acrylic skins are 8 mm thick. -->\n"
+        << "<geom name=\"north_wall\" type=\"box\" pos=\"0 1.30 0.5\" size=\"1.02 0.30 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"south_wall\" type=\"box\" pos=\"0 -1.30 0.5\" size=\"1.02 0.30 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"east_wall\" type=\"box\" pos=\"1.30 0 0.5\" size=\"0.30 1.02 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"west_wall\" type=\"box\" pos=\"-1.30 0 0.5\" size=\"0.30 1.02 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"north_wall_acrylic\" type=\"box\" pos=\"0 1.004 0.5\" size=\"1 0.004 0.5\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.11\"/>\n"
+        << "<geom name=\"south_wall_acrylic\" type=\"box\" pos=\"0 -1.004 0.5\" size=\"1 0.004 0.5\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.11\"/>\n"
+        << "<geom name=\"east_wall_acrylic\" type=\"box\" pos=\"1.004 0 0.5\" size=\"0.004 1 0.5\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.11\"/>\n"
+        << "<geom name=\"west_wall_acrylic\" type=\"box\" pos=\"-1.004 0 0.5\" size=\"0.004 1 0.5\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.11\"/>\n"
+        << "<geom name=\"roof\" type=\"box\" pos=\"0 0 1.15\" size=\"1.02 1.02 0.15\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"roof_acrylic\" type=\"box\" pos=\"0 0 1.004\" size=\"1 1 0.004\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.07\"/>\n"
         << "<body name=\"Player_Robot\" pos=\"" << Text(spawn)
         << "\" quat=\"" << Text4(player_heading) << "\">\n"
         << "<freejoint name=\"robot_free\"/>\n"
@@ -1381,7 +1769,8 @@ bool FusionBundle::Generate(std::filesystem::path& output, const FusionBundle* o
       const auto opponent_frame = GroupMass(opponent->parts_, 0, opponent_origin);
       const Quat opponent_heading = FacingQuaternion(
         NativeDriveHeading(opponent->parts_, opponent->assemblies_, *opponent),
-        3.14159265358979323846);
+        3.14159265358979323846 +
+          opponent->bot_rotation_degrees_ * 3.14159265358979323846 / 180.0);
       xml << "<body name=\"Target_Robot\" pos=\"0.55 0 0.012\" quat=\""
           << Text4(opponent_heading) << "\">\n"
           << "<freejoint name=\"target_free\"/>\n"
@@ -1590,8 +1979,13 @@ bool FusionBundle::Generate(std::filesystem::path& output, const FusionBundle* o
       }
     }
     xml << "</actuator>\n</mujoco>\n";
-    output = manifest_.parent_path() / "combatsim_generated.xml";
-    std::ofstream file(output, std::ios::trunc);
+    if (memory_output) {
+      *xml_output = xml.str();
+      error_.clear();
+      return true;
+    }
+    *output = manifest_.parent_path() / "combatsim_generated.xml";
+    std::ofstream file(*output, std::ios::trunc);
     if (!file) throw std::runtime_error("Cannot write generated MJCF beside manifest.");
     file << xml.str();
     if (!file) throw std::runtime_error("Failed to write generated MJCF.");
@@ -1675,14 +2069,15 @@ void FusionBundle::PickFace(int part_index, const std::array<double, 3>& cad_poi
     pick_message_ = "Selected " + part.name + ". Assign it to a weapon or wheel assembly first.";
     return;
   }
-  std::ifstream file(part.absolute_file, std::ios::binary);
-  file.seekg(80);
-  uint32_t count = 0; file.read(reinterpret_cast<char*>(&count), 4);
+  auto file = OpenMesh(part);
+  if (!file) return;
+  file->seekg(80);
+  uint32_t count = 0; file->read(reinterpret_cast<char*>(&count), 4);
   double nearest = std::numeric_limits<double>::infinity();
   Vec3 center{};
-  for (uint32_t t = 0; t < count && file; ++t) {
-    char triangle[50]; file.read(triangle, sizeof(triangle));
-    if (!file) break;
+  for (uint32_t t = 0; t < count && *file; ++t) {
+    char triangle[50]; file->read(triangle, sizeof(triangle));
+    if (!*file) break;
     Vec3 sum{};
     for (int v = 0; v < 3; ++v) {
       float xyz[3]; std::memcpy(xyz, triangle + 12 + v*12, 12);
@@ -1860,14 +2255,15 @@ void FusionBundle::PickEdge(int part_index, const std::array<double, 3>& cad_poi
     pick_message_ = "Assign " + part.name + " to a rotating assembly first.";
     return;
   }
-  std::ifstream file(part.absolute_file, std::ios::binary);
-  file.seekg(80);
-  uint32_t count = 0; file.read(reinterpret_cast<char*>(&count), 4);
+  auto file = OpenMesh(part);
+  if (!file) return;
+  file->seekg(80);
+  uint32_t count = 0; file->read(reinterpret_cast<char*>(&count), 4);
   double nearest = std::numeric_limits<double>::infinity();
   Vec3 midpoint{}, direction{};
-  for (uint32_t t = 0; t < count && file; ++t) {
-    char triangle[50]; file.read(triangle, sizeof(triangle));
-    if (!file) break;
+  for (uint32_t t = 0; t < count && *file; ++t) {
+    char triangle[50]; file->read(triangle, sizeof(triangle));
+    if (!*file) break;
     Vec3 vertices[3];
     for (int v = 0; v < 3; ++v) {
       float xyz[3]; std::memcpy(xyz, triangle + 12 + v*12, 12);
@@ -1896,7 +2292,8 @@ void FusionBundle::PickEdge(int part_index, const std::array<double, 3>& cad_poi
   }
 }
 
-void FusionBundle::AddAxisMarkers(const mjModel* model, const mjData* data, mjvScene& scene) const {
+void FusionBundle::AddAxisMarkers(const mjModel* model, const mjData* data,
+                                  mjvScene& scene, bool opponent) const {
   auto append_geom = [&]() -> mjvGeom* {
     if (scene.ngeom >= scene.maxgeom || !scene.geoms || !scene.geomorder) return nullptr;
     const int index = scene.ngeom++;
@@ -1915,7 +2312,8 @@ void FusionBundle::AddAxisMarkers(const mjModel* model, const mjData* data, mjvS
     });
     if (!assigned) continue;
     if (assembly.kind == AssemblyKind::Fixed || scene.ngeom + 2 > scene.maxgeom) continue;
-    const std::string body_name = "cad_assembly_" + std::to_string(group);
+    const std::string body_name = (opponent ? "opponent_assembly_" : "cad_assembly_") +
+      std::to_string(group);
     const int body = mj_name2id(model, mjOBJ_BODY, body_name.c_str());
     if (body < 0) continue;
     const double axis_length = Length(assembly.axis);
@@ -1945,7 +2343,8 @@ void FusionBundle::AddAxisMarkers(const mjModel* model, const mjData* data, mjvS
 }
 
 void FusionBundle::AddSetupAxisMarkers(mjvScene& scene,
-                                       std::array<double, 3> camera_position) const {
+                                       std::array<double, 3> camera_position,
+                                       bool show_assembly_axes) const {
   auto append_geom = [&]() -> mjvGeom* {
     if (scene.ngeom >= scene.maxgeom || !scene.geoms || !scene.geomorder) return nullptr;
     const int index = scene.ngeom++;
@@ -2008,6 +2407,7 @@ void FusionBundle::AddSetupAxisMarkers(mjvScene& scene,
       mjv_connector(line, mjGEOM_LINE, 2, a, b);
     }
   }
+  if (!show_assembly_axes) return;
   for (size_t group = 1; group < assemblies_.size(); ++group) {
     if (!AssemblyEnabled(int(group))) continue;
     const auto& assembly = assemblies_[group];
@@ -2188,6 +2588,19 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
     return;
   }
   ImGui::TextWrapped("%s: %d STL bodies", design_name_.c_str(), int(parts_.size()));
+  if (ImGui::Button("Save setup")) Save();
+  ImGui::SameLine();
+  if (ImGui::Button("Apply and preview")) {
+    if (Save()) apply_requested = true;
+  }
+  ImGui::Checkbox("Show wheel, weapon and fork axis markers", &show_axis_markers_);
+  ImGui::SeparatorText("Bot orientation");
+  DrawMotorDoubleInput("Bot rotation about Z (deg)", &bot_rotation_degrees_, 1.0, 15.0, "%.1f");
+  if (!std::isfinite(bot_rotation_degrees_)) bot_rotation_degrees_ = 0.0;
+  bot_rotation_degrees_ = std::clamp(bot_rotation_degrees_, -3600.0, 3600.0);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Rotates the entire assembled bot around vertical Z. CAD body transforms, component assignments, and fitted wheel/weapon axes remain in their original CAD coordinates.");
+  ImGui::TextWrapped("This rotates the imported assembly as a whole; it does not rewrite the CAD-defined part or axis coordinates.");
   ImGui::SeparatorText("Bot powertrain");
   DrawMotorDoubleInput("Battery voltage (V)", &battery_voltage_, 0.1, 1.0, "%.2f");
   if (ImGui::IsItemHovered())
@@ -2431,11 +2844,6 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
   if (std::abs(total - included_mass) > 1e-8)
     ImGui::Text("Mass in current simulation: %.1f g", included_mass * 1000.0);
   if (total > 0.5) ImGui::TextWrapped("Assigned CAD mass exceeds the 500 g class. Check for duplicate CAD bodies or adjust overrides.");
-  if (ImGui::Button("Save setup")) Save();
-  ImGui::SameLine();
-  if (ImGui::Button("Apply and preview")) {
-    if (Save()) apply_requested = true;
-  }
   ImGui::SeparatorText("Rigid assemblies");
   ImGui::TextWrapped("Put each physical wheel in its own assembly with its tire, hub, motor, and fasteners. Keep front and rear wheels separate; every assembly gets one joint and one axis. Wheel drive direction is normalized from each selected axis.");
   int fork_count = ForkCount();
@@ -2535,8 +2943,12 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
         ImGui::InputScalarN("Travel min/max", ImGuiDataType_Double,
                             group.fork_range_degrees.data(), 2);
       }
-      ImGui::Text("Rotation center (meters)");
-      ImGui::InputScalarN("Center X/Y/Z", ImGuiDataType_Double, group.pivot.data(), 3);
+      ImGui::Text("Rotation center (mm)");
+      double pivot_mm[3] = {group.pivot[0] * 1000.0,
+                            group.pivot[1] * 1000.0,
+                            group.pivot[2] * 1000.0};
+      if (ImGui::InputScalarN("Center X/Y/Z", ImGuiDataType_Double, pivot_mm, 3))
+        for (int axis = 0; axis < 3; ++axis) group.pivot[axis] = pivot_mm[axis] * 0.001;
       ImGui::Text("Rotation axis (direction)");
       ImGui::InputScalarN("Axis X/Y/Z", ImGuiDataType_Double, group.axis.data(), 3);
       if (ImGui::SmallButton("Axis X")) group.axis = {1, 0, 0};
@@ -2562,15 +2974,22 @@ void FusionBundle::Clear() {
     std::lock_guard<std::mutex> lock(dialog_mutex_);
     pending_path_.clear();
   }
-  parts_.clear();
+  WipeParts(parts_);
   assemblies_.clear();
   manifest_.clear();
+  Wipe(manifest_json_);
+  memory_loaded_ = false;
   design_name_.clear();
   error_.clear();
   selected_part_ = hovered_part_ = -1;
   axis_picking_ = false;
   axis_points_.clear();
   hovered_loop_.clear();
+}
+
+void FusionBundle::DiscardSessionMeshBuffers() {
+  if (!memory_loaded_) return;
+  for (auto& part : parts_) Wipe(part.mesh_data);
 }
 
 void FusionBundle::DrawImporter(SDL_Window* window, bool& changed) {

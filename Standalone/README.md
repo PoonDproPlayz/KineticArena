@@ -40,7 +40,10 @@ CMake fetches SDL3 and Dear ImGui at configure time. `MUJOCO_ROOT` must contain
 The 0.4 ms model timestep is independent of display frame rate. The app opens
 to a Home screen with **Practice drive**, **Configure bot**, and **Controller
 mixing** buttons; a persistent top navigation bar switches between Home,
-Drive, and Bot workshop. Drive also has a **Controller mixer** button.
+Drive, and Bot workshop. **Arena settings** on Home adjusts ambient, key, fill,
+and camera lighting and selects either a face-to-face center-line spawn or
+opposite-diagonal spawn. These preferences save per user and apply on reset or
+model load. Drive also has a **Controller mixer** button.
 W/S drive and A/D turn the main bot; Space spins its weapon. I/K drive and J/L
 turn the opponent; M spins its weapon. A gamepad uses the left stick and left
 shoulder or south button to control the main bot. Controller mixing opens a setup window for
@@ -68,10 +71,17 @@ robot preview. Text wrapping and control widths stay fixed as either panel is
 resized; narrow panels clip content until widened. The layout updates when the
 resize handle is released.
 
-The arena stays at 2,500 Hz. Its transparent side walls now use a 10 cm thick
-collision volume, a 1 cm early contact margin, and a stiffer contact response;
-the inner wall faces remain at the same 2 m arena boundary. This reduces high
-speed penetration without spending four times more simulation work per second.
+The arena stays at 2,500 Hz. Its visible side skins are 8 mm clear acrylic;
+separate invisible collision volumes extend 60 cm outside each inner wall face
+to catch fast impacts without making the panels look like solid blue blocks.
+The roof has the same hidden catch volume. A 1 cm spawn margin keeps each
+robot's measured geometry clear of the walls, and Reset reapplies the selected
+center-line or diagonal layout. The floor uses a matte warm-white laminate
+material. Lighting defaults are subdued and migrate older brighter preferences
+once; the sliders remain available in Arena settings.
+
+Configure shows rotating-assembly axis centers in millimeters. Setup files
+continue to store `pivotMeters`, so existing saved bot setups remain compatible.
 
 ### Bot-specific motor torque
 
@@ -137,6 +147,11 @@ ratio and 100% efficiency are explicit assumptions. Efficiency can remain at
 estimated as 3.7 V times its cell count. These settings are saved in
 `combatsim_setup.json` with the bot. When the model is disabled, the assembly
 continues to use the legacy prescribed-speed actuator.
+
+Each bot's workshop also has a **Bot rotation about Z** setting. It rotates the
+assembled bot as one root transform; part coordinates, assignments, and fitted
+CAD axes stay in the original CAD frame. The arena floor is fully opaque in
+both the stock and Fusion-generated models.
 
 ## Import a Fusion bot
 
@@ -242,6 +257,51 @@ This generates the model beside the manifest, disables arena and opponent
 collisions for the test, then reports chassis yaw, each wheel's RPM, and its
 floor grip/slip status after one simulated second. It also reports chassis and
 fork floor contacts during the settling and powered portions separately.
+
+## Peer-to-peer LAN multiplayer
+
+Both players should load and configure a file-backed Fusion bot first. In
+CombatSim, open **LAN Multiplayer** from Home (or Drive), then:
+
+1. The host leaves the port at `29811`, clicks **Host match**, and shares the
+   displayed 32-character session key, port, and their local IPv4 address.
+   `ipconfig` in PowerShell shows the IPv4 address for the active Wi-Fi or
+   Ethernet adapter.
+2. The other player enters that address, the same port and session key, then
+   clicks **Join match**. Allow CombatSim through Windows Defender Firewall on
+   private networks if prompted.
+3. Both apps transfer the configured bot package, build the same MuJoCo model,
+   and start after both sides report ready. Each player drives their own bot
+   with W/A/S/D and spins its weapon with Space; a gamepad's left stick and
+   left shoulder or south button also work. The host owns the simulation and
+   sends physics snapshots to the joining PC. When testing both instances on
+   one PC, only the focused window reads local keyboard and gamepad input.
+   Drive shows the local player's wheel and weapon RPM telemetry. The joining
+   window reads telemetry for its own robot and shows its axis markers only
+   when that local bot's Configure checkbox is enabled.
+
+The bot package is sent over an AES-GCM encrypted TCP connection and imported
+from memory; the app does not extract received STL or manifest files. It clears
+temporary package buffers after loading and drops the extra in-memory STL copies
+once MuJoCo has compiled the model. The compiled model still contains the
+geometry needed to render and simulate the bot, so a determined opponent could
+inspect process memory or reconstruct geometry from the running model. This
+reduces casual file copying; it cannot guarantee CAD secrecy or prevent cheats.
+
+This first version connects directly to one reachable host. It has no internet
+relay, NAT traversal, router setup, or host migration. Both PCs need a network
+route between them. To test on one PC, start CombatSim twice, host in the first
+window, then join from the second using `127.0.0.1`, the same port, and the
+copied key. Each window should load a local bot first. The host can end the
+match at any time; the app then restores the local manifest-backed bot setup.
+
+The self-test runs two different synthetic bundles through localhost and checks
+the encrypted package exchange, shared model layout, readiness handshake,
+remote controls, state snapshots, wrong-key rejection, and the input timeout:
+
+```powershell
+python .\Standalone\tests\smoke_bundle.py .\Standalone\build\Release\CombatSimStandalone.exe
+```
 
 Main-frame geoms, fixed structural parts, and gravity-hinged or named fork
 geoms use an overdamped MuJoCo floor-contact response (`solref="0.02 2"`).
