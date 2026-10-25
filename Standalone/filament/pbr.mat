@@ -1,0 +1,39 @@
+material {
+    name : pbr,
+    shadingModel : lit,
+    culling : none,
+    flipUV : false,
+    parameters : [
+        { type : sampler2d, name : BaseColor },
+        { type : sampler2d, name : Normal },
+        { type : sampler2d, name : Metallic },
+        { type : sampler2d, name : Roughness },
+        { type : sampler2d, name : Occlusion },
+        { type : sampler2d, name : Emissive },
+        { type : float4, name : BaseColorFactor },
+        { type : float4, name : EmissiveFactor },
+        { type : float, name : SpecularFactor },
+        { type : float, name : MetallicFactor },
+        { type : float, name : RoughnessFactor }
+    ],
+    requires : [
+        uv0
+    ]
+}
+
+fragment {
+  void material(inout MaterialInputs material) {
+    vec2 uv = getUV0();
+    material.normal = texture(materialParams_Normal, uv).xyz * 2.0 - 1.0;
+    prepareMaterial(material);
+    material.baseColor = materialParams.BaseColorFactor;
+    material.baseColor *= texture(materialParams_BaseColor, uv);
+    material.ambientOcclusion = texture(materialParams_Occlusion, uv).r;
+    material.metallic = materialParams.MetallicFactor;
+    material.metallic *= texture(materialParams_Metallic, uv).r;
+    material.roughness = materialParams.RoughnessFactor;
+    material.roughness *= texture(materialParams_Roughness, uv).r;
+    material.emissive = materialParams.EmissiveFactor;
+    material.emissive.rgb += texture(materialParams_Emissive, uv).rgb;
+  }
+}

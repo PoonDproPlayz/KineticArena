@@ -1,9 +1,9 @@
 # CombatSim standalone prototype
 
 This native driving app loads the stock MJCF or a Fusion bot bundle directly. It
-uses MuJoCo 3.3.7's classic renderer, SDL3 for input/windowing, and Dear ImGui
-for the bot editor. Filament requires upgrading MuJoCo; that upgrade follows
-validation of this native import and physics path.
+uses MuJoCo 3.3.7's classic renderer by default, SDL3 for input/windowing, and
+Dear ImGui for the bot editor. An optional experimental Filament build uses
+MuJoCo 3.4.0 for PBR rendering; the classic build remains the default.
 
 ## Build on Windows
 
@@ -17,6 +17,41 @@ The script installs missing Git, CMake, and Visual Studio 2022 C++ Build Tools
 with WinGet, downloads MuJoCo 3.3.7, builds, then launches the app. It may
 request Windows administrator approval for the C++ tools. It is safe to rerun
 after an interrupted install. To build without launching, add `-NoRun`.
+
+### Experimental PBR renderer
+
+To build the optional Filament renderer and launch the same robot in it, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Standalone\build_filament.ps1
+```
+
+This fetches MuJoCo 3.4.0 and Filament and makes a separate build. The first
+build is large and can take several minutes. It does not replace the default
+3.3.7 build. Filament adds physically based materials, image-based reflections,
+and better light response; it is a real-time raster renderer rather than a
+ray-tracing renderer. Fusion roughness is used when supplied, and material
+names provide editable-style estimates for metallic surfaces and plastics.
+The simulator still uses the model's 0.4 ms (2,500 Hz) physics timestep and standard Earth gravity (`9.80665 m/s²` downward).
+Use `-NoRun` to build without opening the test scene.
+
+Home now has a **Settings** entry with separate **Arena settings** and
+**Graphics settings** pages. Graphics settings includes a Filament PBR checkbox.
+Switching renderers saves the selection and restarts with the matching build;
+build Filament once with the command above before selecting it. The selection
+persists when starting from `Run CombatSim.bat` or either renderer executable.
+
+To check the renderer and capture a frame from both the drive scene and the
+separate CAD-preview context, run:
+
+```powershell
+Standalone\filament-build\bin\Release\CombatSimStandalone.exe `
+  --test-filament-render Assets\CombatSim\Models\CombatRobot500g.xml `
+  "$env:TEMP\CombatSimFilamentPreview.bmp"
+```
+
+The smoke test exits nonzero if either render is blank or it cannot write the
+bitmap.
 
 After setup, double-click `Run CombatSim.bat` in the project root whenever you
 want to start the app. It builds changed source before launch, so it does not
@@ -40,11 +75,13 @@ CMake fetches SDL3 and Dear ImGui at configure time. `MUJOCO_ROOT` must contain
 The 0.4 ms model timestep is independent of display frame rate. The app opens
 to a Home screen with **Practice drive**, **Configure bot**, and **Controller
 mixing** buttons; a persistent top navigation bar switches between Home,
-Drive, and Bot workshop. **Arena settings** on Home sets the square arena side
-length in meters (0.75–10 m, default 2 m), adjusts ambient, key, fill, and
-camera lighting, and selects either a face-to-face center-line spawn or
-opposite-diagonal spawn. Choose the built-in Small, Standard, or Large preset,
-or save the current size under a custom preset name for later use. Custom
+Drive, and Bot workshop. **Settings** on Home separates **Arena settings** from
+**Graphics settings**. Arena settings sets the square arena side length in
+meters (0.75-10 m, default 2 m) and selects either a face-to-face center-line
+spawn or opposite-diagonal spawn. Graphics settings adjusts ambient, key, fill,
+and camera lighting and toggles between classic and Filament PBR rendering.
+Choose the built-in Small, Standard, or Large preset, or save the current size
+under a custom preset name for later use. Custom
 presets and arena settings save per user. Resizing updates the current floor,
 clear side panels, hidden collision walls, and spawn positions, then pauses and
 resets the bots. Drive also has a **Controller mixer** button.
@@ -161,11 +198,20 @@ both the stock and Fusion-generated models.
 ## Import a Fusion bot
 
 1. In Fusion 360, rerun `Fusion360Exporter/CombatSimExport.py` on the design.
-   It writes `manifest.json` and individual binary STLs in `Parts/` folders
-   that follow Fusion's occurrence tree. It exports per-body mass, density,
+   It writes `manifest.json`, a binary STL for selection/physics bounds, and a
+   render OBJ for each solid body in `Parts/` folders that follow Fusion's
+   occurrence tree. The OBJ keeps shared vertex normals and UV coordinates so
+   lighting stays smooth across tessellation triangles on a CAD surface.
+   Supported Fusion color, normal, and roughness image maps are copied into a
+   portable `Textures/` folder and assigned to the render material. Appearance
+   maps are resolved per body/occurrence; separate face-level appearance maps
+   within one body are not exported yet. It exports per-body mass, density,
    physical material name and available material properties, plus appearance
-   color and roughness where Fusion exposes them. A bundle from the old exporter
-   still loads, though it lacks the new tree and appearance fields.
+   color and roughness where Fusion exposes them. Old STL-only bundles still
+   load; MuJoCo now smooths their visual normals automatically, though they do
+   not contain UVs or bundled image maps. If the design has broken external
+   references, the exporter skips unavailable components, completes the rest,
+   and writes `export_warnings.txt` with the missing occurrence paths.
 2. Open the standalone app and choose **Configure bot** (or **Bot workshop** in
    the top navigation). Choose **Browse...** and select the bundle's
    `manifest.json`. The workshop presents the parts tree and configuration
@@ -229,8 +275,9 @@ offset from shaft** readout shows the radial offset that drives vibration at
 speed. Set the shaft center to the measured, physically balanced shaft
 location; changing the axis changes the simulated imbalance. Fusion's physical
 material data is kept for review; Fusion does not supply a universal contact
-friction value, so the friction estimate is editable. Complex appearance
-textures are not yet imported, and this build still uses the classic renderer.
+friction value, so the friction estimate is editable. The importer loads bundled
+Fusion color maps in the classic renderer. The optional Filament renderer also
+uses supported normal and roughness maps for PBR shading.
 
 To validate an import without opening a window:
 

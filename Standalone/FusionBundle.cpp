@@ -28,6 +28,8 @@ using Vec3 = std::array<double, 3>;
 using Quat = std::array<double, 4>;
 using Mat3 = std::array<double, 9>;
 
+bool RefreshPrintEstimate(CadPart& part);
+
 void Wipe(std::vector<unsigned char>& bytes) {
   volatile unsigned char* data = bytes.empty() ? nullptr : bytes.data();
   for (size_t i = 0; i < bytes.size(); ++i) data[i] = 0;
@@ -43,7 +45,11 @@ void Wipe(std::string& value) {
 }
 
 void WipeParts(std::vector<CadPart>& parts) {
-  for (auto& part : parts) Wipe(part.mesh_data);
+  for (auto& part : parts) {
+    Wipe(part.mesh_data);
+    Wipe(part.render_mesh_data);
+    for (auto& texture : part.textures) Wipe(texture.data);
+  }
   parts.clear();
 }
 
@@ -80,6 +86,58 @@ std::string AssetReference(const std::filesystem::path& value,
   const auto relative = value.lexically_relative(bundle_root);
   if (relative.empty() || *relative.begin() == "..") return AssetPath(value);
   return relative.generic_u8string();
+}
+
+bool IsBundleAssetPath(const std::filesystem::path& value) {
+  if (value.empty() || value.is_absolute() || value.has_root_name() ||
+      value.has_root_directory()) return false;
+  const auto normalized = value.lexically_normal();
+  if (normalized.empty() || *normalized.begin() == "..") return false;
+  std::string extension = normalized.extension().string();
+  std::transform(extension.begin(), extension.end(), extension.begin(),
+    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return extension == ".stl" || extension == ".obj" || extension == ".png" ||
+         extension == ".jpg" || extension == ".jpeg";
+}
+
+bool IsTextureRole(const std::string& role) {
+  return role == "rgb" || role == "normal" || role == "roughness";
+}
+
+bool HasTransparentAppearanceHint(const CadPart& part) {
+  std::string label = part.appearance + " " + part.material;
+  std::transform(label.begin(), label.end(), label.begin(),
+    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return label.find("transparent") != std::string::npos ||
+         label.find("translucent") != std::string::npos ||
+         label.find("glass") != std::string::npos ||
+         label.find("clear") != std::string::npos;
+}
+
+void RepairInvisibleOpaquePartColor(CadPart& part) {
+  if (part.color[3] <= 0.0 && part.mass > 0.0 &&
+      !HasTransparentAppearanceHint(part))
+    part.color[3] = 1.0;
+}
+
+const CadPart::Texture* FindTexture(const CadPart& part, const std::string& role) {
+  const auto found = std::find_if(part.textures.begin(), part.textures.end(),
+    [&](const CadPart::Texture& texture) { return texture.role == role; });
+  return found == part.textures.end() ? nullptr : &*found;
+}
+
+std::vector<std::string> ManifestAssetPaths(const json& parts) {
+  std::set<std::string> unique;
+  for (const auto& item : parts) {
+    unique.insert(item.at("file").get<std::string>());
+    if (item.contains("renderFile") && item.at("renderFile").is_string())
+      unique.insert(item.at("renderFile").get<std::string>());
+    if (item.contains("textures") && item.at("textures").is_object()) {
+      for (auto it = item.at("textures").begin(); it != item.at("textures").end(); ++it)
+        if (it.value().is_string()) unique.insert(it.value().get<std::string>());
+    }
+  }
+  return {unique.begin(), unique.end()};
 }
 
 std::string MeshCacheId(const std::filesystem::path& manifest) {
@@ -225,6 +283,307 @@ void DrawMotorDoubleInput(const char* label, double* value, double step,
   const std::string id = std::string("##") + label;
   ImGui::InputDouble(id.c_str(), value, step, step_fast, format);
 }
+
+const char* MassModeLabel(PartMassMode mode) {
+  switch (mode) {
+    case PartMassMode::Fusion: return "Fusion material mass";
+    case PartMassMode::Manual: return "Manual weight";
+    case PartMassMode::Printed: return "3D print estimate";
+  }
+  return "Fusion material mass";
+}
+
+const char* InfillPatternLabel(PrintInfillPattern pattern) {
+  switch (pattern) {
+    case PrintInfillPattern::Grid: return "Grid";
+    case PrintInfillPattern::Rectilinear: return "Rectilinear";
+    case PrintInfillPattern::Triangles: return "Triangles";
+    case PrintInfillPattern::Gyroid: return "Gyroid";
+    case PrintInfillPattern::Honeycomb: return "Honeycomb";
+    case PrintInfillPattern::Cubic: return "Cubic";
+    case PrintInfillPattern::Lightning: return "Lightning";
+  }
+  return "Grid";
+}
+
+const char* MassModeKey(PartMassMode mode) {
+  switch (mode) {
+    case PartMassMode::Fusion: return "fusion";
+    case PartMassMode::Manual: return "manual";
+    case PartMassMode::Printed: return "printed";
+  }
+  return "fusion";
+}
+
+PartMassMode ParseMassMode(const std::string& value) {
+  if (value == "manual") return PartMassMode::Manual;
+  if (value == "printed") return PartMassMode::Printed;
+  return PartMassMode::Fusion;
+}
+
+json PrintProfileJson(const PrintProfile& profile) {
+  return {{"name", profile.name},
+          {"layerHeightMm", profile.layer_height_mm},
+          {"firstLayerHeightMm", profile.first_layer_height_mm},
+          {"lineWidthMm", profile.line_width_mm},
+          {"wallLoops", profile.wall_loops},
+          {"topLayers", profile.top_layers},
+          {"bottomLayers", profile.bottom_layers},
+          {"topSurfaceDensityPercent", profile.top_surface_density_percent},
+          {"bottomSurfaceDensityPercent", profile.bottom_surface_density_percent},
+          {"infillDensityPercent", profile.infill_density_percent},
+          {"infillPattern", InfillPatternLabel(profile.infill_pattern)},
+          {"infillUsageMultiplier", profile.infill_usage_multiplier},
+          {"flowRatioPercent", profile.flow_ratio_percent}};
+}
+
+PrintProfile ReadPrintProfile(const json& node, PrintProfile fallback = {}) {
+  if (!node.is_object()) return fallback;
+  fallback.name = node.value("name", fallback.name);
+  fallback.layer_height_mm = node.value("layerHeightMm", fallback.layer_height_mm);
+  fallback.first_layer_height_mm = node.value(
+    "firstLayerHeightMm", fallback.first_layer_height_mm);
+  fallback.line_width_mm = node.value("lineWidthMm", fallback.line_width_mm);
+  fallback.wall_loops = node.value("wallLoops", fallback.wall_loops);
+  fallback.top_layers = node.value("topLayers", fallback.top_layers);
+  fallback.bottom_layers = node.value("bottomLayers", fallback.bottom_layers);
+  fallback.top_surface_density_percent = node.value(
+    "topSurfaceDensityPercent", fallback.top_surface_density_percent);
+  fallback.bottom_surface_density_percent = node.value(
+    "bottomSurfaceDensityPercent", fallback.bottom_surface_density_percent);
+  fallback.infill_density_percent = node.value(
+    "infillDensityPercent", fallback.infill_density_percent);
+  fallback.infill_usage_multiplier = node.value(
+    "infillUsageMultiplier", fallback.infill_usage_multiplier);
+  fallback.flow_ratio_percent = node.value("flowRatioPercent", fallback.flow_ratio_percent);
+  const std::string pattern = node.value("infillPattern", std::string("Grid"));
+  if (pattern == "Rectilinear") fallback.infill_pattern = PrintInfillPattern::Rectilinear;
+  else if (pattern == "Triangles") fallback.infill_pattern = PrintInfillPattern::Triangles;
+  else if (pattern == "Gyroid") fallback.infill_pattern = PrintInfillPattern::Gyroid;
+  else if (pattern == "Honeycomb") fallback.infill_pattern = PrintInfillPattern::Honeycomb;
+  else if (pattern == "Cubic") fallback.infill_pattern = PrintInfillPattern::Cubic;
+  else if (pattern == "Lightning") fallback.infill_pattern = PrintInfillPattern::Lightning;
+  else fallback.infill_pattern = PrintInfillPattern::Grid;
+  fallback.layer_height_mm = std::clamp(fallback.layer_height_mm, 0.04, 2.0);
+  fallback.first_layer_height_mm = std::clamp(fallback.first_layer_height_mm, 0.04, 2.0);
+  fallback.line_width_mm = std::clamp(fallback.line_width_mm, 0.1, 4.0);
+  fallback.wall_loops = std::clamp(fallback.wall_loops, 0, 20);
+  fallback.top_layers = std::clamp(fallback.top_layers, 0, 100);
+  fallback.bottom_layers = std::clamp(fallback.bottom_layers, 0, 100);
+  fallback.top_surface_density_percent = std::clamp(
+    fallback.top_surface_density_percent, 0.0, 100.0);
+  fallback.bottom_surface_density_percent = std::clamp(
+    fallback.bottom_surface_density_percent, 0.0, 100.0);
+  fallback.infill_density_percent = std::clamp(fallback.infill_density_percent, 0.0, 100.0);
+  fallback.infill_usage_multiplier = std::clamp(fallback.infill_usage_multiplier, 0.1, 3.0);
+  fallback.flow_ratio_percent = std::clamp(fallback.flow_ratio_percent, 50.0, 150.0);
+  return fallback;
+}
+
+std::filesystem::path PrintProfileLibraryPath() {
+  char* preference_path = SDL_GetPrefPath("CombatSim", "CombatSim");
+  if (!preference_path) return {};
+  const std::filesystem::path result =
+    std::filesystem::path(preference_path) / "print_profiles.json";
+  SDL_free(preference_path);
+  return result;
+}
+
+std::vector<PrintProfile>& PrintProfiles() {
+  static std::vector<PrintProfile> profiles;
+  static bool loaded = false;
+  if (loaded) return profiles;
+  loaded = true;
+  profiles.push_back(PrintProfile{});
+  try {
+    const auto path = PrintProfileLibraryPath();
+    std::ifstream input(path);
+    if (!input) return profiles;
+    const json saved = json::parse(input);
+    if (!saved.contains("profiles") || !saved.at("profiles").is_array()) return profiles;
+    std::vector<PrintProfile> parsed;
+    for (const auto& node : saved.at("profiles")) {
+      PrintProfile profile = ReadPrintProfile(node);
+      if (!profile.name.empty()) parsed.push_back(std::move(profile));
+    }
+    if (!parsed.empty()) profiles = std::move(parsed);
+  } catch (...) {
+    // Keep the built-in PLA profile if the settings file is absent or damaged.
+  }
+  return profiles;
+}
+
+bool SavePrintProfiles(std::string* error = nullptr) {
+  try {
+    const auto path = PrintProfileLibraryPath();
+    if (path.empty()) throw std::runtime_error("Could not locate the CombatSim preferences folder.");
+    std::filesystem::create_directories(path.parent_path());
+    json saved;
+    saved["schemaVersion"] = 1;
+    saved["profiles"] = json::array();
+    for (const auto& profile : PrintProfiles()) saved["profiles"].push_back(PrintProfileJson(profile));
+    std::ofstream output(path, std::ios::trunc);
+    if (!output) throw std::runtime_error("Could not save print profiles.");
+    output << saved.dump(2);
+    if (!output) throw std::runtime_error("Failed writing print profiles.");
+    return true;
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return false;
+  }
+}
+
+PrintProfile* FindPrintProfile(const std::string& name) {
+  auto& profiles = PrintProfiles();
+  const auto found = std::find_if(profiles.begin(), profiles.end(),
+    [&](const PrintProfile& profile) { return profile.name == name; });
+  return found == profiles.end() ? nullptr : &*found;
+}
+
+bool DrawProfileDouble(const char* label, double* value, double step,
+                       const char* format) {
+  ImGui::TextUnformatted(label);
+  ImGui::SetNextItemWidth(std::min(180.0f, ImGui::GetContentRegionAvail().x));
+  return ImGui::InputDouble((std::string("##") + label).c_str(), value, step,
+                            step * 10.0, format);
+}
+
+bool DrawProfileInt(const char* label, int* value) {
+  ImGui::TextUnformatted(label);
+  ImGui::SetNextItemWidth(std::min(180.0f, ImGui::GetContentRegionAvail().x));
+  return ImGui::InputInt((std::string("##") + label).c_str(), value);
+}
+
+void DrawPrintProfileManager() {
+  if (!ImGui::CollapsingHeader("3D print profile library")) return;
+  ImGui::PushID("print_profile_manager");
+  auto& profiles = PrintProfiles();
+  static int selected = 0;
+  static std::array<char, 128> name_buffer{};
+  static std::string last_name;
+  static std::string save_message;
+  if (profiles.empty()) profiles.push_back(PrintProfile{});
+  selected = std::clamp(selected, 0, int(profiles.size()) - 1);
+  if (ImGui::BeginCombo("Profile", profiles[selected].name.c_str())) {
+    for (size_t index = 0; index < profiles.size(); ++index)
+      if (ImGui::Selectable(profiles[index].name.c_str(), selected == int(index))) {
+        selected = int(index);
+        last_name.clear();
+      }
+    ImGui::EndCombo();
+  }
+  if (ImGui::Button("New profile")) {
+    PrintProfile profile;
+    profile.name = "New print profile";
+    int suffix = 2;
+    while (FindPrintProfile(profile.name))
+      profile.name = "New print profile " + std::to_string(suffix++);
+    profiles.push_back(profile);
+    selected = int(profiles.size()) - 1;
+    last_name.clear();
+    SavePrintProfiles(&save_message);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Duplicate profile")) {
+    PrintProfile duplicate = profiles[selected];
+    duplicate.name += " copy";
+    int suffix = 2;
+    const std::string base = duplicate.name;
+    while (FindPrintProfile(duplicate.name))
+      duplicate.name = base + " " + std::to_string(suffix++);
+    profiles.push_back(duplicate);
+    selected = int(profiles.size()) - 1;
+    last_name.clear();
+    SavePrintProfiles(&save_message);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Delete profile") && profiles.size() > 1) {
+    profiles.erase(profiles.begin() + selected);
+    selected = std::clamp(selected, 0, int(profiles.size()) - 1);
+    last_name.clear();
+    SavePrintProfiles(&save_message);
+  }
+  PrintProfile& profile = profiles[selected];
+  if (last_name != profile.name) {
+    std::snprintf(name_buffer.data(), name_buffer.size(), "%s", profile.name.c_str());
+    last_name = profile.name;
+  }
+  bool changed = false;
+  if (ImGui::InputText("Profile name", name_buffer.data(), name_buffer.size())) {
+    const std::string edited = name_buffer.data();
+    if (!edited.empty() && edited != profile.name) {
+      const bool duplicate = std::any_of(profiles.begin(), profiles.end(),
+        [&](const PrintProfile& other) {
+          return &other != &profile && other.name == edited;
+        });
+      if (!duplicate) {
+        profile.name = edited;
+        changed = true;
+      } else {
+        save_message = "Profile names must be unique.";
+      }
+    }
+  }
+  changed |= DrawProfileDouble("Layer height (mm)", &profile.layer_height_mm,
+    0.01, "%.3f");
+  changed |= DrawProfileDouble("First layer height (mm)",
+    &profile.first_layer_height_mm, 0.01, "%.3f");
+  changed |= DrawProfileDouble("Line width (mm)", &profile.line_width_mm,
+    0.01, "%.3f");
+  changed |= DrawProfileInt("Wall loops", &profile.wall_loops);
+  changed |= DrawProfileInt("Top solid layers", &profile.top_layers);
+  changed |= DrawProfileInt("Bottom solid layers", &profile.bottom_layers);
+  changed |= DrawProfileDouble("Top surface density (%)",
+    &profile.top_surface_density_percent, 1.0, "%.1f");
+  changed |= DrawProfileDouble("Bottom surface density (%)",
+    &profile.bottom_surface_density_percent, 1.0, "%.1f");
+  changed |= DrawProfileDouble("Sparse infill density (%)",
+    &profile.infill_density_percent, 1.0, "%.1f");
+  const char* pattern_label = InfillPatternLabel(profile.infill_pattern);
+  if (ImGui::BeginCombo("Infill pattern", pattern_label)) {
+    for (const auto pattern : {PrintInfillPattern::Grid,
+         PrintInfillPattern::Rectilinear, PrintInfillPattern::Triangles,
+         PrintInfillPattern::Gyroid, PrintInfillPattern::Honeycomb,
+         PrintInfillPattern::Cubic, PrintInfillPattern::Lightning})
+      if (ImGui::Selectable(InfillPatternLabel(pattern),
+                            pattern == profile.infill_pattern)) {
+        profile.infill_pattern = pattern;
+        changed = true;
+      }
+    ImGui::EndCombo();
+  }
+  double usage_percent = profile.infill_usage_multiplier * 100.0;
+  if (DrawProfileDouble("Infill usage correction (%)", &usage_percent,
+                        1.0, "%.0f")) {
+    profile.infill_usage_multiplier = usage_percent / 100.0;
+    changed = true;
+  }
+  changed |= DrawProfileDouble("Extrusion flow ratio (%)",
+    &profile.flow_ratio_percent, 1.0, "%.1f");
+  profile.layer_height_mm = std::clamp(profile.layer_height_mm, 0.04, 2.0);
+  profile.first_layer_height_mm = std::clamp(profile.first_layer_height_mm, 0.04, 2.0);
+  profile.line_width_mm = std::clamp(profile.line_width_mm, 0.1, 4.0);
+  profile.wall_loops = std::clamp(profile.wall_loops, 0, 20);
+  profile.top_layers = std::clamp(profile.top_layers, 0, 100);
+  profile.bottom_layers = std::clamp(profile.bottom_layers, 0, 100);
+  profile.top_surface_density_percent = std::clamp(
+    profile.top_surface_density_percent, 0.0, 100.0);
+  profile.bottom_surface_density_percent = std::clamp(
+    profile.bottom_surface_density_percent, 0.0, 100.0);
+  profile.infill_density_percent = std::clamp(profile.infill_density_percent, 0.0, 100.0);
+  profile.infill_usage_multiplier = std::clamp(profile.infill_usage_multiplier, 0.1, 3.0);
+  profile.flow_ratio_percent = std::clamp(profile.flow_ratio_percent, 50.0, 150.0);
+  if (changed) last_name = profile.name;
+  if (ImGui::Button("Save print profile")) {
+    if (SavePrintProfiles(&save_message)) save_message = "Profile saved.";
+  }
+  ImGui::SameLine();
+  ImGui::TextDisabled("Shared by both bots. Editing a preset does not change a part until you apply it.");
+  ImGui::TextDisabled("Material density comes from each body's Fusion export; presets change print structure only.");
+  if (!save_message.empty()) ImGui::TextWrapped("%s", save_message.c_str());
+  ImGui::TextWrapped("Printed mass uses an area-based shell estimate plus sparse infill. Pattern multipliers are approximate; the CAD collision surface stays unchanged.");
+  ImGui::PopID();
+}
 const char* KindLabel(AssemblyKind kind) {
   switch (kind) {
     case AssemblyKind::Frame: return "Frame";
@@ -303,6 +662,70 @@ std::string Lower(std::string value) {
   });
   return value;
 }
+struct ClassicSurface {
+  double specular;
+  double shininess;
+};
+ClassicSurface SurfaceForPart(const CadPart& part) {
+  const std::string label = Lower(part.material + " " + part.appearance);
+  ClassicSurface surface{0.38, 0.28};
+  auto has = [&](const char* token) { return label.find(token) != std::string::npos; };
+  if (has("silicone") || has("tpu") || has("rubber") || has("elastomer")) {
+    surface = {0.18, 0.12};
+  } else if (has("carbon") || has("fiber")) {
+    surface = {0.56, 0.42};
+  } else if (has("steel") || has("aluminum") || has("aluminium") || has("metal") ||
+             has("titanium") || has("copper") || has("brass") || has("bronze") ||
+             has("iron") || has("7075")) {
+    surface = {0.72, 0.58};
+  } else if (has("uhmw") || has("polyethylene") || has("nylon") || has("pa12") ||
+             has("abs") || has("plastic") || has("polymer") || has("acetal") ||
+             has("delrin") || has("polycarbonate")) {
+    surface = {0.34, 0.24};
+  } else if (has("wood") || has("mdf") || has("chipboard")) {
+    surface = {0.22, 0.14};
+  }
+
+  // Fusion's normalized surface roughness is useful to shape the classic
+  // renderer's Phong highlight, even though that renderer is not PBR.
+  if (std::isfinite(part.roughness) && part.roughness >= 0.0 && part.roughness <= 1.0) {
+    surface.specular *= 1.0 - 0.55 * part.roughness;
+    surface.shininess = std::clamp(0.88 - 0.82 * part.roughness, 0.06, 0.88);
+  }
+  return surface;
+}
+
+#if defined(COMBATSIM_USE_FILAMENT)
+struct PbrSurface {
+  double metallic = 0.0;
+  double roughness = 0.62;
+};
+
+PbrSurface PbrSurfaceForPart(const CadPart& part) {
+  const std::string label = Lower(part.material + " " + part.appearance);
+  PbrSurface surface;
+  auto has = [&](const char* token) { return label.find(token) != std::string::npos; };
+  if (has("steel") || has("aluminum") || has("aluminium") || has("metal") ||
+      has("titanium") || has("copper") || has("brass") || has("bronze") ||
+      has("iron") || has("7075")) {
+    surface = {0.82, 0.28};
+  } else if (has("silicone") || has("tpu") || has("rubber") || has("elastomer")) {
+    surface = {0.0, 0.82};
+  } else if (has("carbon") || has("fiber")) {
+    surface = {0.0, 0.48};
+  } else if (has("uhmw") || has("polyethylene") || has("nylon") || has("pa12") ||
+             has("abs") || has("plastic") || has("polymer") || has("acetal") ||
+             has("delrin") || has("polycarbonate")) {
+    surface = {0.0, 0.38};
+  } else if (has("wood") || has("mdf") || has("chipboard")) {
+    surface = {0.0, 0.78};
+  }
+  if (std::isfinite(part.roughness) && part.roughness >= 0.0 && part.roughness <= 1.0)
+    surface.roughness = part.roughness;
+  return surface;
+}
+#endif
+
 void Include(Vec3 point, Vec3& low, Vec3& high) {
   for (int i = 0; i < 3; ++i) { low[i] = std::min(low[i], point[i]); high[i] = std::max(high[i], point[i]); }
 }
@@ -420,6 +843,356 @@ std::unique_ptr<std::istream> OpenMesh(const CadPart& part) {
   auto file = std::make_unique<std::ifstream>(part.absolute_file, std::ios::binary);
   if (!*file) return {};
   return file;
+}
+
+Mat3 OuterProduct(Vec3 a, Vec3 b) {
+  return {a[0]*b[0], a[0]*b[1], a[0]*b[2],
+          a[1]*b[0], a[1]*b[1], a[1]*b[2],
+          a[2]*b[0], a[2]*b[1], a[2]*b[2]};
+}
+
+void AddScaled(Mat3& target, const Mat3& value, double scale) {
+  for (size_t i = 0; i < target.size(); ++i) target[i] += value[i] * scale;
+}
+
+double Trace(const Mat3& value) { return value[0] + value[4] + value[8]; }
+
+Mat3 InertiaFromSecondMoment(const Mat3& second) {
+  const double trace = Trace(second);
+  Mat3 inertia{};
+  for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j)
+    inertia[i*3+j] = (i == j ? trace : 0.0) - second[i*3+j];
+  return inertia;
+}
+
+std::array<double, 6> PackTensor(const Mat3& value) {
+  return {value[0], value[4], value[8], value[1], value[2], value[5]};
+}
+
+struct PrintTriangle {
+  Vec3 a{}, b{}, c{}, normal{};
+  double area = 0.0;
+};
+
+struct MeshVolumeProperties {
+  double volume = 0.0;
+  Vec3 center{};
+  Mat3 second_origin{};
+  Vec3 low{std::numeric_limits<double>::infinity(),
+           std::numeric_limits<double>::infinity(),
+           std::numeric_limits<double>::infinity()};
+  Vec3 high{-std::numeric_limits<double>::infinity(),
+            -std::numeric_limits<double>::infinity(),
+            -std::numeric_limits<double>::infinity()};
+  double signed_volume = 0.0;
+};
+
+bool ReadPrintMesh(const CadPart& part, std::vector<PrintTriangle>& triangles,
+                   MeshVolumeProperties& properties, std::string& error) {
+  auto file = OpenMesh(part);
+  if (!file) { error = "Cannot read this part's STL mesh."; return false; }
+  file->seekg(0, std::ios::end);
+  const std::streamoff bytes = file->tellg();
+  file->seekg(80);
+  uint32_t count = 0;
+  file->read(reinterpret_cast<char*>(&count), sizeof(count));
+  if (!*file || count == 0 || bytes != std::streamoff(84) + std::streamoff(count) * 50) {
+    error = "Print mass needs a nonempty binary STL for this part.";
+    return false;
+  }
+  triangles.clear();
+  triangles.reserve(count);
+  Vec3 first_moment{};
+  Mat3 second_origin{};
+  for (uint32_t index = 0; index < count; ++index) {
+    char bytes50[50];
+    file->read(bytes50, sizeof(bytes50));
+    if (!*file) { error = "The part's STL is truncated."; return false; }
+    Vec3 vertex[3];
+    for (int corner = 0; corner < 3; ++corner) {
+      float xyz[3];
+      std::memcpy(xyz, bytes50 + 12 + corner * 12, sizeof(xyz));
+      vertex[corner] = {double(xyz[0]) * part.scale,
+                        double(xyz[1]) * part.scale,
+                        double(xyz[2]) * part.scale};
+      Include(vertex[corner], properties.low, properties.high);
+    }
+    const Vec3 cross = Cross(Sub(vertex[1], vertex[0]), Sub(vertex[2], vertex[0]));
+    const double cross_length = Length(cross);
+    const double area = cross_length * 0.5;
+    if (area <= 1e-16) continue;
+    const Vec3 normal = Mul(cross, 1.0 / cross_length);
+    triangles.push_back({vertex[0], vertex[1], vertex[2], normal, area});
+
+    const double tetra_volume = Dot(vertex[0], Cross(vertex[1], vertex[2])) / 6.0;
+    properties.signed_volume += tetra_volume;
+    first_moment = Add(first_moment,
+      Mul(Add(Add(vertex[0], vertex[1]), vertex[2]), tetra_volume / 4.0));
+    Mat3 tetra_second = OuterProduct(vertex[0], vertex[0]);
+    AddScaled(tetra_second, OuterProduct(vertex[1], vertex[1]), 1.0);
+    AddScaled(tetra_second, OuterProduct(vertex[2], vertex[2]), 1.0);
+    const Vec3 sum = Add(Add(vertex[0], vertex[1]), vertex[2]);
+    AddScaled(tetra_second, OuterProduct(sum, sum), 1.0);
+    AddScaled(second_origin, tetra_second, tetra_volume / 20.0);
+  }
+  if (triangles.empty()) { error = "The part's STL has no usable triangles."; return false; }
+  const double orientation = properties.signed_volume < 0.0 ? -1.0 : 1.0;
+  properties.volume = std::abs(properties.signed_volume);
+  if (properties.volume > 1e-12) {
+    properties.center = Mul(first_moment, orientation / properties.volume);
+    for (double& value : second_origin) value *= orientation;
+  }
+  return true;
+}
+
+double InfillPatternFactor(PrintInfillPattern pattern) {
+  // Small corrections approximate common pattern path overlap/turning. Actual
+  // material usage depends on slicer version, line generator and geometry.
+  switch (pattern) {
+    case PrintInfillPattern::Grid: return 1.04;
+    case PrintInfillPattern::Rectilinear: return 1.0;
+    case PrintInfillPattern::Triangles: return 1.06;
+    case PrintInfillPattern::Gyroid: return 1.03;
+    case PrintInfillPattern::Honeycomb: return 1.10;
+    case PrintInfillPattern::Cubic: return 1.04;
+    case PrintInfillPattern::Lightning: return 0.62;
+  }
+  return 1.0;
+}
+
+bool EstimatePrintedMassProperties(const CadPart& part, const PrintProfile& profile,
+                                   Vec3 build_axis, double& mass, Vec3& center,
+                                   std::array<double, 6>& tensor, std::string& error) {
+  const double axis_length = Length(build_axis);
+  if (!std::isfinite(axis_length) || axis_length < 1e-8) {
+    error = "Choose a valid bed face or build direction.";
+    return false;
+  }
+  build_axis = Mul(build_axis, 1.0 / axis_length);
+  std::vector<PrintTriangle> triangles;
+  MeshVolumeProperties mesh;
+  if (!ReadPrintMesh(part, triangles, mesh, error)) return false;
+
+  double solid_volume = mesh.volume;
+  Vec3 solid_center = mesh.center;
+  Mat3 solid_second_origin = mesh.second_origin;
+  if (!(solid_volume > 1e-12) && part.volume_m3 > 1e-12) {
+    solid_volume = part.volume_m3;
+    solid_center = part.has_fusion_center_of_mass ? part.center_of_mass_local :
+      Mul(Add(mesh.low, mesh.high), 0.5);
+    Mat3 inertia_center{};
+    if (part.has_fusion_inertia_tensor && part.fusion_mass > 0.0) {
+      inertia_center = UnpackTensor(part.fusion_inertia_tensor);
+      for (double& value : inertia_center) value *= solid_volume / part.fusion_mass;
+    } else {
+      const Vec3 size = Sub(mesh.high, mesh.low);
+      inertia_center[0] = solid_volume * (size[1]*size[1] + size[2]*size[2]) / 12.0;
+      inertia_center[4] = solid_volume * (size[0]*size[0] + size[2]*size[2]) / 12.0;
+      inertia_center[8] = solid_volume * (size[0]*size[0] + size[1]*size[1]) / 12.0;
+    }
+    const Mat3 second_center = [&] {
+      Mat3 result{};
+      const double trace = Trace(inertia_center);
+      for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
+        result[row*3+col] = (row == col ? 0.5 * trace : 0.0) - inertia_center[row*3+col];
+      return result;
+    }();
+    solid_second_origin = second_center;
+    AddScaled(solid_second_origin, OuterProduct(solid_center, solid_center), solid_volume);
+  }
+  if (!(solid_volume > 1e-12) || !std::isfinite(solid_volume)) {
+    error = "Could not recover a closed solid volume from this STL; check the Fusion export.";
+    return false;
+  }
+  double material_density_kg_m3 = part.density;
+  if ((!std::isfinite(material_density_kg_m3) || material_density_kg_m3 <= 0.0) &&
+      part.fusion_mass > 0.0) {
+    // Older exporter bundles may contain Fusion mass and volume but omit the
+    // explicit density field. Recover the assigned Fusion material density.
+    const double fusion_volume = part.volume_m3 > 1e-12 ? part.volume_m3 : solid_volume;
+    material_density_kg_m3 = part.fusion_mass / fusion_volume;
+  }
+  if (!std::isfinite(material_density_kg_m3) || material_density_kg_m3 <= 0.0) {
+    error = "Fusion material density is missing. Assign a material with density in Fusion and re-export the body.";
+    return false;
+  }
+  if (part.has_fusion_center_of_mass && part.volume_m3 > 1e-12 &&
+      part.has_fusion_inertia_tensor && part.fusion_mass > 0.0) {
+    solid_volume = part.volume_m3;
+    solid_center = part.center_of_mass_local;
+    Mat3 inertia_center = UnpackTensor(part.fusion_inertia_tensor);
+    for (double& value : inertia_center) value *= solid_volume / part.fusion_mass;
+    Mat3 second_center{};
+    const double trace = Trace(inertia_center);
+    for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
+      second_center[row*3+col] = (row == col ? 0.5 * trace : 0.0) - inertia_center[row*3+col];
+    solid_second_origin = second_center;
+    AddScaled(solid_second_origin, OuterProduct(solid_center, solid_center), solid_volume);
+  }
+
+  const double wall_depth = profile.wall_loops * profile.line_width_mm * 0.001;
+  const double top_depth = profile.top_layers * profile.layer_height_mm * 0.001;
+  const double bottom_depth = profile.bottom_layers > 0 ?
+    (profile.first_layer_height_mm + (profile.bottom_layers - 1) *
+      profile.layer_height_mm) * 0.001 : 0.0;
+  double shell_geometry_volume = 0.0;
+  double shell_effective_volume = 0.0;
+  Vec3 shell_geometry_first{}, shell_effective_first{};
+  Mat3 shell_geometry_second{}, shell_effective_second{};
+  const double orientation = mesh.signed_volume < 0.0 ? -1.0 : 1.0;
+  for (const auto& triangle : triangles) {
+    Vec3 normal = Mul(triangle.normal, orientation);
+    const Vec3 face_center = Mul(Add(Add(triangle.a, triangle.b), triangle.c), 1.0 / 3.0);
+    const double axis_dot = Dot(normal, build_axis);
+    const double surface_fill = axis_dot > 0.70 ?
+      profile.top_surface_density_percent / 100.0 :
+      axis_dot < -0.70 ? profile.bottom_surface_density_percent / 100.0 : 1.0;
+    const double thickness = axis_dot > 0.70 ? top_depth :
+      axis_dot < -0.70 ? bottom_depth : wall_depth;
+    if (thickness <= 0.0) continue;
+    const double volume = triangle.area * thickness;
+    const Vec3 inner_center = Sub(face_center, Mul(normal, thickness * 0.5));
+    const Vec3 da = Sub(triangle.a, face_center);
+    const Vec3 db = Sub(triangle.b, face_center);
+    const Vec3 dc = Sub(triangle.c, face_center);
+    Mat3 covariance{};
+    AddScaled(covariance, OuterProduct(da, da), 1.0 / 12.0);
+    AddScaled(covariance, OuterProduct(db, db), 1.0 / 12.0);
+    AddScaled(covariance, OuterProduct(dc, dc), 1.0 / 12.0);
+    AddScaled(covariance, OuterProduct(normal, normal), thickness*thickness / 12.0);
+    shell_geometry_volume += volume;
+    shell_effective_volume += volume * surface_fill;
+    shell_geometry_first = Add(shell_geometry_first, Mul(inner_center, volume));
+    shell_effective_first = Add(shell_effective_first,
+      Mul(inner_center, volume * surface_fill));
+    Mat3 triangle_second = OuterProduct(inner_center, inner_center);
+    AddScaled(triangle_second, covariance, 1.0);
+    AddScaled(shell_geometry_second, triangle_second, volume);
+    AddScaled(shell_effective_second, triangle_second, volume * surface_fill);
+  }
+
+  // Area x shell thickness slightly overcounts corners and curved offsets.
+  // Cap the approximation to leave a small physical core for infill.
+  const double shell_cap = solid_volume * 0.95;
+  const double shell_scale = shell_geometry_volume > shell_cap && shell_geometry_volume > 0.0 ?
+    shell_cap / shell_geometry_volume : 1.0;
+  shell_geometry_volume *= shell_scale;
+  shell_effective_volume *= shell_scale;
+  shell_geometry_first = Mul(shell_geometry_first, shell_scale);
+  shell_effective_first = Mul(shell_effective_first, shell_scale);
+  for (double& value : shell_geometry_second) value *= shell_scale;
+  for (double& value : shell_effective_second) value *= shell_scale;
+
+  const double core_volume = std::max(0.0, solid_volume - shell_geometry_volume);
+  const double requested_density = profile.infill_density_percent / 100.0;
+  const double infill_fraction = std::clamp(requested_density *
+    profile.infill_usage_multiplier * InfillPatternFactor(profile.infill_pattern), 0.0, 1.0);
+  const double weighted_volume = shell_effective_volume + core_volume * infill_fraction;
+  if (!(weighted_volume > 1e-12)) {
+    error = "This profile has no walls, top/bottom layers, or infill, so its estimated mass is zero.";
+    return false;
+  }
+  const Vec3 full_first = Mul(solid_center, solid_volume);
+  const Vec3 weighted_first = Add(shell_effective_first,
+    Mul(Sub(full_first, shell_geometry_first), infill_fraction));
+  center = Mul(weighted_first, 1.0 / weighted_volume);
+
+  Mat3 weighted_second_origin = shell_effective_second;
+  Mat3 core_second_origin = solid_second_origin;
+  AddScaled(core_second_origin, shell_geometry_second, -1.0);
+  AddScaled(weighted_second_origin, core_second_origin, infill_fraction);
+  Mat3 second_center = weighted_second_origin;
+  AddScaled(second_center, OuterProduct(center, center), -weighted_volume);
+  Mat3 inertia_per_density = InertiaFromSecondMoment(second_center);
+  const double material_density = material_density_kg_m3 *
+    profile.flow_ratio_percent / 100.0;
+  Mat3 inertia = inertia_per_density;
+  for (double& value : inertia) value *= material_density;
+  mass = weighted_volume * material_density;
+  tensor = PackTensor(inertia);
+  if (!ValidInertia(tensor)) {
+    // Fallback to a scaled solid-body inertia if polygonal shell approximation
+    // makes a thin or open tessellation's residual core tensor non-positive.
+    Mat3 full_center_inertia = InertiaFromSecondMoment(solid_second_origin);
+    AddTensor(full_center_inertia, ParallelAxis(-solid_volume, solid_center));
+    for (double& value : full_center_inertia) value *= material_density * weighted_volume / solid_volume;
+    AddTensor(full_center_inertia, ParallelAxis(mass, Sub(solid_center, center)));
+    tensor = PackTensor(full_center_inertia);
+  }
+  if (!std::isfinite(mass) || mass <= 0.0 || !ValidInertia(tensor)) {
+    error = "The estimated print inertia is invalid for this mesh. Try another bed face or manual mass.";
+    return false;
+  }
+  return true;
+}
+
+bool RefreshPrintEstimate(CadPart& part) {
+  double mass = 0.0;
+  Vec3 center{};
+  std::array<double, 6> tensor{};
+  std::string error;
+  const bool valid = EstimatePrintedMassProperties(part, part.print_profile,
+    part.build_axis_local, mass, center, tensor, error);
+  part.print_estimate_valid = valid;
+  part.print_estimate_error = error;
+  if (valid) {
+    part.printed_mass = mass;
+    part.printed_center_local = center;
+    part.printed_inertia_tensor = tensor;
+  }
+  if (part.mass_mode == PartMassMode::Printed)
+    part.mass = valid ? mass : part.fusion_mass;
+  else if (part.mass_mode == PartMassMode::Manual)
+    part.mass = part.manual_mass;
+  else
+    part.mass = part.fusion_mass;
+  return valid;
+}
+
+Vec3 ClosestPointOnTriangle(Vec3 point, Vec3 a, Vec3 b, Vec3 c) {
+  const Vec3 ab = Sub(b, a), ac = Sub(c, a), ap = Sub(point, a);
+  const double d1 = Dot(ab, ap), d2 = Dot(ac, ap);
+  if (d1 <= 0.0 && d2 <= 0.0) return a;
+  const Vec3 bp = Sub(point, b);
+  const double d3 = Dot(ab, bp), d4 = Dot(ac, bp);
+  if (d3 >= 0.0 && d4 <= d3) return b;
+  const double vc = d1*d4 - d3*d2;
+  if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0)
+    return Add(a, Mul(ab, d1 / (d1 - d3)));
+  const Vec3 cp = Sub(point, c);
+  const double d5 = Dot(ab, cp), d6 = Dot(ac, cp);
+  if (d6 >= 0.0 && d5 <= d6) return c;
+  const double vb = d5*d2 - d1*d6;
+  if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0)
+    return Add(a, Mul(ac, d2 / (d2 - d6)));
+  const double va = d3*d6 - d5*d4;
+  if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
+    return Add(b, Mul(Sub(c, b), (d4 - d3) / ((d4 - d3) + (d5 - d6))));
+  const double denominator = 1.0 / (va + vb + vc);
+  return Add(a, Add(Mul(ab, vb * denominator), Mul(ac, vc * denominator)));
+}
+
+bool FindPrintBedAxis(const CadPart& part, Vec3 hit, Vec3& axis, std::string& error) {
+  std::vector<PrintTriangle> triangles;
+  MeshVolumeProperties mesh;
+  if (!ReadPrintMesh(part, triangles, mesh, error)) return false;
+  const Quat inverse{part.rotation[0], -part.rotation[1],
+                     -part.rotation[2], -part.rotation[3]};
+  const Vec3 local_hit = Rotate(inverse, Sub(hit, part.position));
+  double nearest = std::numeric_limits<double>::infinity();
+  const PrintTriangle* closest = nullptr;
+  for (const auto& triangle : triangles) {
+    const Vec3 point = ClosestPointOnTriangle(local_hit,
+      triangle.a, triangle.b, triangle.c);
+    const double distance = Dot(Sub(local_hit, point), Sub(local_hit, point));
+    if (distance < nearest) { nearest = distance; closest = &triangle; }
+  }
+  if (!closest) { error = "Could not find a mesh face at that preview location."; return false; }
+  axis = Mul(closest->normal, mesh.signed_volume < 0.0 ? 1.0 : -1.0);
+  const double length = Length(axis);
+  if (length < 1e-8) { error = "The selected STL face has no stable normal."; return false; }
+  axis = Mul(axis, 1.0 / length);
+  return true;
 }
 
 bool SnapToFeatureEdge(const CadPart& part, Vec3 hit, Vec3& midpoint) {
@@ -579,8 +1352,10 @@ MassProperties GroupMass(const std::vector<CadPart>& parts, int assembly, Vec3 o
     return assembly == -2 ? part.assembly >= 0 : part.assembly == assembly;
   };
   for (const auto& part : parts) if (included(part) && ValidMass(part.mass)) {
-    const Vec3 center = part.has_fusion_center_of_mass ?
-      part.center_of_mass : Mul(Add(part.min_bound, part.max_bound), 0.5);
+    const Vec3 center = part.mass_mode == PartMassMode::Printed && part.print_estimate_valid ?
+      Add(part.position, Rotate(part.rotation, part.printed_center_local)) :
+      (part.has_fusion_center_of_mass ? part.center_of_mass :
+       Mul(Add(part.min_bound, part.max_bound), 0.5));
     result.center = Add(result.center, Mul(center, part.mass));
     result.mass += part.mass;
   }
@@ -588,12 +1363,16 @@ MassProperties GroupMass(const std::vector<CadPart>& parts, int assembly, Vec3 o
   result.center = Mul(result.center, 1.0 / result.mass);
   const Vec3 inertia_center = result.center;
   for (const auto& part : parts) if (included(part) && ValidMass(part.mass)) {
-    const Vec3 center = part.has_fusion_center_of_mass ?
-      part.center_of_mass : Mul(Add(part.min_bound, part.max_bound), 0.5);
+    const Vec3 center = part.mass_mode == PartMassMode::Printed && part.print_estimate_valid ?
+      Add(part.position, Rotate(part.rotation, part.printed_center_local)) :
+      (part.has_fusion_center_of_mass ? part.center_of_mass :
+       Mul(Add(part.min_bound, part.max_bound), 0.5));
     const Vec3 offset = Sub(center, inertia_center);
     const double m = part.mass;
     Mat3 body_inertia{};
-    if (part.has_fusion_inertia_tensor && part.has_fusion_center_of_mass &&
+    if (part.mass_mode == PartMassMode::Printed && part.print_estimate_valid) {
+      body_inertia = RotateTensor(UnpackTensor(part.printed_inertia_tensor), part.rotation);
+    } else if (part.has_fusion_inertia_tensor && part.has_fusion_center_of_mass &&
         ValidMass(part.fusion_mass)) {
       const double mass_scale = m / part.fusion_mass;
       Mat3 local = UnpackTensor(part.fusion_inertia_tensor);
@@ -767,6 +1546,30 @@ bool FusionBundle::LoadContent(
     const auto folder = from_memory ? std::filesystem::path{} :
       std::filesystem::weakly_canonical(NativePath(root));
     const double default_scale = source.value("unitToMeters", 0.001);
+    auto load_companion = [&](const std::string& relative_name,
+                              std::vector<unsigned char>& data,
+                              std::filesystem::path& absolute_path) {
+      const std::filesystem::path relative(relative_name);
+      const auto normalized = relative.lexically_normal();
+      if (!IsBundleAssetPath(relative) || normalized.generic_u8string() != relative_name)
+        throw std::runtime_error("Unsafe or unsupported bundle asset path: " + relative_name);
+      if (from_memory) {
+        const auto found = meshes->find(normalized.generic_u8string());
+        if (found == meshes->end() || found->second.empty()) {
+          missing.push_back(relative_name);
+          return;
+        }
+        data = found->second;
+        return;
+      }
+      const auto resolved = std::filesystem::weakly_canonical(NativePath(folder / normalized));
+      const auto inside = resolved.lexically_relative(folder);
+      if (inside.empty() || *inside.begin() == "..")
+        throw std::runtime_error("Unsafe bundle asset path: " + relative_name);
+      absolute_path = resolved;
+      if (!std::filesystem::is_regular_file(NativePath(resolved)))
+        missing.push_back(relative_name);
+    };
     for (const auto& item : source.at("parts")) {
       CadPart part;
       part.file = item.at("file").get<std::string>();
@@ -822,6 +1625,23 @@ bool FusionBundle::LoadContent(
         }
 #endif
       }
+      part.render_file = item.value("renderFile", part.file);
+      if (part.render_file == part.file) {
+        part.absolute_render_file = part.absolute_file;
+      } else {
+        load_companion(part.render_file, part.render_mesh_data, part.absolute_render_file);
+      }
+      if (item.contains("textures") && item.at("textures").is_object()) {
+        for (auto it = item.at("textures").begin(); it != item.at("textures").end(); ++it) {
+          if (!it.value().is_string() || !IsTextureRole(it.key()))
+            throw std::runtime_error("Manifest has an invalid Fusion texture entry.");
+          CadPart::Texture texture;
+          texture.role = it.key();
+          texture.file = it.value().get<std::string>();
+          load_companion(texture.file, texture.data, texture.absolute_file);
+          part.textures.push_back(std::move(texture));
+        }
+      }
       part.name = item.value("partName", std::string("Part"));
       part.material = item.value("materialName", std::string("Unknown"));
       part.appearance = item.value("appearanceName", std::string());
@@ -846,6 +1666,13 @@ bool FusionBundle::LoadContent(
       if (part.mass <= 0 && item.contains("volumeM3") && part.density > 0)
         part.mass = item.at("volumeM3").get<double>() * part.density;
       part.fusion_mass = part.mass;
+      part.manual_mass = part.mass;
+      part.volume_m3 = item.value("volumeM3", 0.0);
+      if ((!std::isfinite(part.density) || part.density <= 0.0) &&
+          part.volume_m3 > 1e-12 && part.fusion_mass > 0.0)
+        part.density = part.fusion_mass / part.volume_m3;
+      const auto& print_profiles = PrintProfiles();
+      if (!print_profiles.empty()) part.print_profile = print_profiles.front();
       part.friction = item.value("frictionEstimate", 0.0);
       if (part.friction <= 0) part.friction = 0.6;
       part.scale = item.value("unitToMeters", default_scale);
@@ -869,6 +1696,7 @@ bool FusionBundle::LoadContent(
         const Vec3 local_center = ReadArray<3>(item, "centerOfMassLocalMeters", {});
         if (std::all_of(local_center.begin(), local_center.end(),
                         [](double value) { return std::isfinite(value); })) {
+          part.center_of_mass_local = local_center;
           part.center_of_mass = Add(part.position, Rotate(part.rotation, local_center));
           part.has_fusion_center_of_mass = true;
         }
@@ -881,6 +1709,9 @@ bool FusionBundle::LoadContent(
       }
       if (item.contains("colorRgba") && item.at("colorRgba").is_array())
         part.color = ReadArray<4>(item, "colorRgba", part.color);
+      // Some Fusion opaque appearances export their base color with alpha 0,
+      // even though the physical body has mass and should render opaque.
+      RepairInvisibleOpaquePartColor(part);
       loaded.push_back(std::move(part));
       CadPart& loaded_part = loaded.back();
       if (from_memory)
@@ -893,7 +1724,7 @@ bool FusionBundle::LoadContent(
     }
     if (!missing.empty()) {
       std::ostringstream message;
-      message << "Fusion bundle is incomplete. Missing " << missing.size() << " STL files:\n";
+      message << "Fusion bundle is incomplete. Missing " << missing.size() << " asset files:\n";
       for (const auto& file : missing) message << file << '\n';
       throw std::runtime_error(message.str());
     }
@@ -1014,12 +1845,30 @@ bool FusionBundle::LoadContent(
         const auto& overrides = state.at("partOverrides");
         for (auto& part : loaded) if (overrides.contains(part.file)) {
           const auto& override = overrides.at(part.file);
-          part.mass = override.value("massKg", part.mass);
+          const double legacy_mass = override.value("massKg", part.mass);
+          part.manual_mass = override.value("manualMassKg", legacy_mass);
+          if (override.contains("massMode"))
+            part.mass_mode = ParseMassMode(override.value("massMode", std::string("fusion")));
+          else if (std::abs(legacy_mass - part.fusion_mass) > 1e-9)
+            part.mass_mode = PartMassMode::Manual;
+          if (override.contains("buildAxisLocal") && override.at("buildAxisLocal").is_array())
+            part.build_axis_local = ReadArray<3>(override, "buildAxisLocal", part.build_axis_local);
+          if (override.contains("printProfile") && override.at("printProfile").is_object())
+            part.print_profile = ReadPrintProfile(override.at("printProfile"));
           part.friction = override.value("frictionEstimate", part.friction);
           part.color = ReadArray<4>(override, "colorRgba", part.color);
           part.preview_visible = override.value("previewVisible", true);
           part.collision_enabled = override.value("collisionEnabled", part.collision_enabled);
         }
+      }
+      // Older saved setups can contain the same zero-alpha color as the
+      // manifest. Repair after applying overrides so reloading a configured
+      // bot cannot make opaque UHMW or rubber parts invisible again.
+      for (auto& part : loaded) {
+        RepairInvisibleOpaquePartColor(part);
+        if (part.mass_mode == PartMassMode::Printed) RefreshPrintEstimate(part);
+        else if (part.mass_mode == PartMassMode::Manual) part.mass = part.manual_mass;
+        else part.mass = part.fusion_mass;
       }
     }
     // Keep legacy wheel sets usable: infer axle position from old assembly names,
@@ -1062,8 +1911,11 @@ bool FusionBundle::LoadContent(
     const auto path = manifest_.string();
     std::snprintf(path_buffer_, sizeof(path_buffer_), "%s", path.c_str());
     error_.clear();
-    selected_part_ = -1; hovered_part_ = -1; hovered_loop_.clear(); hole_cache_.clear();
+    selected_part_ = focus_part_request_ = -1;
+    focus_frames_remaining_ = 0;
+    hovered_part_ = -1; hovered_loop_.clear(); hole_cache_.clear();
     pick_message_.clear(); axis_points_.clear(); axis_picking_ = false;
+    print_bed_face_picking_ = false; print_bed_face_part_ = -1;
     axis_assembly_ = (saved_axis_assembly > 0 &&
                       saved_axis_assembly < int(assemblies_.size()) &&
                       assemblies_[saved_axis_assembly].kind != AssemblyKind::Fixed &&
@@ -1214,31 +2066,47 @@ bool FusionBundle::ExportSessionPackage(std::vector<unsigned char>& package) {
           path.has_root_directory())
         throw std::runtime_error("Unsafe asset path in LAN package.");
       const auto normalized = path.lexically_normal();
-      if (normalized.empty() || *normalized.begin() == ".." ||
-          normalized.extension() != ".stl")
+      if (!IsBundleAssetPath(path) || normalized.generic_u8string() != input)
         throw std::runtime_error("Unsupported asset path in LAN package.");
       return normalized.generic_u8string();
     };
-    for (const auto& item : manifest_source.at("parts")) {
-      const std::string name = safe_name(item.at("file").get<std::string>());
+    for (const auto& raw_name : ManifestAssetPaths(manifest_source.at("parts"))) {
+      const std::string name = safe_name(raw_name);
       if (files.count(name)) continue;
       if (memory_loaded_) {
-        const auto part = std::find_if(parts_.begin(), parts_.end(), [&](const CadPart& value) {
-          return safe_name(value.file) == name;
-        });
-        if (part == parts_.end() || part->mesh_data.empty())
-          throw std::runtime_error("Session mesh is missing from memory: " + name);
-        files.emplace(name, part->mesh_data);
+        bool found_asset = false;
+        for (const auto& part : parts_) {
+          if (safe_name(part.file) == name && !part.mesh_data.empty()) {
+            files.emplace(name, part.mesh_data); found_asset = true; break;
+          }
+          if (safe_name(part.render_file) == name && !part.render_mesh_data.empty()) {
+            files.emplace(name, part.render_mesh_data); found_asset = true; break;
+          }
+          for (const auto& texture : part.textures) {
+            if (safe_name(texture.file) == name && !texture.data.empty()) {
+              files.emplace(name, texture.data); found_asset = true; break;
+            }
+          }
+          if (found_asset) break;
+        }
+        if (!found_asset)
+          throw std::runtime_error("Session asset is missing from memory: " + name);
       } else {
-        const auto part = std::find_if(parts_.begin(), parts_.end(), [&](const CadPart& value) {
-          return safe_name(value.file) == name;
-        });
-        if (part == parts_.end()) throw std::runtime_error("Manifest mesh was not loaded: " + name);
-        std::ifstream mesh(part->absolute_file, std::ios::binary);
-        if (!mesh) throw std::runtime_error("Cannot read mesh for LAN play: " + name);
+        std::filesystem::path asset_path;
+        for (const auto& part : parts_) {
+          if (safe_name(part.file) == name) { asset_path = part.absolute_file; break; }
+          if (safe_name(part.render_file) == name) { asset_path = part.absolute_render_file; break; }
+          for (const auto& texture : part.textures) {
+            if (safe_name(texture.file) == name) { asset_path = texture.absolute_file; break; }
+          }
+          if (!asset_path.empty()) break;
+        }
+        if (asset_path.empty()) throw std::runtime_error("Manifest asset was not loaded: " + name);
+        std::ifstream mesh(asset_path, std::ios::binary);
+        if (!mesh) throw std::runtime_error("Cannot read asset for LAN play: " + name);
         std::vector<unsigned char> bytes{std::istreambuf_iterator<char>(mesh),
                                          std::istreambuf_iterator<char>()};
-        if (bytes.empty()) throw std::runtime_error("Empty mesh cannot be sent: " + name);
+        if (bytes.empty()) throw std::runtime_error("Empty asset cannot be sent: " + name);
         files.emplace(name, std::move(bytes));
       }
     }
@@ -1342,8 +2210,7 @@ bool FusionBundle::LoadSessionPackage(const std::vector<unsigned char>& package)
           path.has_root_directory())
         throw std::runtime_error("Unsafe asset path in LAN package.");
       const auto normalized = path.lexically_normal();
-      if (normalized.empty() || *normalized.begin() == ".." ||
-          normalized.extension() != ".stl" || normalized.generic_u8string() != input)
+      if (!IsBundleAssetPath(path) || normalized.generic_u8string() != input)
         throw std::runtime_error("Unsupported asset path in LAN package.");
       return normalized.generic_u8string();
     };
@@ -1375,15 +2242,8 @@ bool FusionBundle::LoadSessionPackage(const std::vector<unsigned char>& package)
         manifest_source.at("parts").empty() || manifest_source.at("parts").size() > 4096)
       throw std::runtime_error("Manifest has an invalid part list for LAN play.");
     std::set<std::string> required;
-    for (const auto& item : manifest_source.at("parts")) {
-      const std::filesystem::path path(item.at("file").get<std::string>());
-      if (path.empty() || path.is_absolute() || path.has_root_name() || path.has_root_directory())
-        throw std::runtime_error("Unsafe mesh path in LAN manifest.");
-      const auto normalized = path.lexically_normal();
-      if (normalized.empty() || *normalized.begin() == ".." || normalized.extension() != ".stl")
-        throw std::runtime_error("Unsupported mesh path in LAN manifest.");
-      required.insert(normalized.generic_u8string());
-    }
+    for (const auto& raw_name : ManifestAssetPaths(manifest_source.at("parts")))
+      required.insert(safe_name(raw_name));
     if (required.size() != meshes.size())
       throw std::runtime_error("LAN package mesh list does not match its manifest.");
     for (const auto& name : required)
@@ -1442,6 +2302,10 @@ std::string FusionBundle::SetupJson() const {
   for (const auto& part : parts_) {
     state["partAssignments"][part.file] = part.assembly;
     state["partOverrides"][part.file] = {{"massKg", part.mass},
+      {"massMode", MassModeKey(part.mass_mode)},
+      {"manualMassKg", part.manual_mass},
+      {"printProfile", PrintProfileJson(part.print_profile)},
+      {"buildAxisLocal", part.build_axis_local},
       {"frictionEstimate", part.friction}, {"colorRgba", part.color},
       {"previewVisible", part.preview_visible},
       {"collisionEnabled", part.collision_enabled}};
@@ -1582,15 +2446,44 @@ bool FusionBundle::GeneratePreview(std::filesystem::path& output) {
     for (size_t i = 0; i < parts_.size(); ++i) {
       const auto& part = parts_[i];
       xml << "<mesh name=\"cad_mesh_" << i << "\" file=\""
-          << Escape(AssetReference(part.absolute_file, manifest_.parent_path()))
-          << "\" scale=\"" << Text({part.scale, part.scale, part.scale}) << "\"/>\n";
+          << Escape(AssetReference(part.absolute_render_file, manifest_.parent_path()))
+          << "\" scale=\"" << Text({part.scale, part.scale, part.scale})
+          << "\" smoothnormal=\"true\"/>\n";
+      for (const auto& texture : part.textures) {
+        xml << "<texture name=\"preview_tex_" << i << '_' << Escape(texture.role)
+            << "\" type=\"2d\" file=\""
+            << Escape(AssetReference(texture.absolute_file, manifest_.parent_path()))
+            << "\"/>\n";
+      }
+      const auto rgb = FindTexture(part, "rgb");
+      xml << "<material name=\"preview_surface_" << i << "\" rgba=\""
+          << Text4(part.color) << "\" specular=\"" << Number(SurfaceForPart(part).specular)
+          << "\" shininess=\"" << Number(SurfaceForPart(part).shininess) << '"';
+#if defined(COMBATSIM_USE_FILAMENT)
+      const auto pbr = PbrSurfaceForPart(part);
+      xml << " metallic=\"" << Number(pbr.metallic) << "\" roughness=\""
+          << Number(pbr.roughness) << '"';
+      if (!part.textures.empty()) {
+        xml << ">\n";
+        for (const auto& texture : part.textures)
+          xml << "<layer role=\"" << Escape(texture.role) << "\" texture=\"preview_tex_"
+              << i << '_' << Escape(texture.role) << "\"/>\n";
+        xml << "</material>\n";
+      } else {
+        xml << "/>\n";
+      }
+#else
+      if (rgb) xml << " texture=\"preview_tex_" << i << "_rgb\"";
+      xml << "/>\n";
+#endif
     }
     xml << "</asset><worldbody><body name=\"CAD_Preview\">\n";
     for (size_t i = 0; i < parts_.size(); ++i) {
       const auto& part = parts_[i];
       xml << "<geom name=\"cad_part_" << i << "\" type=\"mesh\" mesh=\"cad_mesh_" << i
           << "\" pos=\"" << Text(part.position) << "\" quat=\"" << Text4(part.rotation)
-          << "\" rgba=\"" << Text4(part.color) << "\"/>\n";
+          << "\" material=\"preview_surface_" << i << "\" rgba=\""
+          << Text4(part.color) << "\"/>\n";
     }
     xml << "</body></worldbody></mujoco>\n";
     output = manifest_.parent_path() / "combatsim_preview.xml";
@@ -1602,19 +2495,19 @@ bool FusionBundle::GeneratePreview(std::filesystem::path& output) {
   } catch (const std::exception& e) { error_ = e.what(); return false; }
 }
 
-bool FusionBundle::Generate(std::filesystem::path& output, const FusionBundle* opponent) {
+bool FusionBundle::Generate(std::filesystem::path& output, FusionBundle* opponent) {
   return GenerateImpl(&output, nullptr, nullptr, opponent);
 }
 
 bool FusionBundle::GenerateInMemory(std::string& xml,
                                     std::vector<MemoryBundleAsset>& assets,
-                                    const FusionBundle* opponent) {
+                                    FusionBundle* opponent) {
   return GenerateImpl(nullptr, &xml, &assets, opponent);
 }
 
 bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_output,
                                 std::vector<MemoryBundleAsset>* assets,
-                                const FusionBundle* opponent) {
+                                FusionBundle* opponent) {
   try {
     const bool memory_output = xml_output && assets;
     if (memory_output == (output != nullptr))
@@ -1624,20 +2517,75 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
       assets->clear();
     }
     if (!HasBundle()) throw std::runtime_error("Load a Fusion manifest first.");
-    auto asset_name = [memory_output](bool is_opponent, size_t index) {
+    std::ostringstream xml;
+    auto mesh_asset_name = [memory_output](bool is_opponent, size_t index,
+                                          const std::string& extension) {
       return std::string(is_opponent ? "opponent_asset_" : "cad_asset_") +
-        std::to_string(index) + ".stl";
+        std::to_string(index) + extension;
     };
-    auto add_asset = [&](const std::string& name, const CadPart& part) {
+    auto texture_asset_name = [](bool is_opponent, size_t index,
+                                const CadPart::Texture& texture) {
+      return std::string(is_opponent ? "opponent_texture_" : "cad_texture_") +
+        std::to_string(index) + "_" + texture.role +
+        std::filesystem::path(texture.file).extension().string();
+    };
+    auto add_asset = [&](const std::string& name,
+                         const std::vector<unsigned char>& resident_bytes,
+                         const std::filesystem::path& path,
+                         const std::string& label) {
       if (!memory_output) return;
-      std::vector<unsigned char> bytes = part.mesh_data;
+      std::vector<unsigned char> bytes = resident_bytes;
       if (bytes.empty()) {
-        std::ifstream input(part.absolute_file, std::ios::binary);
-        if (!input) throw std::runtime_error("Cannot read mesh for in-memory model: " + part.file);
+        std::ifstream input(path, std::ios::binary);
+        if (!input) throw std::runtime_error("Cannot read asset for in-memory model: " + label);
         bytes.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
       }
-      if (bytes.empty()) throw std::runtime_error("Empty mesh for in-memory model: " + part.file);
+      if (bytes.empty()) throw std::runtime_error("Empty asset for in-memory model: " + label);
       assets->push_back({name, std::move(bytes)});
+    };
+    auto emit_texture_assets = [&](const CadPart& part, size_t index, bool is_opponent) {
+      const std::string prefix = is_opponent ? "opponent_" : "cad_";
+      for (const auto& texture : part.textures) {
+        const std::string texture_name = prefix + "texture_" + std::to_string(index) +
+                                         "_" + texture.role;
+        std::string filename;
+        if (memory_output) {
+          filename = texture_asset_name(is_opponent, index, texture);
+        } else if (is_opponent) {
+          filename = AssetPath(texture.absolute_file);
+        } else {
+          filename = AssetReference(texture.absolute_file, manifest_.parent_path());
+        }
+        xml << "<texture name=\"" << texture_name << "\" type=\"2d\" file=\""
+            << Escape(filename) << "\"/>\n";
+        add_asset(filename, texture.data, texture.absolute_file, texture.file);
+      }
+    };
+    auto emit_material = [&](const CadPart& part, size_t index, bool is_opponent) {
+      const std::string prefix = is_opponent ? "opponent_" : "cad_";
+      const std::string material_name = prefix + "surface_" + std::to_string(index);
+      const std::string rgb_texture = prefix + "texture_" + std::to_string(index) + "_rgb";
+      const auto surface = SurfaceForPart(part);
+      xml << "<material name=\"" << material_name << "\" specular=\""
+          << Number(surface.specular) << "\" shininess=\""
+          << Number(surface.shininess) << '"';
+#if defined(COMBATSIM_USE_FILAMENT)
+      const auto pbr = PbrSurfaceForPart(part);
+      xml << " metallic=\"" << Number(pbr.metallic) << "\" roughness=\""
+          << Number(pbr.roughness) << '"';
+      if (part.textures.empty()) {
+        xml << "/>\n";
+      } else {
+        xml << ">\n";
+        for (const auto& texture : part.textures)
+          xml << "<layer role=\"" << texture.role << "\" texture=\"" << prefix
+              << "texture_" << index << '_' << texture.role << "\"/>\n";
+        xml << "</material>\n";
+      }
+#else
+      if (FindTexture(part, "rgb")) xml << " texture=\"" << rgb_texture << '"';
+      xml << "/>\n";
+#endif
     };
     for (size_t i = 0; i < parts_.size(); ++i)
       if (PartIncludedInSimulation(int(i)) && !ValidMass(parts_[i].mass))
@@ -1666,47 +2614,64 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
       bot_rotation_degrees_ * 3.14159265358979323846 / 180.0);
     const Vec3 rotated_center = Rotate(player_heading, center);
     const Vec3 spawn{-0.62 - rotated_center[0], -rotated_center[1], 0.012 - low[2]};
-    std::ostringstream xml; xml.imbue(std::locale::classic());
+    xml.imbue(std::locale::classic());
     xml << "<mujoco model=\"" << Escape(design_name_) << "\">\n"
         << "<compiler angle=\"radian\" autolimits=\"true\"/>\n"
-        << "<option timestep=\"0.0004\" gravity=\"0 0 -9.81\" integrator=\"implicitfast\"/>\n"
+        << "<option timestep=\"0.0004\" gravity=\"0 0 -9.80665\" integrator=\"implicitfast\"/>\n"
         << "<visual><headlight ambient=\"0.12 0.12 0.12\" diffuse=\"0.07 0.07 0.07\" specular=\"0.008 0.008 0.008\"/></visual>\n"
         << "<asset>\n";
-    xml << "<material name=\"arena_floor_laminate\" rgba=\"0.84 0.83 0.79 1\" specular=\"0.06\" shininess=\"0.12\" reflectance=\"0\"/>\n";
+    xml << "<material name=\"arena_floor_laminate\" rgba=\"0.84 0.83 0.79 1\" specular=\"0.06\" shininess=\"0.12\" reflectance=\"0\""
+#if defined(COMBATSIM_USE_FILAMENT)
+        << " metallic=\"0\" roughness=\"0.78\""
+#endif
+        << "/>\n";
     for (size_t i = 0; i < parts_.size(); ++i) if (PartIncludedInSimulation(int(i))) {
       const auto& part = parts_[i];
-      const std::string mesh_file = memory_output ? asset_name(false, i) :
-        AssetReference(part.absolute_file, manifest_.parent_path());
+      emit_texture_assets(part, i, false);
+      emit_material(part, i, false);
+      const std::string mesh_file = memory_output
+        ? mesh_asset_name(false, i, std::filesystem::path(part.render_file).extension().string())
+        : AssetReference(part.absolute_render_file, manifest_.parent_path());
       xml << "<mesh name=\"cad_mesh_" << i << "\" file=\""
           << Escape(mesh_file)
-          << "\" scale=\"" << Text({part.scale, part.scale, part.scale}) << "\"/>\n";
-      add_asset(mesh_file, part);
+          << "\" scale=\"" << Text({part.scale, part.scale, part.scale})
+          << "\" smoothnormal=\"true\"/>\n";
+      const auto& render_data = part.render_mesh_data.empty() && part.render_file == part.file
+        ? part.mesh_data : part.render_mesh_data;
+      add_asset(mesh_file, render_data, part.absolute_render_file, part.render_file);
     }
     if (has_opponent) for (size_t i = 0; i < opponent->parts_.size(); ++i)
       if (opponent->PartIncludedInSimulation(int(i))) {
         const auto& part = opponent->parts_[i];
-        const std::string mesh_file = memory_output ? asset_name(true, i) :
-          AssetPath(part.absolute_file);
+        emit_texture_assets(part, i, true);
+        emit_material(part, i, true);
+        const std::string mesh_file = memory_output
+          ? mesh_asset_name(true, i, std::filesystem::path(part.render_file).extension().string())
+          : AssetPath(part.absolute_render_file);
         xml << "<mesh name=\"opponent_mesh_" << i << "\" file=\""
             << Escape(mesh_file)
             << "\" scale=\""
-            << Text({part.scale, part.scale, part.scale}) << "\"/>\n";
-        add_asset(mesh_file, part);
+            << Text({part.scale, part.scale, part.scale})
+            << "\" smoothnormal=\"true\"/>\n";
+        const auto& render_data = part.render_mesh_data.empty() && part.render_file == part.file
+          ? part.mesh_data : part.render_mesh_data;
+        add_asset(mesh_file, render_data, part.absolute_render_file, part.render_file);
       }
     xml << "</asset>\n<worldbody>\n"
-        << "<light name=\"arena_key_light\" directional=\"true\" pos=\"0 0 2\" dir=\"0.3 -0.4 -1\" diffuse=\"0.88 0.85 0.78\" specular=\"0.08 0.08 0.08\" ambient=\"0.01 0.01 0.01\"/>\n"
-        << "<light name=\"arena_fill_light\" directional=\"true\" pos=\"0 0 2\" dir=\"-0.5 0.3 -1\" diffuse=\"0.42 0.48 0.54\" specular=\"0.015 0.015 0.015\" ambient=\"0.005 0.005 0.005\"/>\n"
-        << "<geom name=\"floor\" type=\"plane\" size=\"1 1 0.02\" material=\"arena_floor_laminate\" friction=\"1.4 0.02 0.001\"/>\n"
+        << "<light name=\"arena_key_light\" directional=\"true\" castshadow=\"false\" pos=\"0 0 2\" dir=\"0.3 -0.4 -1\" diffuse=\"0.88 0.85 0.78\" specular=\"0.18 0.18 0.18\" ambient=\"0.01 0.01 0.01\"/>\n"
+        << "<light name=\"arena_fill_light\" directional=\"true\" castshadow=\"false\" pos=\"0 0 2\" dir=\"-0.5 0.3 -1\" diffuse=\"0.42 0.48 0.54\" specular=\"0.035 0.035 0.035\" ambient=\"0.005 0.005 0.005\"/>\n"
+        << "<geom name=\"floor\" type=\"plane\" size=\"0 0 0.02\" rgba=\"0 0 0 0\" friction=\"1.4 0.02 0.001\"/>\n"
+        << "<geom name=\"floor_visual\" type=\"box\" pos=\"0 0 -0.001\" size=\"1 1 0.001\" material=\"arena_floor_laminate\" contype=\"0\" conaffinity=\"0\"/>\n"
         << "<!-- Hidden deep collision volumes catch fast impacts; the visible acrylic skins are 8 mm thick. -->\n"
-        << "<geom name=\"north_wall\" type=\"box\" pos=\"0 1.30 0.5\" size=\"1.02 0.30 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
-        << "<geom name=\"south_wall\" type=\"box\" pos=\"0 -1.30 0.5\" size=\"1.02 0.30 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
-        << "<geom name=\"east_wall\" type=\"box\" pos=\"1.30 0 0.5\" size=\"0.30 1.02 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
-        << "<geom name=\"west_wall\" type=\"box\" pos=\"-1.30 0 0.5\" size=\"0.30 1.02 0.5\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"north_wall\" type=\"box\" pos=\"0 1.30 0.5\" size=\"1.62 0.30 0.55\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"south_wall\" type=\"box\" pos=\"0 -1.30 0.5\" size=\"1.62 0.30 0.55\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"east_wall\" type=\"box\" pos=\"1.30 0 0.5\" size=\"0.30 1.62 0.55\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"west_wall\" type=\"box\" pos=\"-1.30 0 0.5\" size=\"0.30 1.62 0.55\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
         << "<geom name=\"north_wall_acrylic\" type=\"box\" pos=\"0 1.004 0.5\" size=\"1 0.004 0.5\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.11\"/>\n"
         << "<geom name=\"south_wall_acrylic\" type=\"box\" pos=\"0 -1.004 0.5\" size=\"1 0.004 0.5\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.11\"/>\n"
         << "<geom name=\"east_wall_acrylic\" type=\"box\" pos=\"1.004 0 0.5\" size=\"0.004 1 0.5\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.11\"/>\n"
         << "<geom name=\"west_wall_acrylic\" type=\"box\" pos=\"-1.004 0 0.5\" size=\"0.004 1 0.5\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.11\"/>\n"
-        << "<geom name=\"roof\" type=\"box\" pos=\"0 0 1.15\" size=\"1.02 1.02 0.15\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"roof\" type=\"box\" pos=\"0 0 1.125\" size=\"1.62 1.62 0.175\" rgba=\"0.5 0.58 0.58 0\"/>\n"
         << "<geom name=\"roof_acrylic\" type=\"box\" pos=\"0 0 1.004\" size=\"1 1 0.004\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.07\"/>\n"
         << "<body name=\"Player_Robot\" pos=\"" << Text(spawn)
         << "\" quat=\"" << Text4(player_heading) << "\">\n"
@@ -1717,7 +2682,7 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
       const auto& p = parts_[i];
       xml << "<geom name=\"cad_part_" << i << "\" type=\"mesh\" mesh=\"cad_mesh_" << i
           << "\" pos=\"" << Text(Sub(p.position, origin)) << "\" quat=\"" << Text4(p.rotation)
-          << "\" mass=\"0\" friction=\"" << Number(p.friction)
+          << "\" material=\"cad_surface_" << i << "\" mass=\"0\" friction=\"" << Number(p.friction)
           << " 0.02 0.001\" rgba=\"" << Text4(p.color) << "\"";
       if (!p.collision_enabled) xml << " contype=\"0\" conaffinity=\"0\"";
       xml << "/>\n";
@@ -1781,7 +2746,8 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
         const auto& part = opponent->parts_[i];
         xml << "<geom name=\"opponent_part_" << i << "\" type=\"mesh\" mesh=\"opponent_mesh_"
             << i << "\" pos=\"" << Text(Sub(part.position, local_origin)) << "\" quat=\""
-            << Text4(part.rotation) << "\" mass=\"0\" friction=\"" << Number(part.friction)
+            << Text4(part.rotation) << "\" material=\"opponent_surface_" << i
+            << "\" mass=\"0\" friction=\"" << Number(part.friction)
             << " 0.02 0.001\" rgba=\"" << Text4(part.color) << "\"";
         if (!part.collision_enabled) xml << " contype=\"0\" conaffinity=\"0\"";
         xml << "/>\n";
@@ -2096,10 +3062,13 @@ void FusionBundle::PickFace(int part_index, const std::array<double, 3>& cad_poi
 void FusionBundle::SelectPart(int part_index) {
   if (part_index < 0 || part_index >= int(parts_.size())) return;
   selected_part_ = part_index;
+  focus_part_request_ = part_index;
+  focus_frames_remaining_ = 2;
   pick_message_ = "Selected " + parts_[part_index].name + ". Choose its rigid assembly below.";
 }
 
 void FusionBundle::UpdateHover(int part_index, const std::array<double, 3>& hit) {
+  hovered_hit_ = hit;
   const bool valid_part = PreviewVisible(part_index);
   // The axis target is independent of the CAD part supplying the reference hole.
   // This also prevents the body hover highlight from competing with the rim cue.
@@ -2128,6 +3097,45 @@ void FusionBundle::UpdateHover(int part_index, const std::array<double, 3>& hit)
                     ". Click to fit " + assemblies_[axis_assembly_].name + " axis.";
 }
 
+void FusionBundle::StartPrintBedFacePick(int part_index) {
+  if (part_index < 0 || part_index >= int(parts_.size())) return;
+  axis_picking_ = false;
+  axis_points_.clear();
+  hovered_loop_.clear();
+  print_bed_face_picking_ = true;
+  print_bed_face_part_ = part_index;
+  selected_part_ = part_index;
+  hovered_part_ = -1;
+  pick_message_ = "Click a face on this part that will sit on the build plate. The build axis points into the part.";
+}
+
+bool FusionBundle::SelectHoveredPrintBedFace() {
+  if (!print_bed_face_picking_) return false;
+  if (hovered_part_ != print_bed_face_part_ || !PreviewVisible(hovered_part_)) {
+    pick_message_ = "Click a visible face on the selected part to set its bed contact.";
+    return false;
+  }
+  auto& part = parts_[print_bed_face_part_];
+  Vec3 axis{};
+  std::string error;
+  if (!FindPrintBedAxis(part, hovered_hit_, axis, error)) {
+    pick_message_ = error;
+    return false;
+  }
+  part.build_axis_local = axis;
+  print_bed_face_picking_ = false;
+  print_bed_face_part_ = -1;
+  if (part.mass_mode == PartMassMode::Printed) RefreshPrintEstimate(part);
+  pick_message_ = "Build direction set from the selected bed face on " + part.name + ".";
+  return true;
+}
+
+void FusionBundle::CancelPrintBedFacePick() {
+  print_bed_face_picking_ = false;
+  print_bed_face_part_ = -1;
+  pick_message_ = "Bed-face selection cancelled.";
+}
+
 bool FusionBundle::SelectHoveredHole() {
   if (!axis_picking_ || hovered_loop_.size() < 6) {
     pick_message_ = "Move over a highlighted closed hole rim, then click it.";
@@ -2149,6 +3157,8 @@ void FusionBundle::StartAxis(int assembly) {
     return;
   }
   axis_assembly_ = assembly;
+  print_bed_face_picking_ = false;
+  print_bed_face_part_ = -1;
   axis_points_.clear(); axis_picking_ = true;
   hovered_part_ = -1;
   hovered_loop_.clear();
@@ -2444,7 +3454,14 @@ void FusionBundle::DrawPart(size_t index) {
   auto& part = parts_[index];
   ImGui::PushID(int(index));
   const std::string label = part.name + "##part";
-  if (ImGui::TreeNode(label.c_str())) {
+  const bool focus_selected = focus_part_request_ == int(index);
+  const float part_row_y = ImGui::GetCursorPosY();
+  if (focus_part_request_ >= 0)
+    ImGui::SetNextItemOpen(focus_selected, ImGuiCond_Always);
+  const ImGuiTreeNodeFlags node_flags = selected_part_ == int(index)
+    ? ImGuiTreeNodeFlags_Selected : ImGuiTreeNodeFlags_None;
+  const bool node_open = ImGui::TreeNodeEx(label.c_str(), node_flags);
+  if (node_open) {
     ImGui::Checkbox("Show in preview", &part.preview_visible);
     ImGui::Checkbox("Use for collisions", &part.collision_enabled);
     if (ImGui::IsItemHovered())
@@ -2453,7 +3470,7 @@ void FusionBundle::DrawPart(size_t index) {
     ImGui::TextWrapped("Fusion material: %s", part.material.c_str());
     if (!part.appearance.empty()) ImGui::TextWrapped("Appearance: %s", part.appearance.c_str());
     if (part.roughness >= 0) ImGui::Text("Fusion roughness: %.2f", part.roughness);
-    ImGui::Text("Density: %.0f kg/m3", part.density);
+    ImGui::Text("Fusion material density: %.0f kg/m3", part.density);
     if (!part.material_properties.empty() && ImGui::TreeNode("Fusion material properties")) {
       for (const auto& property : part.material_properties) ImGui::TextWrapped("%s", property.c_str());
       ImGui::TreePop();
@@ -2476,18 +3493,90 @@ void FusionBundle::DrawPart(size_t index) {
       }
       ImGui::EndCombo();
     }
-    ImGui::Text("Fusion weight: %.2f g", part.fusion_mass * 1000.0);
-    double mass_grams = part.mass * 1000.0;
-    if (ImGui::InputDouble("Weight (g)", &mass_grams, 0.1, 1.0, "%.2f"))
-      part.mass = std::max(0.0, mass_grams / 1000.0);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Use Fusion")) part.mass = part.fusion_mass;
+    ImGui::Text("Fusion solid mass: %.2f g", part.fusion_mass * 1000.0);
+    if (ImGui::BeginCombo("Mass model", MassModeLabel(part.mass_mode))) {
+      for (const auto mode : {PartMassMode::Fusion, PartMassMode::Manual,
+                              PartMassMode::Printed})
+        if (ImGui::Selectable(MassModeLabel(mode), part.mass_mode == mode)) {
+          part.mass_mode = mode;
+          if (mode == PartMassMode::Printed) RefreshPrintEstimate(part);
+          else part.mass = mode == PartMassMode::Manual ? part.manual_mass : part.fusion_mass;
+        }
+      ImGui::EndCombo();
+    }
+    if (part.mass_mode == PartMassMode::Manual) {
+      double mass_grams = part.manual_mass * 1000.0;
+      if (ImGui::InputDouble("Manual weight (g)", &mass_grams, 0.1, 1.0, "%.2f")) {
+        part.manual_mass = std::max(0.0, mass_grams / 1000.0);
+        part.mass = part.manual_mass;
+      }
+    } else if (part.mass_mode == PartMassMode::Printed) {
+      auto& profiles = PrintProfiles();
+      if (profiles.empty()) profiles.push_back(PrintProfile{});
+      if (part.print_profile_selection.empty())
+        part.print_profile_selection = part.print_profile.name;
+      if (!FindPrintProfile(part.print_profile_selection))
+        part.print_profile_selection = FindPrintProfile(part.print_profile.name) ?
+          part.print_profile.name : profiles.front().name;
+      const std::string applied_picker_label =
+        FindPrintProfile(part.print_profile_selection) ?
+          part.print_profile_selection : part.print_profile_selection + " (saved copy)";
+      if (ImGui::BeginCombo("Profile to apply", applied_picker_label.c_str())) {
+        for (const auto& profile : profiles)
+          if (ImGui::Selectable(profile.name.c_str(),
+                                profile.name == part.print_profile_selection)) {
+            part.print_profile_selection = profile.name;
+          }
+        ImGui::EndCombo();
+      }
+      if (ImGui::Button("Apply profile to this part")) {
+        if (const PrintProfile* selected = FindPrintProfile(part.print_profile_selection)) {
+          part.print_profile = *selected;
+          RefreshPrintEstimate(part);
+        }
+      }
+      ImGui::Text("Applied profile snapshot: %s", part.print_profile.name.c_str());
+      ImGui::TextWrapped("Saved to this part: %.2f mm line width, %d walls, %d top / %d bottom layers, %.1f%% %s infill.",
+        part.print_profile.line_width_mm, part.print_profile.wall_loops,
+        part.print_profile.top_layers, part.print_profile.bottom_layers,
+        part.print_profile.infill_density_percent,
+        InfillPatternLabel(part.print_profile.infill_pattern));
+      ImGui::TextDisabled("Save setup stores this part's applied settings and bed direction beside the manifest.");
+      ImGui::TextWrapped("Build axis in part coordinates: %.3f, %.3f, %.3f",
+        part.build_axis_local[0], part.build_axis_local[1], part.build_axis_local[2]);
+      if (ImGui::Button("Pick bed contact face in preview"))
+        StartPrintBedFacePick(int(index));
+      if (print_bed_face_picking_ && print_bed_face_part_ == int(index)) {
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel face pick")) CancelPrintBedFacePick();
+      }
+      if (part.print_estimate_valid) {
+        ImGui::Text("Estimated printed weight: %.2f g", part.printed_mass * 1000.0);
+        if (part.has_fusion_center_of_mass) {
+          const Vec3 offset_mm = Mul(
+            Sub(part.printed_center_local, part.center_of_mass_local), 1000.0);
+          ImGui::TextWrapped("Estimated center-of-mass shift: %.2f, %.2f, %.2f mm",
+            offset_mm[0], offset_mm[1], offset_mm[2]);
+        }
+      }
+      if (!part.print_estimate_error.empty())
+        ImGui::TextWrapped("Print estimate: %s", part.print_estimate_error.c_str());
+      if (ImGui::SmallButton("Recalculate print mass")) RefreshPrintEstimate(part);
+    } else {
+      ImGui::Text("Physics weight: %.2f g", part.fusion_mass * 1000.0);
+    }
     ImGui::DragScalar("Friction estimate", ImGuiDataType_Double, &part.friction, 0.01, nullptr, nullptr, "%.2f");
     part.mass = std::max(0.0, part.mass);
     part.friction = std::max(0.01, part.friction);
     float color[4] = {float(part.color[0]), float(part.color[1]), float(part.color[2]), float(part.color[3])};
     if (ImGui::ColorEdit4("Color", color)) for (int i = 0; i < 4; ++i) part.color[i] = color[i];
     ImGui::TreePop();
+  }
+  if (focus_selected) {
+    // Apply the scroll request after the full expanded body has been laid out,
+    // so ImGui knows the final scroll range for this frame. Repeat briefly to
+    // let the parent configuration child settle after opening nested nodes.
+    ImGui::SetScrollFromPosY(part_row_y, 0.15f);
   }
   ImGui::PopID();
 }
@@ -2503,6 +3592,14 @@ void FusionBundle::DrawTree(const std::vector<std::string>& parent) {
   for (const auto& child : children) {
     auto path = parent; path.push_back(child);
     ImGui::PushID(int(parent.size()));
+    bool contains_focus_target = false;
+    if (focus_part_request_ >= 0 && focus_part_request_ < int(parts_.size())) {
+      const auto& target_path = parts_[focus_part_request_].occurrence_path;
+      contains_focus_target = target_path.size() >= path.size() &&
+        std::equal(path.begin(), path.end(), target_path.begin());
+    }
+    if (focus_part_request_ >= 0)
+      ImGui::SetNextItemOpen(contains_focus_target, ImGuiCond_Always);
     if (ImGui::TreeNode(child.c_str())) {
       int folder_assignment = -2;
       bool folder_has_parts = false;
@@ -2601,6 +3698,12 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip("Rotates the entire assembled bot around vertical Z. CAD body transforms, component assignments, and fitted wheel/weapon axes remain in their original CAD coordinates.");
   ImGui::TextWrapped("This rotates the imported assembly as a whole; it does not rewrite the CAD-defined part or axis coordinates.");
+  DrawPrintProfileManager();
+  if (print_bed_face_picking_) {
+    ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.82f, 1.0f),
+      "Bed-face pick active: click the selected part's face in the CAD preview.");
+    if (ImGui::SmallButton("Cancel bed-face pick")) CancelPrintBedFacePick();
+  }
   ImGui::SeparatorText("Bot powertrain");
   DrawMotorDoubleInput("Battery voltage (V)", &battery_voltage_, 0.1, 1.0, "%.2f");
   if (ImGui::IsItemHovered())
@@ -2812,7 +3915,10 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
     if (ImGui::Button(selected.preview_visible ? "Hide selected" : "Show selected"))
       selected.preview_visible = !selected.preview_visible;
     ImGui::SameLine();
-    if (ImGui::Button("Deselect part")) selected_part_ = -1;
+    if (ImGui::Button("Deselect part")) {
+      selected_part_ = focus_part_request_ = -1;
+      focus_frames_remaining_ = 0;
+    }
     const char* chosen = selected.assembly < 0 ? "Exclude" : assemblies_[selected.assembly].name.c_str();
     if (ImGui::BeginCombo("Assign selected part", chosen)) {
       if (ImGui::Selectable("Exclude", selected.assembly < 0)) selected.assembly = -1;
@@ -2967,6 +4073,8 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
     assemblies_.push_back({"Assembly " + std::to_string(assemblies_.size()), AssemblyKind::Fixed, {}, {0, 1, 0}});
   ImGui::SeparatorText("Fusion assembly tree");
   DrawTree({});
+  if (focus_frames_remaining_ > 0 && --focus_frames_remaining_ == 0)
+    focus_part_request_ = -1;
 }
 
 void FusionBundle::Clear() {
@@ -2982,14 +4090,22 @@ void FusionBundle::Clear() {
   design_name_.clear();
   error_.clear();
   selected_part_ = hovered_part_ = -1;
+  focus_part_request_ = -1;
+  focus_frames_remaining_ = 0;
   axis_picking_ = false;
+  print_bed_face_picking_ = false;
+  print_bed_face_part_ = -1;
   axis_points_.clear();
   hovered_loop_.clear();
 }
 
 void FusionBundle::DiscardSessionMeshBuffers() {
   if (!memory_loaded_) return;
-  for (auto& part : parts_) Wipe(part.mesh_data);
+  for (auto& part : parts_) {
+    Wipe(part.mesh_data);
+    Wipe(part.render_mesh_data);
+    for (auto& texture : part.textures) Wipe(texture.data);
+  }
 }
 
 void FusionBundle::DrawImporter(SDL_Window* window, bool& changed) {

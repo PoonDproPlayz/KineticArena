@@ -15,6 +15,26 @@ enum class AssemblyKind { Frame, Fixed, LeftWheel, RightWheel, Weapon, GravityFo
 enum class DriveLayout { TwoWheel, FourWheel };
 enum class MotorType { Brushless, Brushed };
 enum class MotorSpeedInput { Kv, RatedRpmAtVoltage };
+enum class PartMassMode { Fusion, Manual, Printed };
+enum class PrintInfillPattern { Grid, Rectilinear, Triangles, Gyroid, Honeycomb, Cubic, Lightning };
+
+struct PrintProfile {
+  std::string name = "PLA 0.20 mm";
+  double layer_height_mm = 0.20;
+  double first_layer_height_mm = 0.24;
+  double line_width_mm = 0.45;
+  int wall_loops = 3;
+  int top_layers = 4;
+  int bottom_layers = 4;
+  double top_surface_density_percent = 100.0;
+  double bottom_surface_density_percent = 100.0;
+  double infill_density_percent = 20.0;
+  PrintInfillPattern infill_pattern = PrintInfillPattern::Grid;
+  // Pattern-dependent extrusion volume varies between slicers. This multiplier
+  // is an editable correction to the nominal infill percentage.
+  double infill_usage_multiplier = 1.0;
+  double flow_ratio_percent = 100.0;
+};
 
 struct MotorSpec {
   bool enabled = false;
@@ -45,6 +65,16 @@ struct CadPart {
   std::string file;
   std::filesystem::path absolute_file;
   std::vector<unsigned char> mesh_data;  // Present for bundles received in RAM.
+  std::string render_file;
+  std::filesystem::path absolute_render_file;
+  std::vector<unsigned char> render_mesh_data;
+  struct Texture {
+    std::string role;
+    std::string file;
+    std::filesystem::path absolute_file;
+    std::vector<unsigned char> data;
+  };
+  std::vector<Texture> textures;
   std::vector<std::string> occurrence_path;
   std::string material;
   std::string appearance;
@@ -52,6 +82,17 @@ struct CadPart {
   double density = 0.0;
   double mass = 0.0;
   double fusion_mass = 0.0;
+  double volume_m3 = 0.0;
+  double manual_mass = 0.0;
+  PartMassMode mass_mode = PartMassMode::Fusion;
+  PrintProfile print_profile;  // Applied, per-part snapshot; independent of the preset library.
+  std::string print_profile_selection;  // Transient preset picker; not serialized.
+  std::array<double, 3> build_axis_local{0, 0, 1};
+  double printed_mass = 0.0;
+  std::array<double, 3> printed_center_local{};
+  std::array<double, 6> printed_inertia_tensor{};
+  bool print_estimate_valid = false;
+  std::string print_estimate_error;
   double friction = 0.6;
   double roughness = -1.0;
   double scale = 0.001;
@@ -61,6 +102,7 @@ struct CadPart {
   std::array<double, 3> min_bound{};
   std::array<double, 3> max_bound{};
   std::array<double, 3> center_of_mass{};
+  std::array<double, 3> center_of_mass_local{};
   bool has_fusion_center_of_mass = false;
   // Centroidal inertia in the body's native Fusion frame, packed as
   // Ixx, Iyy, Izz, Ixy, Ixz, Iyz in kg*m^2.
@@ -95,9 +137,9 @@ class FusionBundle {
   bool ExportSessionPackage(std::vector<unsigned char>& package);
   bool LoadSessionPackage(const std::vector<unsigned char>& package);
   bool Save();
-  bool Generate(std::filesystem::path& output, const FusionBundle* opponent = nullptr);
+  bool Generate(std::filesystem::path& output, FusionBundle* opponent = nullptr);
   bool GenerateInMemory(std::string& xml, std::vector<MemoryBundleAsset>& assets,
-                        const FusionBundle* opponent = nullptr);
+                        FusionBundle* opponent = nullptr);
   bool GeneratePreview(std::filesystem::path& output);
   bool SetForkCount(int count);
   bool AssemblyEnabled(int assembly) const;
@@ -114,7 +156,14 @@ class FusionBundle {
   void SelectPart(int part_index);
   void UpdateHover(int part_index, const std::array<double, 3>& hit);
   bool SelectHoveredHole();
-  void ClearSelection() { selected_part_ = -1; }
+  bool PrintBedFacePicking() const { return print_bed_face_picking_; }
+  void StartPrintBedFacePick(int part_index);
+  bool SelectHoveredPrintBedFace();
+  void CancelPrintBedFacePick();
+  void ClearSelection() {
+    selected_part_ = focus_part_request_ = -1;
+    focus_frames_remaining_ = 0;
+  }
   bool PreviewVisible(int part_index) const;
   bool AxisPicking() const { return axis_picking_; }
   void StartAxis(int assembly);
@@ -178,7 +227,12 @@ class FusionBundle {
   bool show_axis_markers_ = true;
   char path_buffer_[1024]{};
   int selected_part_ = -1;
+  int focus_part_request_ = -1;
+  int focus_frames_remaining_ = 0;
   int hovered_part_ = -1;
+  std::array<double, 3> hovered_hit_{};
+  bool print_bed_face_picking_ = false;
+  int print_bed_face_part_ = -1;
   std::vector<std::array<double, 3>> hovered_loop_;
   std::map<int, std::vector<std::vector<std::array<double, 3>>>> hole_cache_;
   bool axis_picking_ = false;
@@ -195,5 +249,5 @@ class FusionBundle {
                    const std::string& setup_json);
   bool GenerateImpl(std::filesystem::path* output, std::string* xml,
                     std::vector<MemoryBundleAsset>* assets,
-                    const FusionBundle* opponent);
+                    FusionBundle* opponent);
 };

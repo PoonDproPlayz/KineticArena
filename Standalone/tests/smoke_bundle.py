@@ -4,6 +4,7 @@ import json
 import math
 import re
 import struct
+import zlib
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,43 @@ def tetra_stl(path):
             for index in face:
                 stream.write(struct.pack("<3f", *vertices[index]))
             stream.write(struct.pack("<H", 0))
+
+
+def tetra_obj(path):
+    """Small OBJ with vertex normals and UVs, like the new Fusion render mesh."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("""# test OBJ with UVs and smooth normals
+v 0 0 0
+v 70 0 0
+v 0 70 0
+v 0 0 70
+vt 0 0
+vt 1 0
+vt 0 1
+vt 1 1
+vn 0 0 1
+vn 0 1 0
+vn 1 0 0
+vn 0.57735 0.57735 0.57735
+f 1/1/1 3/3/3 2/2/2
+f 1/1/1 2/2/2 4/4/4
+f 1/1/1 4/4/4 3/3/3
+f 2/2/2 3/3/3 4/4/4
+""", encoding="ascii")
+
+
+def tiny_png(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    def chunk(kind, payload):
+        content = kind + payload
+        return struct.pack(">I", len(payload)) + content + struct.pack(">I", zlib.crc32(content))
+    image = bytes((0, 255, 0, 0, 255, 0, 255, 0, 255,
+                   0, 0, 0, 255, 255, 255, 255, 255, 255))
+    png = (b"\x89PNG\r\n\x1a\n" +
+           chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 6, 0, 0, 0)) +
+           chunk(b"IDAT", zlib.compress(image)) +
+           chunk(b"IEND", b""))
+    path.write_bytes(png)
 
 
 def chamfered_ring_stl(path, segments=64):
@@ -118,6 +156,15 @@ def main(exe, workdir=None):
     if result.returncode:
         raise SystemExit(result.returncode)
     assert "matte laminate floor" in result.stdout
+    stock_xml = ET.parse(stock_model).getroot()
+    stock_gravity = [float(value) for value in stock_xml.find("option").attrib["gravity"].split()]
+    assert stock_gravity == [0.0, 0.0, -9.80665], "stock model must use standard Earth gravity"
+    for material_name in ("bot_painted_alloy", "bot_tire_rubber",
+                          "bot_machined_steel", "bot_tool_steel"):
+        assert stock_xml.find(f".//material[@name='{material_name}']") is not None
+    assert stock_xml.find(".//geom[@name='chassis']").attrib["material"] == "bot_painted_alloy"
+    assert stock_xml.find(".//body[@name='front_left_wheel']/geom").attrib["material"] == "bot_tire_rubber"
+    assert stock_xml.find(".//geom[@name='drum_core']").attrib["material"] == "bot_machined_steel"
     result = subprocess.run([str(exe), "--test-wall-impact", str(stock_model)],
                             text=True, capture_output=True)
     print(result.stdout, end="")
@@ -125,7 +172,7 @@ def main(exe, workdir=None):
     if result.returncode:
         raise SystemExit(result.returncode)
     assert "Wall impact at 2500 Hz and 100.0 m/s" in result.stdout
-    assert "Wall and roof impacts stayed inside the hidden catch volumes" in result.stdout
+    assert "Wall, roof, and diagonal corner impacts stayed inside the hidden catch volumes" in result.stdout
     result = subprocess.run([str(exe), "--test-transform-gizmo", str(stock_model)],
                             text=True, capture_output=True)
     print(result.stdout, end="")
@@ -151,17 +198,37 @@ def main(exe, workdir=None):
         for index, (name, mass, group, position) in enumerate(entries):
             relative = f"Parts/{name}/{index:04d}.stl"
             tetra_stl(root / relative)
-            part = {"file": relative, "partName": name.split("/")[-1],
-                    "bodyName": name, "occurrencePath": name.split("/"),
-                    "materialName": "Steel", "massKg": mass,
-                    "densityKgPerM3": 7800, "unitToMeters": 0.001,
-                    "positionFusionMeters": position,
-                    "rotationFusionWxyz": [1, 0, 0, 0],
-                    "colorRgba": [0.7, 0.7, 0.75, 1]}
+            part_data = {"file": relative, "partName": name.split("/")[-1],
+                         "bodyName": name, "occurrencePath": name.split("/"),
+                         "materialName": "Steel", "massKg": mass,
+                         "densityKgPerM3": 7800, "unitToMeters": 0.001,
+                         "positionFusionMeters": position,
+                         "rotationFusionWxyz": [1, 0, 0, 0],
+                         "colorRgba": [0.7, 0.7, 0.75, 1]}
+            if index == 0:
+                # Fusion versions can emit an opaque ABS material with alpha
+                # zero; physical solids should remain visible in the preview.
+                part_data["materialName"] = "UHMW, White"
+                part_data["appearanceName"] = "ABS (White)"
+                part_data["colorRgba"] = [0.96, 0.96, 0.95, 0]
+                render_file = Path(relative).with_suffix(".obj").as_posix()
+                texture_file = "Textures/frame_color.png"
+                tetra_obj(root / render_file)
+                tiny_png(root / texture_file)
+                part_data["renderFile"] = render_file
+                part_data["textures"] = {"rgb": texture_file}
+            elif index == 8:
+                # Preserve alpha zero for an explicitly transparent appearance.
+                part_data["materialName"] = "Clear polycarbonate"
+                part_data["appearanceName"] = "Clear Polycarbonate"
+                part_data["colorRgba"] = [0.8, 0.9, 1.0, 0]
+            part = part_data
             if name == "Weapon/Main":
                 part["centerOfMassLocalMeters"] = [0.005, 0, 0]
                 part["inertiaTensorLocalKgM2"] = [4e-6, 5e-6, 6e-6,
                                                    0.5e-6, 0.25e-6, -0.2e-6]
+            if index == 0:
+                part["roughness"] = 0.25
             elif name == "Weapon/Blade":
                 part["centerOfMassLocalMeters"] = [0, -0.010, 0]
                 part["rotationFusionWxyz"] = [2 ** -0.5, 0, 0, 2 ** -0.5]
@@ -186,6 +253,10 @@ def main(exe, workdir=None):
             "schemaVersion": 1,
             "batteryVoltage": 11.1,
             "showAxisMarkers": False,
+            # Existing setups may have saved the bad Fusion alpha=0 value.
+            "partOverrides": {
+                parts[0]["file"]: {"colorRgba": [0.96, 0.96, 0.95, 0]}
+            },
             "assemblies": [{"name": n, "kind": k, "pivotMeters": pivot,
                             "axis": axis,
                             "motor": {"enabled": n in ("FL", "RL", "Weapon"),
@@ -270,12 +341,23 @@ def main(exe, workdir=None):
         assert "guest-only axis visibility" in result.stdout
         assert "player collision" in result.stdout
         opponent_model = ET.parse(root / "combatsim_generated.xml").getroot()
+        opponent_surface = opponent_model.find(".//material[@name='opponent_surface_0']")
+        assert opponent_surface is not None
+        assert opponent_model.find(".//geom[@name='opponent_part_0']").attrib["material"] == "opponent_surface_0"
         assert has_pair(opponent_model, "floor", "opponent_part_0")
         assert has_pair(opponent_model, "floor", "opponent_part_3")
         for part_name in ("opponent_part_0", "opponent_part_3"):
             pair = next(pair for pair in floor_scrape_pairs(opponent_model)
                         if part_name in (pair.attrib.get("geom1"), pair.attrib.get("geom2")))
             assert pair.attrib["solref"] == "0.02 2"
+        result = subprocess.run([str(exe), "--test-renderer-resume",
+                                 str(root / "manifest.json"), str(opponent_manifest)],
+                                text=True, capture_output=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        assert "Renderer restart restored player and opponent CAD bundles" in result.stdout
         opponent_quat = [float(value) for value in
                          opponent_model.find(".//body[@name='Target_Robot']").attrib["quat"].split()]
         assert abs(opponent_quat[0] - 2 ** -0.5) < 1e-6
@@ -396,12 +478,45 @@ def main(exe, workdir=None):
         assert 'cad_part_2' in generated  # blade shares the weapon joint
         model = ET.fromstring(generated)
         assert abs(float(model.find("option").attrib["timestep"]) - 0.0004) < 1e-12
+        generated_gravity = [float(value) for value in model.find("option").attrib["gravity"].split()]
+        assert generated_gravity == [0.0, 0.0, -9.80665], "Fusion model must use standard Earth gravity"
+        cad_surface = model.find(".//material[@name='cad_surface_0']")
+        assert cad_surface is not None
+        rgb_layer = cad_surface.find("./layer[@role='rgb']")
+        if rgb_layer is not None:
+            assert rgb_layer.attrib["texture"] == "cad_texture_0_rgb"
+        else:
+            assert cad_surface.attrib["texture"] == "cad_texture_0_rgb"
+        assert model.find(".//texture[@name='cad_texture_0_rgb']").attrib["file"] == "Textures/frame_color.png"
+        assert model.find(".//mesh[@name='cad_mesh_0']").attrib["file"].endswith("0000.obj")
+        assert model.find(".//mesh[@name='cad_mesh_0']").attrib["smoothnormal"] == "true"
+        assert model.find(".//mesh[@name='cad_mesh_1']").attrib["smoothnormal"] == "true"
+        assert abs(float(cad_surface.attrib["specular"]) - 0.29325) < 1e-9
+        assert abs(float(cad_surface.attrib["shininess"]) - 0.675) < 1e-9
+        assert model.find(".//geom[@name='cad_part_0']").attrib["material"] == "cad_surface_0"
+        preview_model = ET.parse(root / "combatsim_preview.xml").getroot()
+        opaque_preview_surface = preview_model.find(
+            ".//material[@name='preview_surface_0']")
+        assert opaque_preview_surface is not None
+        assert abs(float(opaque_preview_surface.attrib["rgba"].split()[3]) - 1.0) < 1e-9
+        transparent_surface = preview_model.find(
+            ".//material[@name='preview_surface_8']")
+        assert transparent_surface is not None
+        assert float(transparent_surface.attrib["rgba"].split()[3]) == 0.0
         floor = model.find(".//geom[@name='floor']")
-        assert floor is not None and floor.attrib["material"] == "arena_floor_laminate"
+        assert floor is not None and floor.attrib["type"] == "plane"
+        assert floor.attrib["rgba"] == "0 0 0 0"
+        floor_visual = model.find(".//geom[@name='floor_visual']")
+        assert floor_visual is not None and floor_visual.attrib["material"] == "arena_floor_laminate"
+        assert floor_visual.attrib["type"] == "box" and floor_visual.attrib["pos"] == "0 0 -0.001"
+        assert floor_visual.attrib["size"] == "1 1 0.001"
+        assert floor_visual.attrib["contype"] == "0" and floor_visual.attrib["conaffinity"] == "0"
         floor_material = model.find(".//material[@name='arena_floor_laminate']")
         assert floor_material is not None and float(floor_material.attrib["rgba"].split()[0]) > 0.75
-        assert model.find(".//light[@name='arena_key_light']") is not None
-        assert model.find(".//light[@name='arena_fill_light']") is not None
+        key_light = model.find(".//light[@name='arena_key_light']")
+        fill_light = model.find(".//light[@name='arena_fill_light']")
+        assert key_light is not None and key_light.attrib["castshadow"] == "false"
+        assert fill_light is not None and fill_light.attrib["castshadow"] == "false"
         assert model.find(".//motor[@name='cad_assembly_2_drive']") is not None
         assert model.find(".//motor[@name='cad_assembly_3_drive']") is not None
         assert model.find(".//motor[@name='cad_assembly_1_drive']") is not None
@@ -409,8 +524,11 @@ def main(exe, workdir=None):
         assert east_wall is not None
         assert east_wall.attrib["pos"].split()[0] == "1.30"
         assert east_wall.attrib["size"].split()[0] == "0.30"
+        assert float(east_wall.attrib["size"].split()[1]) >= 1.619
         assert east_wall.attrib["margin"] == "0.01"
         assert east_wall.attrib["solref"] == "0.001 1"
+        assert float(model.find(".//geom[@name='north_wall']").attrib["size"].split()[0]) >= 1.619
+        assert float(model.find(".//geom[@name='roof']").attrib["size"].split()[0]) >= 1.619
         east_panel = model.find(".//geom[@name='east_wall_acrylic']")
         assert east_panel is not None
         assert east_panel.attrib["size"].split()[0] == "0.004"
@@ -701,7 +819,7 @@ def main(exe, workdir=None):
         assert (long_root / "combatsim_preview.xml").read_bytes() == disk_preview_before
         print("Received CAD stayed in RAM and did not rewrite bundle-side model files")
 
-        result = subprocess.run([str(exe), "--test-lan-session", str(long_manifest_path),
+        result = subprocess.run([str(exe), "--test-lan-session", str(root / "manifest.json"),
                                  str(opponent_manifest)],
                                 text=True, capture_output=True, timeout=30)
         print(result.stdout, end="")

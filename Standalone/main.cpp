@@ -1,4 +1,12 @@
 #include <mujoco/mujoco.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#if defined(COMBATSIM_USE_FILAMENT)
+#include "experimental/filament/render_context_filament.h"
+#endif
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
 #include "imgui.h"
@@ -11,9 +19,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -25,7 +35,154 @@
 namespace {
 constexpr double pi = 3.14159265358979323846;
 constexpr double drive_command_ramp_seconds = 0.30;
+#if defined(COMBATSIM_USE_FILAMENT)
+constexpr int compiled_renderer_id = 1;  // 1 = Filament PBR.
+#else
+constexpr int compiled_renderer_id = 0;  // 0 = MuJoCo classic.
+#endif
 using json = nlohmann::json;
+
+std::filesystem::path standalone_source_dir() {
+  const char* executable_dir = SDL_GetBasePath();
+  if (!executable_dir) return {};
+  auto candidate = std::filesystem::path(executable_dir);
+  for (int depth = 0; depth < 7 && !candidate.empty(); ++depth) {
+    if (std::filesystem::exists(candidate / "build_filament.ps1")) return candidate;
+    const auto parent = candidate.parent_path();
+    if (parent == candidate) break;
+    candidate = parent;
+  }
+  return {};
+}
+
+std::filesystem::path renderer_executable(int renderer_id) {
+  const auto source_dir = standalone_source_dir();
+  if (source_dir.empty()) return {};
+  return renderer_id == 1
+      ? source_dir / "filament-build" / "bin" / "Release" / "CombatSimStandalone.exe"
+      : source_dir / "build" / "Release" / "CombatSimStandalone.exe";
+}
+
+bool launch_renderer_build(int renderer_id, const std::filesystem::path& model_path,
+                           std::string& error,
+                           const std::filesystem::path& player_manifest = {},
+                           const std::filesystem::path& opponent_manifest = {}) {
+  const auto target = renderer_executable(renderer_id);
+  if (target.empty()) {
+    error = "Could not locate the CombatSim Standalone source folder.";
+    return false;
+  }
+  if (!std::filesystem::exists(target)) {
+    error = renderer_id == 1
+        ? "Filament build not found. Run Standalone\\build_filament.ps1 first."
+        : "Classic build not found. Run Standalone\\setup.ps1 first.";
+    return false;
+  }
+  std::error_code path_error;
+  const auto absolute_model = std::filesystem::absolute(model_path, path_error);
+  if (path_error) {
+    error = "Could not resolve the active model path for the renderer switch.";
+    return false;
+  }
+  const auto quote = [](const std::filesystem::path& path) {
+    return L"\"" + path.wstring() + L"\"";
+  };
+  std::wstring parameters;
+  if (!player_manifest.empty()) {
+    parameters = L"--renderer-resume " + quote(player_manifest) + L" " +
+      (opponent_manifest.empty() ? L"\"\"" : quote(opponent_manifest));
+  } else {
+    parameters = quote(absolute_model);
+  }
+  const auto source_dir = standalone_source_dir();
+  const std::wstring working_dir = source_dir.parent_path().wstring();
+  const auto launched = ShellExecuteW(nullptr, L"open", target.c_str(),
+                                      parameters.c_str(), working_dir.c_str(),
+                                      SW_SHOWNORMAL);
+  if (reinterpret_cast<INT_PTR>(launched) <= 32) {
+    error = "Windows could not start the selected renderer build.";
+    return false;
+  }
+  return true;
+}
+
+#if defined(COMBATSIM_USE_FILAMENT)
+int load_filament_asset(const char* filename, void*, unsigned char** contents,
+                        uint64_t* size) {
+  const auto path = std::filesystem::path(COMBATSIM_FILAMENT_ASSETS_DIR) / filename;
+  std::ifstream file(path, std::ios::binary);
+  if (!file) {
+    std::fprintf(stderr, "Filament asset missing: %s\n", path.string().c_str());
+    return 1;
+  }
+  file.seekg(0, std::ios::end);
+  const auto end = file.tellg();
+  if (end <= 0) return 1;
+  *size = static_cast<uint64_t>(end);
+  file.seekg(0, std::ios::beg);
+  *contents = static_cast<unsigned char*>(std::malloc(*size));
+  if (!*contents) return 1;
+  file.read(reinterpret_cast<char*>(*contents), static_cast<std::streamsize>(*size));
+  if (!file) {
+    std::free(*contents);
+    *contents = nullptr;
+    return 1;
+  }
+  return 0;
+}
+
+void make_render_context(const mjModel* model, mjrContext* context) {
+  mjrFilamentConfig config;
+  mjr_defaultFilamentConfig(&config);
+  config.load_asset = load_filament_asset;
+  config.graphics_api = mjGFX_OPENGL;
+  config.enable_gui = false;
+  mjr_makeFilamentContext(model, context, &config);
+}
+#else
+void make_render_context(const mjModel* model, mjrContext* context) {
+  mjr_makeContext(model, context, mjFONTSCALE_100);
+}
+#endif
+
+#if defined(COMBATSIM_USE_FILAMENT)
+bool write_rgb_bitmap(const std::filesystem::path& path, int width, int height,
+                      const std::vector<unsigned char>& rgb) {
+  if (width <= 0 || height <= 0 || rgb.size() != size_t(width) * height * 3)
+    return false;
+  const uint32_t stride = (uint32_t(width) * 3 + 3) & ~uint32_t(3);
+  const uint32_t image_size = stride * uint32_t(height);
+  auto u16 = [](std::ofstream& file, uint16_t value) {
+    const char bytes[2] = {char(value), char(value >> 8)};
+    file.write(bytes, sizeof(bytes));
+  };
+  auto u32 = [](std::ofstream& file, uint32_t value) {
+    const char bytes[4] = {char(value), char(value >> 8),
+                           char(value >> 16), char(value >> 24)};
+    file.write(bytes, sizeof(bytes));
+  };
+  std::ofstream file(path, std::ios::binary);
+  if (!file) return false;
+  file.write("BM", 2);
+  u32(file, 54 + image_size); u16(file, 0); u16(file, 0); u32(file, 54);
+  u32(file, 40); u32(file, uint32_t(width)); u32(file, uint32_t(height));
+  u16(file, 1); u16(file, 24); u32(file, 0); u32(file, image_size);
+  u32(file, 2835); u32(file, 2835); u32(file, 0); u32(file, 0);
+  const uint32_t padding = stride - uint32_t(width) * 3;
+  const char zeros[3] = {};
+  for (int y = height - 1; y >= 0; --y) {
+    for (int x = 0; x < width; ++x) {
+      const size_t index = (size_t(y) * width + x) * 3;
+      const char bgr[3] = {char(rgb[index + 2]), char(rgb[index + 1]),
+                           char(rgb[index])};
+      file.write(bgr, sizeof(bgr));
+    }
+    file.write(zeros, padding);
+  }
+  return bool(file);
+}
+#endif
+
 constexpr int max_input_channels = 16;
 constexpr float min_arena_size_m = 0.75f;
 constexpr float max_arena_size_m = 10.0f;
@@ -44,6 +201,7 @@ struct ArenaSizePreset {
 };
 
 struct AppSettings {
+  int renderer = compiled_renderer_id;  // 0 = classic, 1 = Filament PBR.
   int spawn_layout = 0;  // 0 = center line, 1 = opposite diagonal.
   float arena_size_m = 2.0f;  // Full side length of the square fighting area.
   std::vector<ArenaSizePreset> arena_presets;
@@ -64,6 +222,7 @@ void load_app_settings(AppSettings& settings) {
     std::ifstream input(path);
     if (!input) return;
     const json saved = json::parse(input);
+    settings.renderer = std::clamp(saved.value("renderer", settings.renderer), 0, 1);
     settings.spawn_layout = std::clamp(saved.value("spawnLayout", settings.spawn_layout), 0, 1);
     settings.arena_size_m = std::clamp(saved.value("arenaSizeM", settings.arena_size_m),
                                        min_arena_size_m, max_arena_size_m);
@@ -108,7 +267,8 @@ bool save_app_settings(const AppSettings& settings) {
       arena_presets.push_back({{"name", preset.name},
         {"sizeM", std::clamp(preset.size_m, min_arena_size_m, max_arena_size_m)}});
     }
-    json saved{{"lightingVersion", 1}, {"spawnLayout", settings.spawn_layout},
+    json saved{{"lightingVersion", 1}, {"renderer", settings.renderer},
+      {"spawnLayout", settings.spawn_layout},
       {"arenaSizeM", settings.arena_size_m},
       {"arenaPresets", std::move(arena_presets)},
       {"ambientLight", settings.ambient_light}, {"keyLight", settings.key_light},
@@ -783,29 +943,27 @@ void set_arena_geom(mjModel* model, const char* name, Vec3 position, Vec3 size) 
 void apply_arena_size(mjModel* model, double size_m) {
   if (!model) return;
   const double half = clamp_arena_size_m(size_m) * 0.5;
-  const int floor = mj_name2id(model, mjOBJ_GEOM, "floor");
-  if (floor >= 0 && floor < model->ngeom) {
-    model->geom_size[3 * floor] = half;
-    model->geom_size[3 * floor + 1] = half;
-    model->geom_aabb[6 * floor + 3] = half;
-    model->geom_aabb[6 * floor + 4] = half;
-  }
+  constexpr double floor_visual_thickness = 0.001;
+  set_arena_geom(model, "floor_visual", {0, 0, -floor_visual_thickness},
+                 {half, half, floor_visual_thickness});
 
   constexpr double catch_depth = 0.30;
   constexpr double catch_margin = 0.02;
   constexpr double panel_thickness = 0.004;
-  constexpr double wall_height = 0.5;
+  constexpr double wall_height = 0.55;
   const double wall_center = half + catch_depth;
   const double panel_center = half + panel_thickness;
-  const double catch_span = half + catch_margin;
+  // Extend the side-wall ends across the full outer depth so the four boxes
+  // overlap at arena corners. A short tangential span leaves diagonal escape gaps.
+  const double catch_outer_half_extent = half + 2.0 * catch_depth + catch_margin;
   set_arena_geom(model, "north_wall", {0, wall_center, wall_height},
-                 {catch_span, catch_depth, wall_height});
+                 {catch_outer_half_extent, catch_depth, wall_height});
   set_arena_geom(model, "south_wall", {0, -wall_center, wall_height},
-                 {catch_span, catch_depth, wall_height});
+                 {catch_outer_half_extent, catch_depth, wall_height});
   set_arena_geom(model, "east_wall", {wall_center, 0, wall_height},
-                 {catch_depth, catch_span, wall_height});
+                 {catch_depth, catch_outer_half_extent, wall_height});
   set_arena_geom(model, "west_wall", {-wall_center, 0, wall_height},
-                 {catch_depth, catch_span, wall_height});
+                 {catch_depth, catch_outer_half_extent, wall_height});
   set_arena_geom(model, "north_wall_acrylic", {0, panel_center, wall_height},
                  {half, panel_thickness, wall_height});
   set_arena_geom(model, "south_wall_acrylic", {0, -panel_center, wall_height},
@@ -814,7 +972,11 @@ void apply_arena_size(mjModel* model, double size_m) {
                  {panel_thickness, half, wall_height});
   set_arena_geom(model, "west_wall_acrylic", {-panel_center, 0, wall_height},
                  {panel_thickness, half, wall_height});
-  set_arena_geom(model, "roof", {0, 0, 1.15}, {catch_span, catch_span, 0.15});
+  // Hidden wall sides rise to 1.05 m and this roof starts at 0.95 m, leaving
+  // a 10 cm overlap to close the wall/roof seam. The clear visual panels stay
+  // at the user's 1 m arena height.
+  set_arena_geom(model, "roof", {0, 0, 1.125},
+                 {catch_outer_half_extent, catch_outer_half_extent, 0.175});
   set_arena_geom(model, "roof_acrylic", {0, 0, 1.004}, {half, half, panel_thickness});
 }
 
@@ -881,14 +1043,69 @@ void apply_arena_lighting(mjModel* model, const AppSettings& settings) {
     const int id = mj_name2id(model, mjOBJ_LIGHT, name);
     if (id < 0 || id >= model->nlight) return;
     model->light_active[id] = strength > 0.001f;
+    // Transparent arena skins still write into MuJoCo's shadow map and leave
+    // hard-edged, overlapping light patches across the MDF floor.
+    model->light_castshadow[id] = 0;
     for (int channel = 0; channel < 3; ++channel) {
       model->light_diffuse[3 * id + channel] = diffuse[channel] * strength;
       model->light_specular[3 * id + channel] = specular * strength;
     }
   };
-  set_light("arena_key_light", settings.key_light, {0.88f, 0.85f, 0.78f}, 0.08f);
-  set_light("arena_fill_light", settings.fill_light, {0.42f, 0.48f, 0.54f}, 0.015f);
+  set_light("arena_key_light", settings.key_light, {0.88f, 0.85f, 0.78f}, 0.18f);
+  set_light("arena_fill_light", settings.fill_light, {0.42f, 0.48f, 0.54f}, 0.035f);
 }
+
+#if defined(COMBATSIM_USE_FILAMENT)
+void apply_filament_material_defaults(mjModel* model) {
+  if (!model) return;
+  std::vector<bool> material_has_uv_mesh(model->nmat, false);
+  for (int geom_id = 0; geom_id < model->ngeom; ++geom_id) {
+    if (model->geom_type[geom_id] != mjGEOM_MESH) continue;
+    const int material_id = model->geom_matid[geom_id];
+    // geom_dataid is the mesh ID directly for mjGEOM_MESH.
+    const int mesh_id = model->geom_dataid[geom_id];
+    if (material_id >= 0 && material_id < model->nmat &&
+        mesh_id >= 0 && mesh_id < model->nmesh &&
+        model->mesh_texcoordadr[mesh_id] >= 0)
+      material_has_uv_mesh[material_id] = true;
+  }
+  for (int i = 0; i < model->nmat; ++i) {
+    // This PBR material samples Fusion's OBJ UVs. MuJoCo primitive shapes and
+    // legacy STL-only bundles have no UV attribute, so leave them on the
+    // regular Filament Phong material and avoid incomplete vertex layouts.
+    if (!material_has_uv_mesh[i]) {
+      model->mat_metallic[i] = -1.0f;
+      model->mat_roughness[i] = -1.0f;
+      continue;
+    }
+    const char* material_name = mj_id2name(model, mjOBJ_MATERIAL, i);
+    std::string name = material_name ? material_name : "";
+    std::transform(name.begin(), name.end(), name.begin(),
+      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    const bool metal = name.find("steel") != std::string::npos ||
+      name.find("aluminum") != std::string::npos ||
+      name.find("aluminium") != std::string::npos ||
+      name.find("titanium") != std::string::npos ||
+      name.find("metal") != std::string::npos ||
+      name.find("7075") != std::string::npos;
+    if (model->mat_metallic[i] < 0.0f) {
+      const bool painted = name.find("paint") != std::string::npos ||
+                           name.find("alloy") != std::string::npos;
+      model->mat_metallic[i] = metal ? (painted ? 0.18f : 0.82f) : 0.0f;
+    }
+    if (model->mat_roughness[i] < 0.0f) {
+      float roughness = std::clamp(1.0f - 0.80f * model->mat_shininess[i],
+                                   0.22f, 0.92f);
+      if (name.find("floor") != std::string::npos ||
+          name.find("mdf") != std::string::npos) roughness = 0.78f;
+      else if (name.find("rubber") != std::string::npos ||
+               name.find("silicone") != std::string::npos) roughness = 0.82f;
+      else if (name.find("steel") != std::string::npos) roughness = 0.26f;
+      model->mat_roughness[i] = roughness;
+    }
+  }
+}
+#endif
 
 bool translate_free_body_axis(const mjModel* model, mjData* data, int body,
                               int axis, double distance) {
@@ -2981,6 +3198,48 @@ int main(int argc, char** argv) {
       mj_deleteData(checked_data); mj_deleteModel(checked);
       return peak_position;
     };
+    auto run_corner_case = [&](double timestep) {
+      std::array<char, 4096> diagnostic{};
+      mjModel* checked = mj_loadXML(wall_model.string().c_str(), nullptr,
+                                    diagnostic.data(), diagnostic.size());
+      if (!checked) { std::fprintf(stderr, "%s\n", diagnostic.data()); return 1e9; }
+      apply_arena_size(checked, 2.0);
+      checked->opt.timestep = timestep;
+      mjData* checked_data = mj_makeData(checked);
+      const int player_joint = mj_name2id(checked, mjOBJ_JOINT, "robot_free");
+      const int target_joint = mj_name2id(checked, mjOBJ_JOINT, "target_free");
+      if (!checked_data || player_joint < 0 || target_joint < 0) {
+        if (checked_data) mj_deleteData(checked_data);
+        mj_deleteModel(checked);
+        return 1e9;
+      }
+      const int player_qpos = checked->jnt_qposadr[player_joint];
+      const int player_dof = checked->jnt_dofadr[player_joint];
+      const int target_qpos = checked->jnt_qposadr[target_joint];
+      checked_data->qpos[player_qpos] = 0.45;
+      checked_data->qpos[player_qpos + 1] = 0.45;
+      checked_data->qpos[player_qpos + 2] = 0.065;
+      checked_data->qpos[target_qpos] = -0.55;
+      checked_data->qpos[target_qpos + 1] = -0.55;
+      checked_data->qpos[target_qpos + 2] = 0.065;
+      checked_data->qvel[player_dof] = 180.0;
+      checked_data->qvel[player_dof + 1] = 180.0;
+      mj_forward(checked, checked_data);
+      double peak_extent = std::max(checked_data->qpos[player_qpos],
+                                    checked_data->qpos[player_qpos + 1]);
+      const int steps = int(std::ceil(0.08 / timestep));
+      for (int i = 0; i < steps; ++i) {
+        mj_step(checked, checked_data);
+        peak_extent = std::max(peak_extent,
+          std::max(double(checked_data->qpos[player_qpos]),
+                   double(checked_data->qpos[player_qpos + 1])));
+      }
+      std::printf("Diagonal corner impact at %.0f Hz: peak robot center extent=%.4f m\n",
+                  1.0 / timestep, peak_extent);
+      mj_deleteData(checked_data);
+      mj_deleteModel(checked);
+      return peak_extent;
+    };
     const double at_2500 = run_wall_case(0.0004, 24.0);
     const double at_10000 = run_wall_case(0.0001, 24.0);
     const double at_2500_fast = run_wall_case(0.0004, 100.0);
@@ -2989,14 +3248,17 @@ int main(int argc, char** argv) {
     const double at_10000_extreme = run_wall_case(0.0001, 180.0);
     const double roof_2500 = run_wall_case(0.0004, 100.0, true);
     const double roof_10000 = run_wall_case(0.0001, 100.0, true);
+    const double corner_2500 = run_corner_case(0.0004);
+    const double corner_10000 = run_corner_case(0.0001);
     if (at_2500 > 1.25 || at_10000 > 1.25 ||
         at_2500_fast > 0.84 || at_10000_fast > 0.84 ||
         at_2500_extreme > 1.25 || at_10000_extreme > 1.25 ||
-        roof_2500 > 1.25 || roof_10000 > 1.25) {
+        roof_2500 > 1.25 || roof_10000 > 1.25 ||
+        corner_2500 > 1.90 || corner_10000 > 1.90) {
       std::fprintf(stderr, "Robot escaped the arena's hidden wall or roof catch volumes.\n");
       return 1;
     }
-    std::puts("Wall and roof impacts stayed inside the hidden catch volumes at both update rates, including 180 m/s lateral impact.");
+    std::puts("Wall, roof, and diagonal corner impacts stayed inside the hidden catch volumes at both update rates.");
     return 0;
   }
   if (argc >= 3 && std::string(argv[1]) == "--inspect-model") {
@@ -3326,14 +3588,23 @@ int main(int argc, char** argv) {
     mjData* test_data = mj_makeData(test_model);
     if (!test_data) { mj_deleteModel(test_model); return 1; }
     const int floor = mj_name2id(test_model, mjOBJ_GEOM, "floor");
-    const int floor_material = floor >= 0 ? test_model->geom_matid[floor] : -1;
+    const int floor_visual = mj_name2id(test_model, mjOBJ_GEOM, "floor_visual");
+    const int floor_material = floor_visual >= 0 ? test_model->geom_matid[floor_visual] : -1;
     const int key = mj_name2id(test_model, mjOBJ_LIGHT, "arena_key_light");
     const int fill = mj_name2id(test_model, mjOBJ_LIGHT, "arena_fill_light");
-    bool valid = floor >= 0 && test_model->geom_rgba[4 * floor + 3] >= 0.999f &&
+    AppSettings test_lighting;
+    apply_arena_lighting(test_model, test_lighting);
+    bool valid = floor >= 0 && test_model->geom_type[floor] == mjGEOM_PLANE &&
+      test_model->geom_rgba[4 * floor + 3] == 0.0f &&
+      floor_visual >= 0 && test_model->geom_type[floor_visual] == mjGEOM_BOX &&
+      test_model->geom_contype[floor_visual] == 0 &&
+      test_model->geom_conaffinity[floor_visual] == 0 &&
+      test_model->geom_rgba[4 * floor_visual + 3] >= 0.999f &&
       floor_material >= 0 && test_model->mat_rgba[4 * floor_material] >= 0.75f &&
       test_model->mat_rgba[4 * floor_material + 1] >= 0.75f &&
       test_model->mat_rgba[4 * floor_material + 2] >= 0.70f &&
-      key >= 0 && fill >= 0;
+      key >= 0 && fill >= 0 && !test_model->light_castshadow[key] &&
+      !test_model->light_castshadow[fill];
     for (const char* name : {"north_wall_acrylic", "south_wall_acrylic",
                              "east_wall_acrylic", "west_wall_acrylic"}) {
       const int panel = mj_name2id(test_model, mjOBJ_GEOM, name);
@@ -3351,11 +3622,19 @@ int main(int argc, char** argv) {
       if (wall < 0) { valid = false; continue; }
       const bool x_axis = std::string(name).find("east") != std::string::npos ||
                           std::string(name).find("west") != std::string::npos;
-      const double inner_face = x_axis
-        ? std::abs(test_model->geom_pos[3 * wall]) - test_model->geom_size[3 * wall]
-        : std::abs(test_model->geom_pos[3 * wall + 1]) - test_model->geom_size[3 * wall + 1];
+      const int radial_axis = x_axis ? 0 : 1;
+      const int tangent_axis = 1 - radial_axis;
+      const double inner_face = std::abs(test_model->geom_pos[3 * wall + radial_axis]) -
+        test_model->geom_size[3 * wall + radial_axis];
+      const double outer_face = inner_face + 2.0 * test_model->geom_size[3 * wall + radial_axis];
+      const int roof = mj_name2id(test_model, mjOBJ_GEOM, "roof");
       valid = valid && std::abs(inner_face - 1.0) < 1e-6 &&
-        test_model->geom_rgba[4 * wall + 3] == 0.0f;
+        test_model->geom_rgba[4 * wall + 3] == 0.0f &&
+        test_model->geom_size[3 * wall + tangent_axis] >= outer_face + 0.019 &&
+        roof >= 0 && test_model->geom_size[3 * roof] >= outer_face + 0.019 &&
+        test_model->geom_size[3 * roof + 1] >= outer_face + 0.019 &&
+        test_model->geom_pos[3 * wall + 2] + test_model->geom_size[3 * wall + 2] >=
+          test_model->geom_pos[3 * roof + 2] - test_model->geom_size[3 * roof + 2] + 0.099;
     }
     const int roots[2] = {mj_name2id(test_model, mjOBJ_BODY, "Player_Robot"),
                           mj_name2id(test_model, mjOBJ_BODY, "Target_Robot")};
@@ -3415,20 +3694,33 @@ int main(int argc, char** argv) {
         alignment += expected[component] * test_data->qpos[qpos + 3 + component];
       valid = valid && std::abs(std::abs(alignment) - 1.0) < 1e-6;
     }
+    const bool initial_layout_valid = valid;
     constexpr double resized_arena_m = 3.5;
     apply_arena_size(test_model, resized_arena_m);
     apply_arena_spawn_layout(test_model, test_data, 0, resized_arena_m);
-    valid = valid && std::abs(test_model->geom_size[3 * floor] - resized_arena_m * 0.5) < 1e-6 &&
-      std::abs(test_model->geom_size[3 * floor + 1] - resized_arena_m * 0.5) < 1e-6;
+    valid = valid && std::abs(test_model->geom_size[3 * floor_visual] - resized_arena_m * 0.5) < 1e-6 &&
+      std::abs(test_model->geom_size[3 * floor_visual + 1] - resized_arena_m * 0.5) < 1e-6 &&
+      std::abs(test_model->geom_size[3 * floor_visual + 2] - 0.001) < 1e-6 &&
+      std::abs(test_model->geom_pos[3 * floor_visual + 2] + 0.001) < 1e-6 &&
+      std::abs(test_model->geom_rbound[floor_visual] -
+               std::sqrt(2.0 * std::pow(resized_arena_m * 0.5, 2) + 0.001 * 0.001)) < 1e-6;
     for (const char* name : {"north_wall", "south_wall", "east_wall", "west_wall"}) {
       const int wall = mj_name2id(test_model, mjOBJ_GEOM, name);
       if (wall < 0) { valid = false; continue; }
       const bool x_axis = std::string(name).find("east") != std::string::npos ||
                           std::string(name).find("west") != std::string::npos;
-      const double inner_face = x_axis
-        ? std::abs(test_model->geom_pos[3 * wall]) - test_model->geom_size[3 * wall]
-        : std::abs(test_model->geom_pos[3 * wall + 1]) - test_model->geom_size[3 * wall + 1];
-      valid = valid && std::abs(inner_face - resized_arena_m * 0.5) < 1e-6;
+      const int radial_axis = x_axis ? 0 : 1;
+      const int tangent_axis = 1 - radial_axis;
+      const double inner_face = std::abs(test_model->geom_pos[3 * wall + radial_axis]) -
+        test_model->geom_size[3 * wall + radial_axis];
+      const double outer_face = inner_face + 2.0 * test_model->geom_size[3 * wall + radial_axis];
+      const int roof = mj_name2id(test_model, mjOBJ_GEOM, "roof");
+      valid = valid && std::abs(inner_face - resized_arena_m * 0.5) < 1e-6 &&
+        test_model->geom_size[3 * wall + tangent_axis] >= outer_face + 0.019 &&
+        roof >= 0 && test_model->geom_size[3 * roof] >= outer_face + 0.019 &&
+        test_model->geom_size[3 * roof + 1] >= outer_face + 0.019 &&
+        test_model->geom_pos[3 * wall + 2] + test_model->geom_size[3 * wall + 2] >=
+          test_model->geom_pos[3 * roof + 2] - test_model->geom_size[3 * roof + 2] + 0.099;
     }
     for (int i = 0; i < 2; ++i) {
       Vec3 low{}, high{};
@@ -3438,6 +3730,7 @@ int main(int argc, char** argv) {
         low[1] >= -resized_arena_m * 0.5 - 1e-4 &&
         high[1] <= resized_arena_m * 0.5 + 1e-4;
     }
+    const bool resized_layout_valid = valid;
     const int player_free = free_joint_for_body(test_model, roots[0]);
     if (player_free < 0) {
       valid = false;
@@ -3459,7 +3752,9 @@ int main(int argc, char** argv) {
     if (valid)
       std::puts("Arena check passed: adjustable square arena in meters, matte laminate floor, calm lighting, 8 mm acrylic panels, hidden catch walls, safe center-line and diagonal spawns, and selected-layout reset.");
     else
-      std::fprintf(stderr, "Arena check failed: arena dimensions, floor, lights, acrylic panels, wall boundary, safe spawns, or reset layout are incorrect.\n");
+      std::fprintf(stderr, "Arena check failed (initial layout: %s, resized layout: %s): arena dimensions, floor, lights, acrylic panels, wall boundary, safe spawns, or reset layout are incorrect.\n",
+                   initial_layout_valid ? "passed" : "failed",
+                   resized_layout_valid ? "passed" : "failed");
     mj_deleteData(test_data);
     mj_deleteModel(test_model);
     return valid ? 0 : 1;
@@ -3615,17 +3910,83 @@ int main(int argc, char** argv) {
     mj_deleteModel(checked);
     return 0;
   }
-  const std::filesystem::path model_path = argc > 1 ? argv[1] :
-    std::filesystem::path("Assets/CombatSim/Models/CombatRobot500g.xml");
+#if defined(COMBATSIM_USE_FILAMENT)
+  const bool filament_render_smoke = argc >= 2 &&
+    std::string(argv[1]) == "--test-filament-render";
+  if (filament_render_smoke && argc < 4) {
+    std::fprintf(stderr, "Usage: CombatSimStandalone --test-filament-render model.xml output.bmp\n");
+    return 2;
+  }
+#else
+  constexpr bool filament_render_smoke = false;
+#endif
+  const bool renderer_resume_test = argc >= 3 &&
+    std::string(argv[1]) == "--test-renderer-resume";
+  const bool renderer_resume = argc >= 3 &&
+    (std::string(argv[1]) == "--renderer-resume" || renderer_resume_test);
+  std::filesystem::path model_path;
+  if (renderer_resume) {
+    if (!bundle.Load(argv[2])) {
+      std::fprintf(stderr, "Could not restore player CAD bundle: %s\n", bundle.Error().c_str());
+      return 1;
+    }
+    if (argc >= 4 && argv[3][0] != '\0' && !opponent_bundle.Load(argv[3])) {
+      std::fprintf(stderr, "Could not restore opponent CAD bundle: %s\n",
+                   opponent_bundle.Error().c_str());
+      return 1;
+    }
+    if (!bundle.Generate(model_path, opponent_bundle.HasBundle() ? &opponent_bundle : nullptr)) {
+      std::fprintf(stderr, "Could not rebuild CAD model after renderer switch: %s\n",
+                   bundle.Error().c_str());
+      return 1;
+    }
+  } else if (filament_render_smoke) {
+    model_path = argv[2];
+  } else {
+    model_path = argc > 1 ? argv[1] :
+      std::filesystem::path("Assets/CombatSim/Models/CombatRobot500g.xml");
+  }
   std::array<char, 4096> load_error{};
   mjModel* model = mj_loadXML(model_path.string().c_str(), nullptr, load_error.data(), load_error.size());
   if (!model) {
     std::fprintf(stderr, "MuJoCo model load failed: %s\n", load_error.data());
     return 1;
   }
+  if (renderer_resume_test) {
+    const bool restored_player = mj_name2id(model, mjOBJ_BODY, "Player_Robot") > 0;
+    const bool restored_opponent = mj_name2id(model, mjOBJ_BODY, "Target_Robot") > 0;
+    const bool valid = restored_player && restored_opponent &&
+      std::abs(model->opt.timestep - 0.0004) < 1e-12;
+    if (valid)
+      std::printf("Renderer restart restored player and opponent CAD bundles: %d bodies, %.4f s timestep.\n",
+                  model->nbody, model->opt.timestep);
+    else
+      std::fprintf(stderr, "Renderer restart bundle restore did not produce the expected two-bot model.\n");
+    mj_deleteModel(model);
+    return valid ? 0 : 1;
+  }
+#if defined(COMBATSIM_USE_FILAMENT)
+  apply_filament_material_defaults(model);
+#endif
   Controls controls;
   bind_stock_actuators(model, controls);
   Controls opponent_controls;
+  if (bundle.HasBundle()) {
+    controls.left.clear(); controls.right.clear(); controls.weapon.clear();
+    controls.filtered_wheel_speeds.clear();
+    bundle.BindControls(model, controls.left, controls.right, controls.weapon,
+      controls.motor_models, controls.weapon_motor_models,
+      controls.manual_velocity_actuators, controls.battery_voltage);
+  }
+  if (opponent_bundle.HasBundle()) {
+    opponent_controls.left.clear(); opponent_controls.right.clear();
+    opponent_controls.weapon.clear(); opponent_controls.filtered_wheel_speeds.clear();
+    opponent_bundle.BindControls(model, opponent_controls.left,
+      opponent_controls.right, opponent_controls.weapon,
+      opponent_controls.motor_models, opponent_controls.weapon_motor_models,
+      opponent_controls.manual_velocity_actuators,
+      opponent_controls.battery_voltage, true);
+  }
   mjData* data = mj_makeData(model);
   if (!data || !SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK)) {
     std::fprintf(stderr, "Initialization failed: %s\n", SDL_GetError());
@@ -3653,6 +4014,24 @@ int main(int argc, char** argv) {
   load_mixer_settings(input_mixer);
   AppSettings app_settings;
   load_app_settings(app_settings);
+  std::string graphics_status;
+  if (app_settings.renderer != compiled_renderer_id) {
+    const std::filesystem::path player_manifest = bundle.HasBundle() &&
+        !bundle.IsMemoryLoaded() ? bundle.ManifestPath() : std::filesystem::path{};
+    const std::filesystem::path opponent_manifest = opponent_bundle.HasBundle() &&
+        !opponent_bundle.IsMemoryLoaded() ? opponent_bundle.ManifestPath() : std::filesystem::path{};
+    if (launch_renderer_build(app_settings.renderer, model_path, graphics_status,
+                              player_manifest, opponent_manifest)) {
+      SDL_GL_DestroyContext(gl);
+      SDL_DestroyWindow(window);
+      SDL_Quit();
+      mj_deleteData(data);
+      mj_deleteModel(model);
+      return 0;
+    }
+    app_settings.renderer = compiled_renderer_id;
+    save_app_settings(app_settings);
+  }
   char arena_preset_name[65]{};
   std::string arena_preset_status;
   apply_arena_size(model, app_settings.arena_size_m);
@@ -3677,11 +4056,66 @@ int main(int argc, char** argv) {
   mjvScene setup_scene; mjv_defaultScene(&setup_scene);
   mjrContext setup_context; mjr_defaultContext(&setup_context);
   model->vis.quality.offsamples = 0;
-  mjrContext context; mjr_defaultContext(&context); mjr_makeContext(model, &context, mjFONTSCALE_100);
+  mjrContext context; mjr_defaultContext(&context); make_render_context(model, &context);
+#if defined(COMBATSIM_USE_FILAMENT)
+  GLuint main_scene_texture = 0;
+  glGenTextures(1, &main_scene_texture);
+  int main_scene_width = 0, main_scene_height = 0;
+  std::vector<unsigned char> main_scene_pixels;
+#endif
   GLuint preview_texture = 0;
   glGenTextures(1, &preview_texture);
   int texture_width = 0, texture_height = 0;
   std::vector<unsigned char> preview_pixels;
+#if defined(COMBATSIM_USE_FILAMENT)
+  if (filament_render_smoke) {
+    constexpr int test_width = 1024, test_height = 768;
+    mjv_updateScene(model, data, &options, nullptr, &camera, mjCAT_ALL, &scene);
+    std::vector<unsigned char> pixels(size_t(test_width) * test_height * 3);
+    const mjrRect test_view{0, 0, test_width, test_height};
+    mjr_setBuffer(mjFB_OFFSCREEN, &context);
+    mjr_render(test_view, &scene, &context);
+    mjr_readPixels(pixels.data(), nullptr, test_view, &context);
+    unsigned char low = 255, high = 0;
+    for (unsigned char value : pixels) {
+      low = std::min(low, value);
+      high = std::max(high, value);
+    }
+    const bool image_written = write_rgb_bitmap(argv[3], test_width, test_height, pixels);
+    mjrContext preview_context; mjr_defaultContext(&preview_context);
+    mjvScene preview_scene; mjv_defaultScene(&preview_scene);
+    mjv_makeScene(model, &preview_scene, 512);
+    make_render_context(model, &preview_context);
+    constexpr int preview_width = 320, preview_height = 240;
+    std::vector<unsigned char> preview_pixels(size_t(preview_width) * preview_height * 3);
+    mjv_updateScene(model, data, &options, nullptr, &setup_camera, mjCAT_ALL,
+                    &preview_scene);
+    mjr_setBuffer(mjFB_OFFSCREEN, &preview_context);
+    mjr_render({0, 0, preview_width, preview_height}, &preview_scene, &preview_context);
+    mjr_readPixels(preview_pixels.data(), nullptr,
+                   {0, 0, preview_width, preview_height}, &preview_context);
+    const auto preview_range = std::minmax_element(preview_pixels.begin(), preview_pixels.end());
+    const bool preview_rendered = preview_range.first != preview_pixels.end() &&
+      int(*preview_range.second) - int(*preview_range.first) >= 8;
+    const bool rendered = image_written && (high - low >= 8) && preview_rendered;
+    if (rendered)
+      std::printf("Filament render smoke passed: %s (%dx%d, pixel range %u-%u)\n",
+                  argv[3], test_width, test_height, unsigned(low), unsigned(high));
+    else
+      std::fprintf(stderr, "Filament render smoke failed (image write=%d, drive range %u-%u, preview=%d).\n",
+                   image_written ? 1 : 0, unsigned(low), unsigned(high),
+                   preview_rendered ? 1 : 0);
+    mjr_freeContext(&preview_context); mjv_freeScene(&preview_scene);
+    mjr_freeContext(&context); mjv_freeScene(&scene);
+    glDeleteTextures(1, &preview_texture);
+    glDeleteTextures(1, &main_scene_texture);
+    if (pad) SDL_CloseGamepad(pad);
+    if (joystick) SDL_CloseJoystick(joystick);
+    SDL_GL_DestroyContext(gl); SDL_DestroyWindow(window); SDL_Quit();
+    mj_deleteData(data); mj_deleteModel(model);
+    return rendered ? 0 : 1;
+  }
+#endif
   IMGUI_CHECKVERSION(); ImGui::CreateContext();
   ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_DockingEnable;
   ImGuiStyle& ui = ImGui::GetStyle();
@@ -3734,8 +4168,10 @@ int main(int argc, char** argv) {
   ImGui_ImplOpenGL3_Init("#version 330");
 
   enum class AppScreen { Home, Drive, Configure, Settings };
+  enum class SettingsSection { Arena, Graphics };
   enum class GizmoMode { Move, Rotate };
   AppScreen screen = AppScreen::Home;
+  SettingsSection settings_section = SettingsSection::Arena;
   int config_bot = 0;  // 0 = player, 1 = opponent.
   bool opponent_ai_enabled = true;
   float opponent_ai_aggression_percent = 70.0f;
@@ -3779,6 +4215,9 @@ int main(int argc, char** argv) {
       if (next_model) mj_deleteModel(next_model);
       return false;
     }
+#if defined(COMBATSIM_USE_FILAMENT)
+    apply_filament_material_defaults(next_model);
+#endif
     apply_arena_size(next_model, app_settings.arena_size_m);
     apply_arena_spawn_layout(next_model, next_data, app_settings.spawn_layout,
                              app_settings.arena_size_m);
@@ -3788,7 +4227,7 @@ int main(int argc, char** argv) {
     model = next_model; data = next_data;
     gizmo_drag_active = false; gizmo_drag_axis = -1;
     model->vis.quality.offsamples = 0;
-    mjv_makeScene(model, &scene, 2000); mjr_makeContext(model, &context, mjFONTSCALE_100);
+    mjv_makeScene(model, &scene, 2000); make_render_context(model, &context);
     controls.left.clear(); controls.right.clear(); controls.weapon.clear();
     controls.filtered_wheel_speeds.clear();
     bundle.BindControls(model, controls.left, controls.right, controls.weapon,
@@ -4126,7 +4565,9 @@ int main(int argc, char** argv) {
     int width = 0, height = 0;
     SDL_GetWindowSizeInPixels(window, &width, &height);
     mjrRect viewport{0, 0, width, height};
+#if !defined(COMBATSIM_USE_FILAMENT)
     mjr_setBuffer(mjFB_WINDOW, &context);
+#endif
     apply_arena_lighting(model, app_settings);
     mjv_updateScene(model, data, &options, nullptr, &camera, mjCAT_ALL, &scene);
     if (local_bot_is_guest) {
@@ -4141,8 +4582,37 @@ int main(int argc, char** argv) {
       add_transform_gizmo(model, data, player_root, gizmo_mode == GizmoMode::Rotate,
                           gizmo_drag_axis, gizmo_length, scene);
     }
+#if defined(COMBATSIM_USE_FILAMENT)
+    if (width != main_scene_width || height != main_scene_height) {
+      if (main_scene_width > 0) mjr_setBuffer(mjFB_WINDOW, &context);
+      main_scene_width = width;
+      main_scene_height = height;
+      main_scene_pixels.resize(size_t(width) * height * 3);
+      glBindTexture(GL_TEXTURE_2D, main_scene_texture);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0,
+                   GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    }
+    mjr_setBuffer(mjFB_OFFSCREEN, &context);
     mjr_render(viewport, &scene, &context);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    mjr_readPixels(main_scene_pixels.data(), nullptr, viewport, &context);
+    glBindTexture(GL_TEXTURE_2D, main_scene_texture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+                    GL_RGB, GL_UNSIGNED_BYTE, main_scene_pixels.data());
+#else
+    mjr_render(viewport, &scene, &context);
+#endif
     ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL3_NewFrame(); ImGui::NewFrame();
+#if defined(COMBATSIM_USE_FILAMENT)
+    // Filament's readPixels path already flips OpenGL's bottom-up rows into
+    // top-left image order, so the ImGui texture must not be V-flipped again.
+    ImGui::GetBackgroundDrawList()->AddImage(
+      (ImTextureID)(intptr_t)main_scene_texture, ImVec2(0, 0),
+      ImGui::GetIO().DisplaySize, ImVec2(0, 0), ImVec2(1, 1));
+#endif
     bool load_requested = false, apply_requested = false;
     FusionBundle* setup_bundle = &bundle;
     bool mixer_popup_requested = false;
@@ -4281,7 +4751,7 @@ int main(int argc, char** argv) {
           ui_blue, false, [&] { screen = AppScreen::Configure; paused = true; });
       menu_item("##menu_mixer", "03", "CONTROLLER SETUP", "Map joystick channels and response curves",
           ui_violet, false, [&] { mixer_popup_requested = true; });
-      menu_item("##menu_settings", "04", "ARENA SETTINGS", "Adjust lighting and choose bot starting positions",
+      menu_item("##menu_settings", "04", "SETTINGS", "Arena layout, lighting and graphics",
           ui_amber, false, [&] { screen = AppScreen::Settings; paused = true; });
       menu_item("##menu_lan", "05", "LAN MULTIPLAYER", "Host a match or join another bot on your network",
           ui_coral, false, [&] { lan_popup_requested = true; });
@@ -4352,11 +4822,32 @@ int main(int argc, char** argv) {
                                ImGuiCond_Always);
       ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.055f, 0.075f, 0.105f, 0.96f));
       ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
-      ImGui::Begin("##arena_settings", nullptr, fixed_window);
+      ImGui::Begin("##settings", nullptr, fixed_window);
       const float panel_width = std::min(760.0f, std::max(360.0f, display.x - 48.0f));
       ImGui::SetCursorPosX(std::max(24.0f, (display.x - panel_width) * 0.5f));
-      ImGui::BeginChild("Arena settings panel", ImVec2(panel_width, display.y - 110.0f),
+      ImGui::BeginChild("Settings panel", ImVec2(panel_width, display.y - 110.0f),
                         ImGuiChildFlags_Borders);
+      ImGui::TextColored(ui_amber, "SETTINGS");
+      ImGui::TextDisabled("Choose an arena setup or adjust how the simulator looks.");
+      push_button_palette(settings_section == SettingsSection::Arena
+                              ? ImVec4(0.24f, 0.43f, 0.64f, 1.0f)
+                              : ImVec4(0.16f, 0.20f, 0.26f, 1.0f),
+                          ImVec4(0.30f, 0.48f, 0.68f, 1.0f),
+                          ImVec4(0.20f, 0.39f, 0.47f, 1.0f));
+      if (ImGui::Button("Arena settings", ImVec2(150.0f, 36.0f)))
+        settings_section = SettingsSection::Arena;
+      pop_button_palette();
+      ImGui::SameLine();
+      push_button_palette(settings_section == SettingsSection::Graphics
+                              ? ImVec4(0.24f, 0.43f, 0.64f, 1.0f)
+                              : ImVec4(0.16f, 0.20f, 0.26f, 1.0f),
+                          ImVec4(0.30f, 0.48f, 0.68f, 1.0f),
+                          ImVec4(0.20f, 0.39f, 0.47f, 1.0f));
+      if (ImGui::Button("Graphics settings", ImVec2(170.0f, 36.0f)))
+        settings_section = SettingsSection::Graphics;
+      pop_button_palette();
+      ImGui::Separator();
+      if (settings_section == SettingsSection::Arena) {
       ImGui::TextColored(ui_amber, "ARENA SETTINGS");
       ImGui::TextDisabled("Changes are saved on this computer and applied to the current arena.");
       const bool spawn_locked = lan_bundle_swapped || lan_connected;
@@ -4429,10 +4920,8 @@ int main(int argc, char** argv) {
       if (arena_size_changed) {
         app_settings.arena_size_m = float(clamp_arena_size_m(app_settings.arena_size_m));
         apply_arena_size(model, app_settings.arena_size_m);
-        // MuJoCo compiles bounded plane tiles into the renderer context, so rebuild it
-        // after changing the floor geom size to extend its laminate color to the new edge.
-        mjr_freeContext(&context);
-        mjr_makeContext(model, &context, mjFONTSCALE_100);
+        // The visible floor and arena boundaries use primitive boxes, so the next
+        // scene update picks up their new dimensions without rebuilding renderer resources.
         apply_arena_spawn_layout(model, data, app_settings.spawn_layout,
                                  app_settings.arena_size_m);
         if (previous_arena_size_m > 0.0f)
@@ -4477,6 +4966,74 @@ int main(int argc, char** argv) {
       ImGui::TextWrapped(app_settings.spawn_layout == 0
         ? "Bots start on opposite ends of the arena's center line, facing each other."
         : "Bots start at opposite diagonal positions and turn together to face across the arena.");
+      } else {
+      ImGui::TextColored(ui_blue, "GRAPHICS SETTINGS");
+      ImGui::TextDisabled("Renderer changes restart CombatSim and reopen the current model.");
+      ImGui::SeparatorText("Renderer");
+      ImGui::Text("Active renderer: %s", compiled_renderer_id == 1
+          ? "Filament PBR" : "MuJoCo classic");
+      ImGui::TextWrapped("Filament adds physically based materials and image-based reflections. It is an experimental real-time renderer.");
+      const int other_renderer_id = compiled_renderer_id == 1 ? 0 : 1;
+      const auto other_renderer_exe = renderer_executable(other_renderer_id);
+      const bool other_renderer_available = !other_renderer_exe.empty() &&
+        std::filesystem::exists(other_renderer_exe);
+      const bool renderer_switch_locked = lan_connected || lan_bundle_swapped ||
+        !other_renderer_available;
+      ImGui::BeginDisabled(renderer_switch_locked);
+      bool requested_filament = compiled_renderer_id == 1;
+      if (ImGui::Checkbox("Use Filament PBR renderer", &requested_filament) &&
+          (requested_filament ? 1 : 0) != compiled_renderer_id) {
+        graphics_status.clear();
+        std::filesystem::path player_manifest;
+        std::filesystem::path opponent_manifest;
+        bool bundles_saved = true;
+        auto save_bundle_for_switch = [&](FusionBundle& saved_bundle,
+                                          std::filesystem::path& manifest,
+                                          const char* label) {
+          if (!saved_bundle.HasBundle()) return true;
+          if (saved_bundle.IsMemoryLoaded() || saved_bundle.ManifestPath().empty()) {
+            graphics_status = std::string(label) +
+              " bot is only in memory and cannot be restored after switching.";
+            return false;
+          }
+          if (!saved_bundle.Save()) {
+            graphics_status = std::string("Could not save ") + label +
+              " bot setup: " + saved_bundle.Error();
+            return false;
+          }
+          manifest = saved_bundle.ManifestPath();
+          return true;
+        };
+        bundles_saved &= save_bundle_for_switch(bundle, player_manifest, "Player");
+        bundles_saved &= save_bundle_for_switch(opponent_bundle, opponent_manifest,
+                                                 "Opponent");
+        const int desired_renderer = requested_filament ? 1 : 0;
+        if (bundles_saved) {
+          app_settings.renderer = desired_renderer;
+          if (!save_app_settings(app_settings)) {
+            graphics_status = "Could not save the renderer preference.";
+            app_settings.renderer = compiled_renderer_id;
+          } else if (!launch_renderer_build(app_settings.renderer, model_path,
+                                             graphics_status, player_manifest,
+                                             opponent_manifest)) {
+            app_settings.renderer = compiled_renderer_id;
+            save_app_settings(app_settings);
+          } else {
+            running = false;
+          }
+        } else {
+          app_settings.renderer = compiled_renderer_id;
+        }
+      }
+      ImGui::EndDisabled();
+      if (!other_renderer_available) {
+        ImGui::TextDisabled(compiled_renderer_id == 1
+          ? "Classic build is missing. Run Standalone\\setup.ps1 first."
+          : "Filament build is missing. Run Standalone\\build_filament.ps1 first.");
+      }
+      if (lan_connected || lan_bundle_swapped)
+        ImGui::TextDisabled("Renderer switching is unavailable during a LAN match.");
+      if (!graphics_status.empty()) ImGui::TextColored(ui_red, "%s", graphics_status.c_str());
       ImGui::SeparatorText("Arena lighting");
       bool lighting_changed = false;
       ImGui::SetNextItemWidth(std::min(480.0f, panel_width - 40.0f));
@@ -4501,6 +5058,7 @@ int main(int argc, char** argv) {
       }
       ImGui::Separator();
       ImGui::TextColored(ui_green, "Arena floor opacity: 100%%");
+      }
       if (ImGui::Button("Back to Home", ImVec2(150.0f, 36.0f))) {
         screen = AppScreen::Home;
         paused = true;
@@ -4894,7 +5452,7 @@ int main(int argc, char** argv) {
       ImGui::TextColored(config_bot == 1 ? ui_coral : ui_blue,
                          config_bot == 1 ? "OPPONENT PREVIEW" : "PLAYER PREVIEW");
       setup_bundle->DrawAxisSelectionControls();
-      ImGui::TextWrapped("Hover to highlight a part. In axis mode, hover a hole rim until its edge loop highlights, then click. Left drag orbits; right drag pans; scroll zooms.");
+      ImGui::TextWrapped("Hover to highlight a part; click it to select it and jump to its settings. In axis mode, hover a hole rim until its edge loop highlights, then click. Left drag orbits; right drag pans; scroll zooms.");
       if (setup_model && setup_bundle->HasBundle()) {
         if (ImGui::SmallButton("Reset view")) {
           const auto center = setup_bundle->PreviewCenter();
@@ -4912,9 +5470,14 @@ int main(int argc, char** argv) {
         const ImVec2 available = ImGui::GetContentRegionAvail();
         const int preview_width = std::max(1, int(available.x));
         const int preview_height = std::max(1, int(available.y));
+#if !defined(COMBATSIM_USE_FILAMENT)
         if (preview_width != setup_context.offWidth || preview_height != setup_context.offHeight)
           mjr_resizeOffscreen(preview_width, preview_height, &setup_context);
+#endif
         if (preview_width != texture_width || preview_height != texture_height) {
+#if defined(COMBATSIM_USE_FILAMENT)
+          if (texture_width > 0) mjr_setBuffer(mjFB_WINDOW, &setup_context);
+#endif
           texture_width = preview_width; texture_height = preview_height;
           preview_pixels.resize(size_t(preview_width) * preview_height * 3);
           glBindTexture(GL_TEXTURE_2D, preview_texture);
@@ -4966,7 +5529,9 @@ int main(int argc, char** argv) {
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         mjr_readPixels(preview_pixels.data(), nullptr,
                        {0, 0, preview_width, preview_height}, &setup_context);
+#if !defined(COMBATSIM_USE_FILAMENT)
         mjr_setBuffer(mjFB_WINDOW, &setup_context);
+#endif
         glBindTexture(GL_TEXTURE_2D, preview_texture);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, preview_width, preview_height,
@@ -4975,8 +5540,13 @@ int main(int argc, char** argv) {
                                ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
         const ImVec2 image_min = ImGui::GetItemRectMin();
         const ImVec2 image_max = ImGui::GetItemRectMax();
+#if defined(COMBATSIM_USE_FILAMENT)
+        ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)preview_texture,
+                                             image_min, image_max, ImVec2(0, 0), ImVec2(1, 1));
+#else
         ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)preview_texture,
                                              image_min, image_max, ImVec2(0, 1), ImVec2(1, 0));
+#endif
         const bool canvas_click = mouse.x >= image_min.x && mouse.y >= image_min.y &&
           mouse.x < image_max.x && mouse.y < image_max.y &&
           ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
@@ -5011,8 +5581,24 @@ int main(int argc, char** argv) {
               setup_scene, *setup_bundle, hit);
             setup_bundle->UpdateHover(part, {hit[0], hit[1], hit[2]});
             setup_bundle->SelectHoveredHole();
-          } else if (setup_bundle->HoveredPart() >= 0) {
-            setup_bundle->SelectPart(setup_bundle->HoveredPart());
+          } else if (setup_bundle->PrintBedFacePicking()) {
+            mjtNum hit[3];
+            const int part = SelectPreviewPartForHover(setup_model, setup_data,
+              &options, double(preview_width)/preview_height,
+              (mouse.x-image_min.x)/preview_width,
+              1.0-(mouse.y-image_min.y)/preview_height,
+              setup_scene, *setup_bundle, hit);
+            setup_bundle->UpdateHover(part, {hit[0], hit[1], hit[2]});
+            setup_bundle->SelectHoveredPrintBedFace();
+          } else {
+            mjtNum hit[3];
+            const int part = SelectPreviewPartForHover(setup_model, setup_data,
+              &options, double(preview_width)/preview_height,
+              (mouse.x-image_min.x)/preview_width,
+              1.0-(mouse.y-image_min.y)/preview_height,
+              setup_scene, *setup_bundle, hit);
+            setup_bundle->UpdateHover(part, {hit[0], hit[1], hit[2]});
+            if (part >= 0) setup_bundle->SelectPart(part);
           }
         }
       } else ImGui::TextWrapped("Load a Fusion manifest in this bot's configuration to preview and select its parts.");
@@ -5194,10 +5780,13 @@ int main(int argc, char** argv) {
             mj_deleteData(setup_data); mj_deleteModel(setup_model);
           }
           setup_model = next; setup_data = next_data;
+#if defined(COMBATSIM_USE_FILAMENT)
+          apply_filament_material_defaults(setup_model);
+#endif
           mj_forward(setup_model, setup_data);
           setup_model->vis.quality.offsamples = 0;
           mjv_makeScene(setup_model, &setup_scene, 2000);
-          mjr_makeContext(setup_model, &setup_context, mjFONTSCALE_100);
+          make_render_context(setup_model, &setup_context);
           const auto center = setup_bundle->PreviewCenter();
           for (int i = 0; i < 3; ++i) setup_camera.lookat[i] = center[i];
           setup_camera.distance = setup_bundle->PreviewDistance();
@@ -5224,6 +5813,9 @@ int main(int argc, char** argv) {
   if (joystick) SDL_CloseJoystick(joystick);
   ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplSDL3_Shutdown(); ImGui::DestroyContext();
   glDeleteTextures(1, &preview_texture);
+#if defined(COMBATSIM_USE_FILAMENT)
+  glDeleteTextures(1, &main_scene_texture);
+#endif
   if (setup_model) {
     mjr_freeContext(&setup_context); mjv_freeScene(&setup_scene);
     mj_deleteData(setup_data); mj_deleteModel(setup_model);

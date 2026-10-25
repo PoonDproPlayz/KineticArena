@@ -23,4 +23,5 @@ _unity_verify/
 Thumbs.db
 Desktop.ini
 /Standalone/build/
+/Standalone/filament-build/
 /Standalone/.deps/
