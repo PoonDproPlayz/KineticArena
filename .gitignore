@@ -1,13 +1,16 @@
-# Unity generated files
-[Ll]ibrary/
-[Tt]emp/
-[Oo]bj/
+# Build and generated files
 [Bb]uild/
 [Bb]uilds/
+[Oo]bj/
+[Tt]emp/
+[Ll]ibrary/
 [Ll]ogs/
 [Uu]ser[Ss]ettings/
-MemoryCaptures/
-_unity_verify/
+site/
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
 
 # IDE files
 .vs/
@@ -25,3 +28,4 @@ Desktop.ini
 /Standalone/build/
 /Standalone/filament-build/
 /Standalone/.deps/
+/Standalone/filament-check/

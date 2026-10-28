@@ -14,6 +14,7 @@
 #include "backends/imgui_impl_opengl3.h"
 #include "FusionBundle.h"
 #include "LanSession.h"
+#include "AppSettings.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -35,13 +36,10 @@
 namespace {
 constexpr double pi = 3.14159265358979323846;
 constexpr double drive_command_ramp_seconds = 0.30;
-#if defined(COMBATSIM_USE_FILAMENT)
-constexpr int compiled_renderer_id = 1;  // 1 = Filament PBR.
-#else
-constexpr int compiled_renderer_id = 0;  // 0 = MuJoCo classic.
-#endif
 using json = nlohmann::json;
 
+// Runtime flow: resolve the stock model, load app and bot settings, compile the
+// MuJoCo model, then run input, physics, rendering, and page UI in the main loop.
 std::filesystem::path standalone_source_dir() {
   const char* executable_dir = SDL_GetBasePath();
   if (!executable_dir) return {};
@@ -53,6 +51,31 @@ std::filesystem::path standalone_source_dir() {
     candidate = parent;
   }
   return {};
+}
+
+std::filesystem::path executable_directory() {
+  std::wstring path(32768, L'\0');
+  const DWORD length = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
+  if (length == 0 || length >= path.size()) return {};
+  path.resize(length);
+  return std::filesystem::path(path).parent_path();
+}
+
+// Find the sample model relative to the checkout or packaged executable so
+// launching CombatSim from another working directory still opens the same scene.
+std::filesystem::path stock_model_path() {
+  constexpr const char* model_name = "CombatRobot500g.xml";
+  auto candidate = executable_directory();
+  for (int depth = 0; depth < 8 && !candidate.empty(); ++depth) {
+    const auto beside_app = candidate / "models" / model_name;
+    if (std::filesystem::exists(beside_app)) return beside_app;
+    const auto in_checkout = candidate / "Standalone" / "models" / model_name;
+    if (std::filesystem::exists(in_checkout)) return in_checkout;
+    const auto parent = candidate.parent_path();
+    if (parent == candidate) break;
+    candidate = parent;
+  }
+  return std::filesystem::path("Standalone/models/CombatRobot500g.xml");
 }
 
 std::filesystem::path renderer_executable(int renderer_id) {
@@ -184,8 +207,6 @@ bool write_rgb_bitmap(const std::filesystem::path& path, int width, int height,
 #endif
 
 constexpr int max_input_channels = 16;
-constexpr float min_arena_size_m = 0.75f;
-constexpr float max_arena_size_m = 10.0f;
 const ImVec4 ui_ink(0.90f, 0.93f, 0.97f, 1.0f);
 const ImVec4 ui_blue(0.39f, 0.70f, 1.00f, 1.0f);
 const ImVec4 ui_teal(0.30f, 0.84f, 0.82f, 1.0f);
@@ -194,93 +215,6 @@ const ImVec4 ui_violet(0.74f, 0.62f, 1.00f, 1.0f);
 const ImVec4 ui_coral(1.00f, 0.57f, 0.45f, 1.0f);
 const ImVec4 ui_amber(1.00f, 0.75f, 0.36f, 1.0f);
 const ImVec4 ui_red(1.00f, 0.42f, 0.44f, 1.0f);
-
-struct ArenaSizePreset {
-  std::string name;
-  float size_m = 2.0f;
-};
-
-struct AppSettings {
-  int renderer = compiled_renderer_id;  // 0 = classic, 1 = Filament PBR.
-  int spawn_layout = 0;  // 0 = center line, 1 = opposite diagonal.
-  float arena_size_m = 2.0f;  // Full side length of the square fighting area.
-  std::vector<ArenaSizePreset> arena_presets;
-  float ambient_light = 0.12f;
-  float key_light = 0.68f;
-  float fill_light = 0.24f;
-  float camera_fill = 0.07f;
-};
-
-bool save_app_settings(const AppSettings& settings);
-
-void load_app_settings(AppSettings& settings) {
-  char* preference_path = SDL_GetPrefPath("CombatSim", "CombatSim");
-  if (!preference_path) return;
-  const std::filesystem::path path = std::filesystem::path(preference_path) / "visual_settings.json";
-  SDL_free(preference_path);
-  try {
-    std::ifstream input(path);
-    if (!input) return;
-    const json saved = json::parse(input);
-    settings.renderer = std::clamp(saved.value("renderer", settings.renderer), 0, 1);
-    settings.spawn_layout = std::clamp(saved.value("spawnLayout", settings.spawn_layout), 0, 1);
-    settings.arena_size_m = std::clamp(saved.value("arenaSizeM", settings.arena_size_m),
-                                       min_arena_size_m, max_arena_size_m);
-    const auto presets = saved.find("arenaPresets");
-    if (presets != saved.end() && presets->is_array()) {
-      for (const auto& preset : *presets) {
-        if (!preset.is_object() || !preset.contains("name") ||
-            !preset["name"].is_string() || !preset.contains("sizeM") ||
-            !preset["sizeM"].is_number()) continue;
-        const std::string name = preset["name"].get<std::string>();
-        const float size_m = preset["sizeM"].get<float>();
-        if (name.empty() || name.size() > 64 || !std::isfinite(size_m)) continue;
-        settings.arena_presets.push_back({name,
-          std::clamp(size_m, min_arena_size_m, max_arena_size_m)});
-      }
-    }
-    // Older preferences used a much brighter look that made clear panels glow.
-    // Migrate those values once while preserving the user's spawn selection.
-    if (saved.value("lightingVersion", 0) >= 1) {
-      settings.ambient_light = std::clamp(saved.value("ambientLight", settings.ambient_light), 0.0f, 0.8f);
-      settings.key_light = std::clamp(saved.value("keyLight", settings.key_light), 0.0f, 2.0f);
-      settings.fill_light = std::clamp(saved.value("fillLight", settings.fill_light), 0.0f, 2.0f);
-      settings.camera_fill = std::clamp(saved.value("cameraFill", settings.camera_fill), 0.0f, 1.0f);
-    } else {
-      input.close();
-      save_app_settings(settings);
-    }
-  } catch (const std::exception&) {
-    // A malformed preference file should not prevent the simulator from starting.
-  }
-}
-
-bool save_app_settings(const AppSettings& settings) {
-  char* preference_path = SDL_GetPrefPath("CombatSim", "CombatSim");
-  if (!preference_path) return false;
-  const std::filesystem::path path = std::filesystem::path(preference_path) / "visual_settings.json";
-  SDL_free(preference_path);
-  try {
-    json arena_presets = json::array();
-    for (const auto& preset : settings.arena_presets) {
-      if (preset.name.empty() || preset.name.size() > 64 || !std::isfinite(preset.size_m)) continue;
-      arena_presets.push_back({{"name", preset.name},
-        {"sizeM", std::clamp(preset.size_m, min_arena_size_m, max_arena_size_m)}});
-    }
-    json saved{{"lightingVersion", 1}, {"renderer", settings.renderer},
-      {"spawnLayout", settings.spawn_layout},
-      {"arenaSizeM", settings.arena_size_m},
-      {"arenaPresets", std::move(arena_presets)},
-      {"ambientLight", settings.ambient_light}, {"keyLight", settings.key_light},
-      {"fillLight", settings.fill_light}, {"cameraFill", settings.camera_fill}};
-    std::ofstream output(path, std::ios::trunc);
-    if (!output) return false;
-    output << saved.dump(2) << '\n';
-    return output.good();
-  } catch (const std::exception&) {
-    return false;
-  }
-}
 
 void push_button_palette(ImVec4 base, ImVec4 hovered, ImVec4 active) {
   ImGui::PushStyleColor(ImGuiCol_Button, base);
@@ -1872,6 +1806,8 @@ void drive(const mjModel* model, mjData* data, Controls& c, SDL_Gamepad* pad,
 }
 }
 
+// Command-line checks are handled before the interactive app is initialized;
+// they share the same model builders so diagnostics exercise production paths.
 int main(int argc, char** argv) {
   FusionBundle bundle;
   FusionBundle opponent_bundle;
@@ -2584,7 +2520,7 @@ int main(int argc, char** argv) {
     const bool arena_mode = argc >= 3 && std::string(argv[2]) == "--arena";
     const int model_arg = arena_mode ? 3 : 2;
     const std::filesystem::path test_model = argc > model_arg ? argv[model_arg] :
-      std::filesystem::path("Assets/CombatSim/Models/CombatRobot500g.xml");
+      stock_model_path();
     std::array<char, 4096> diagnostic{};
     mjModel* checked = mj_loadXML(test_model.string().c_str(), nullptr,
                                   diagnostic.data(), diagnostic.size());
@@ -2829,7 +2765,7 @@ int main(int argc, char** argv) {
   }
   if (argc >= 2 && std::string(argv[1]) == "--test-rpm-telemetry") {
     const std::filesystem::path telemetry_model = argc >= 3 ? argv[2] :
-      std::filesystem::path("Assets/CombatSim/Models/CombatRobot500g.xml");
+      stock_model_path();
     std::array<char, 4096> diagnostic{};
     mjModel* checked = mj_loadXML(telemetry_model.string().c_str(), nullptr,
                                   diagnostic.data(), diagnostic.size());
@@ -3158,7 +3094,7 @@ int main(int argc, char** argv) {
   }
   if (argc >= 2 && std::string(argv[1]) == "--test-wall-impact") {
     const std::filesystem::path wall_model = argc >= 3 ? argv[2] :
-      std::filesystem::path("Assets/CombatSim/Models/CombatRobot500g.xml");
+      stock_model_path();
     auto run_wall_case = [&](double timestep, double impact_speed, bool vertical = false) {
       std::array<char, 4096> diagnostic{};
       mjModel* checked = mj_loadXML(wall_model.string().c_str(), nullptr,
@@ -3577,7 +3513,7 @@ int main(int argc, char** argv) {
   }
   if (argc >= 2 && std::string(argv[1]) == "--test-arena-spawns") {
     const std::filesystem::path test_path = argc >= 3 ? argv[2] :
-      "Assets/CombatSim/Models/CombatRobot500g.xml";
+      stock_model_path();
     std::array<char, 4096> diagnostic{};
     mjModel* test_model = mj_loadXML(test_path.string().c_str(), nullptr,
                                       diagnostic.data(), int(diagnostic.size()));
@@ -3944,7 +3880,7 @@ int main(int argc, char** argv) {
     model_path = argv[2];
   } else {
     model_path = argc > 1 ? argv[1] :
-      std::filesystem::path("Assets/CombatSim/Models/CombatRobot500g.xml");
+      stock_model_path();
   }
   std::array<char, 4096> load_error{};
   mjModel* model = mj_loadXML(model_path.string().c_str(), nullptr, load_error.data(), load_error.size());
@@ -4015,7 +3951,7 @@ int main(int argc, char** argv) {
   AppSettings app_settings;
   load_app_settings(app_settings);
   std::string graphics_status;
-  if (app_settings.renderer != compiled_renderer_id) {
+  if (app_settings.renderer != default_renderer_id) {
     const std::filesystem::path player_manifest = bundle.HasBundle() &&
         !bundle.IsMemoryLoaded() ? bundle.ManifestPath() : std::filesystem::path{};
     const std::filesystem::path opponent_manifest = opponent_bundle.HasBundle() &&
@@ -4029,7 +3965,7 @@ int main(int argc, char** argv) {
       mj_deleteModel(model);
       return 0;
     }
-    app_settings.renderer = compiled_renderer_id;
+    app_settings.renderer = default_renderer_id;
     save_app_settings(app_settings);
   }
   char arena_preset_name[65]{};
@@ -4306,6 +4242,8 @@ int main(int argc, char** argv) {
     screen = AppScreen::Home;
     paused = true;
   };
+  // Each frame samples input, applies controls, advances MuJoCo at its fixed
+  // timestep, refreshes render state, and draws the current navigation page.
   while (running) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -4627,6 +4565,7 @@ int main(int argc, char** argv) {
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.13f, 0.19f, 0.28f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.13f, 0.19f, 0.28f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.97f, 1.0f, 1.0f));
+    // The navigation bar stays in one place; each page below owns its controls.
     ImGui::Begin("##main_navigation", nullptr,
       fixed_window | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::TextColored(ImVec4(0.64f, 0.88f, 0.98f, 1.0f), "COMBATSIM");
@@ -4671,6 +4610,7 @@ int main(int argc, char** argv) {
       ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
       ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
       ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+      // Home contains launch actions, opponent selection, and the LAN entry point.
       ImGui::Begin("##home_screen", nullptr, fixed_window | ImGuiWindowFlags_NoBackground |
           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
       ImDrawList* menu_draw = ImGui::GetWindowDrawList();
@@ -4822,6 +4762,7 @@ int main(int argc, char** argv) {
                                ImGuiCond_Always);
       ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.055f, 0.075f, 0.105f, 0.96f));
       ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
+      // Arena and renderer preferences are separate from bot setup files.
       ImGui::Begin("##settings", nullptr, fixed_window);
       const float panel_width = std::min(760.0f, std::max(360.0f, display.x - 48.0f));
       ImGui::SetCursorPosX(std::max(24.0f, (display.x - panel_width) * 0.5f));
@@ -4970,19 +4911,19 @@ int main(int argc, char** argv) {
       ImGui::TextColored(ui_blue, "GRAPHICS SETTINGS");
       ImGui::TextDisabled("Renderer changes restart CombatSim and reopen the current model.");
       ImGui::SeparatorText("Renderer");
-      ImGui::Text("Active renderer: %s", compiled_renderer_id == 1
+      ImGui::Text("Active renderer: %s", default_renderer_id == 1
           ? "Filament PBR" : "MuJoCo classic");
       ImGui::TextWrapped("Filament adds physically based materials and image-based reflections. It is an experimental real-time renderer.");
-      const int other_renderer_id = compiled_renderer_id == 1 ? 0 : 1;
+      const int other_renderer_id = default_renderer_id == 1 ? 0 : 1;
       const auto other_renderer_exe = renderer_executable(other_renderer_id);
       const bool other_renderer_available = !other_renderer_exe.empty() &&
         std::filesystem::exists(other_renderer_exe);
       const bool renderer_switch_locked = lan_connected || lan_bundle_swapped ||
         !other_renderer_available;
       ImGui::BeginDisabled(renderer_switch_locked);
-      bool requested_filament = compiled_renderer_id == 1;
+      bool requested_filament = default_renderer_id == 1;
       if (ImGui::Checkbox("Use Filament PBR renderer", &requested_filament) &&
-          (requested_filament ? 1 : 0) != compiled_renderer_id) {
+          (requested_filament ? 1 : 0) != default_renderer_id) {
         graphics_status.clear();
         std::filesystem::path player_manifest;
         std::filesystem::path opponent_manifest;
@@ -5012,22 +4953,22 @@ int main(int argc, char** argv) {
           app_settings.renderer = desired_renderer;
           if (!save_app_settings(app_settings)) {
             graphics_status = "Could not save the renderer preference.";
-            app_settings.renderer = compiled_renderer_id;
+            app_settings.renderer = default_renderer_id;
           } else if (!launch_renderer_build(app_settings.renderer, model_path,
                                              graphics_status, player_manifest,
                                              opponent_manifest)) {
-            app_settings.renderer = compiled_renderer_id;
+            app_settings.renderer = default_renderer_id;
             save_app_settings(app_settings);
           } else {
             running = false;
           }
         } else {
-          app_settings.renderer = compiled_renderer_id;
+          app_settings.renderer = default_renderer_id;
         }
       }
       ImGui::EndDisabled();
       if (!other_renderer_available) {
-        ImGui::TextDisabled(compiled_renderer_id == 1
+        ImGui::TextDisabled(default_renderer_id == 1
           ? "Classic build is missing. Run Standalone\\setup.ps1 first."
           : "Filament build is missing. Run Standalone\\build_filament.ps1 first.");
       }
@@ -5079,6 +5020,7 @@ int main(int argc, char** argv) {
       ImGui::SetNextWindowSize(ImVec2(drive_sidebar_width, display.y - 92), ImGuiCond_Always);
       ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.075f, 0.105f, 0.12f, 0.98f));
       ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.34f, 0.36f, 0.95f));
+      // Drive owns match controls, controller telemetry, and manual robot gizmos.
       ImGui::Begin("##drive_dashboard", nullptr, fixed_window);
       const float drive_content_height = ImGui::GetContentRegionAvail().y;
       ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.105f, 0.145f, 0.16f, 0.98f));
@@ -5344,6 +5286,7 @@ int main(int argc, char** argv) {
       ImGui::SetNextWindowSize(ImVec2(display.x - 24, display.y - 84), ImGuiCond_Always);
       ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.075f, 0.09f, 0.12f, 0.98f));
       ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.24f, 0.29f, 0.36f, 0.95f));
+      // Bot workshop selects a local player/opponent bundle and edits its setup.
       ImGui::Begin("##configure_bots", nullptr, fixed_window);
       const float panel_width = ImGui::GetContentRegionAvail().x;
       const float splitter_width = 10.0f;

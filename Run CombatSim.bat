@@ -1,7 +1,7 @@
 @echo off
 setlocal
 set "COMBATSIM_EXE=%~dp0Standalone\build\Release\CombatSimStandalone.exe"
-set "COMBATSIM_MODEL=%~dp0Assets\CombatSim\Models\CombatRobot500g.xml"
+set "COMBATSIM_MODEL=%~dp0Standalone\models\CombatRobot500g.xml"
 
 if not exist "%COMBATSIM_EXE%" (
     echo CombatSim has not been built yet.

@@ -148,7 +148,7 @@ def main(exe, workdir=None):
         raise SystemExit(result.returncode)
 
     repo_root = Path(__file__).resolve().parents[2]
-    stock_model = repo_root / "Assets" / "CombatSim" / "Models" / "CombatRobot500g.xml"
+    stock_model = repo_root / "Standalone" / "models" / "CombatRobot500g.xml"
     result = subprocess.run([str(exe), "--test-arena-spawns", str(stock_model)],
                             text=True, capture_output=True)
     print(result.stdout, end="")
