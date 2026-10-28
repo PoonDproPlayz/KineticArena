@@ -1,0 +1,78 @@
+site_name: CombatSim Documentation
+site_description: User guide and developer documentation for CombatSim.
+site_url: https://poondproplayz.github.io/KineticArena/
+repo_url: https://github.com/PoonDproPlayz/KineticArena
+repo_name: PoonDproPlayz/KineticArena
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.tracking
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue grey
+      accent: cyan
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue grey
+      accent: cyan
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+nav:
+  - Home: index.md
+  - Get started:
+      - Install: getting-started.md
+      - First drive: drive/first-drive.md
+  - Configure a bot:
+      - Fusion 360 import: configuration/fusion-import.md
+      - Parts and mechanisms: configuration/parts-and-mechanisms.md
+      - Drive and weapon motors: configuration/motors.md
+      - Printed part mass: configuration/printed-parts.md
+  - Drive:
+      - Keyboard and gamepad: drive/controls.md
+      - Controller mixer: drive/controller-mixer.md
+      - Opponent AI: drive/opponent-ai.md
+      - LAN multiplayer: drive/multiplayer.md
+  - Settings:
+      - Arena and graphics: settings/arena-graphics.md
+  - Help:
+      - Troubleshooting: troubleshooting.md
+  - Development:
+      - Build from source: development/building.md
+      - Code layout: development/code-layout.md
+      - Release packaging: development/releases.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - tables
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+
+strict: true

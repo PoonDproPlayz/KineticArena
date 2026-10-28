@@ -124,7 +124,7 @@ endif()
     }
     Write-Host "Built: $exe"
     if (-not $NoRun) {
-        $model = Join-Path $projectDir 'Assets\CombatSim\Models\CombatRobot500g.xml'
+        $model = Join-Path $standaloneDir 'models\CombatRobot500g.xml'
         Write-Host 'Launching the Filament build with CombatRobot500g.xml...'
         & $exe $model
         if ($LASTEXITCODE -ne 0) { throw "CombatSim Filament exited with code $LASTEXITCODE." }
