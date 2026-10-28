@@ -2,7 +2,6 @@ param([switch]$NoRun)
 
 $ErrorActionPreference = 'Stop'
 $standaloneDir = $PSScriptRoot
-$projectDir = Split-Path $standaloneDir -Parent
 $depsDir = Join-Path $standaloneDir '.deps'
 $buildDir = Join-Path $standaloneDir 'build'
 $mujocoZip = Join-Path $depsDir 'mujoco-3.3.7-windows-x86_64.zip'
@@ -88,7 +87,7 @@ try {
     if (-not (Test-Path -LiteralPath $exe)) { throw "Build finished but executable was not found at $exe." }
     Write-Host "Built: $exe"
     if (-not $NoRun) {
-        $model = Join-Path $projectDir 'Assets\CombatSim\Models\CombatRobot500g.xml'
+        $model = Join-Path $standaloneDir 'models\CombatRobot500g.xml'
         Write-Host 'Launching CombatSim...'
         & $exe $model
         if ($LASTEXITCODE -ne 0) { throw "CombatSim exited with code $LASTEXITCODE." }
