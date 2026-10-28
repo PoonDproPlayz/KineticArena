@@ -2,10 +2,6 @@
 [Bb]uild/
 [Bb]uilds/
 [Oo]bj/
-[Tt]emp/
-[Ll]ibrary/
-[Ll]ogs/
-[Uu]ser[Ss]ettings/
 site/
 __pycache__/
 *.py[cod]
