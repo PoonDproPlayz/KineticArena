@@ -55,7 +55,7 @@ written to `site/`.
 
 ## Public documentation site
 
-The guide is published at <https://poondproplayz.github.io/CombatSim/>. After
+The guide is published at <https://poondproplayz.github.io/KineticArena/>. After
 GitHub Pages is enabled, pushes to `main` that change the docs, MkDocs config,
 documentation requirements, or deployment workflow build and deploy the site
 automatically. Pull requests run the strict build check without deploying.
