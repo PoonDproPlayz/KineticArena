@@ -15,12 +15,14 @@ without W or S; the two wheel sides counter-rotate for a spot turn.
 
 ## USB gamepad
 
-The main bot can use the selected USB joystick/gamepad's left stick and weapon
-button. Open **Controller mixer** to see the live channels and choose axes,
-buttons, reversals, deadzones, and output mixes. Different controllers label
-their axes differently, so use the live channel display to identify each one.
+The main bot can use a USB joystick/gamepad. Open **Controller setup** and
+follow its three steps: connect the device, use **Detect** to assign each stick
+or button, then map inputs to drive motor groups or the weapon. The live bars
+show which controls are moving. Use **Reverse** if a control acts in the wrong
+direction and **Deadzone** if a centered stick drifts.
 
-Mixer settings are application preferences. They remain available when you
-load another robot and are saved when changed.
+The selected physical controller is remembered on this computer. Input
+assignments and output mixes are saved separately for each loaded bot model and
+restored when that model is loaded again.
 
 For analog shaping and channel assignment, see [Controller mixer](controller-mixer.md).

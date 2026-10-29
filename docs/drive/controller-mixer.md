@@ -1,26 +1,27 @@
-# Controller mixer
+# Controller setup
 
-Open **Controller mixer** from Home or Drive. The mixer maps raw USB joystick
-inputs to drive-motor and weapon outputs.
+Open **Controller setup** from Home or Drive. The setup has three steps:
 
-## Set up a controller
+1. **Connect your controller.** Plug it in and select it from the Controller list.
+   The green Connected status shows the number of axes and buttons detected.
+2. **Map the sticks and buttons.** Enable **Use controller mapping**, then press
+   **Detect** beside an input. Move one stick fully or press one button. CombatSim
+   assigns that physical control to the input and shows its live value. Repeat for
+   each input you need. Control numbers start at 1.
+3. **Map inputs to bot controls.** Choose a motor group or Weapon. Set each input's
+   weight, offset, and expo, then move the controller and watch the response graph.
 
-1. Connect the controller before opening or refreshing the mixer.
-2. Select it in **Input sources**.
-3. Enable the custom joystick mixer.
-4. Add or remove input channels as needed, then choose a source for each one.
-5. Move a stick or press a button and watch **Live** to identify its channel.
-6. Assign each channel to the drive groups or weapon output and tune its mix.
+The default mix uses Input 1 for throttle, Input 2 for steering, and Input 3 for
+the weapon. Fine tune **Reverse** if an axis moves the wrong way. Increase its
+**Deadzone** if a stick drifts while centered. The default drive mix combines
+throttle and steering for left and right motors; weapon output ranges from 0% to
+100%.
 
-Each mix line has a weight, offset, and expo. The graph shows the response for
-the selected channel; drag its control point to edit the curve. Other inputs
-remain at their current values while you tune that line. Reverse and deadzone
-are configured for each input channel.
+The selected physical controller is remembered on this computer. Each bot keeps
+its own channel map and output mix, saved automatically when changed. Load a bot
+to return to its saved controller setup. A bot without a saved setup starts with
+the default mix.
 
-The default RC tank mix uses left = Ch1 − Ch2, right = Ch1 + Ch2, and weapon =
-Ch3. CombatSim clamps drive outputs to the range −100% to +100% and weapon
-output to 0% to 100%.
-
-If a control does not respond, check that the right joystick is selected, its
-channel moves in the live display, the channel is mapped to the desired output,
-and its weight is not zero.
+If an input does not respond, confirm the controller is connected, its live bar
+moves, mapping is enabled, and the input has a nonzero weight for the selected
+bot control.

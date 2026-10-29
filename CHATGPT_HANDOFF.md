@@ -51,9 +51,12 @@ models, wheel slip telemetry, configurable arenas, and LAN play.
 
 Motor behavior is a model estimate. It uses configured motor and drivetrain
 values but does not yet model battery sag, motor heating, or rigid chain/belt
-wheel-speed coupling. Real-hardware calibration is still needed. Physical USB
-controller behavior and the visible CAD axis highlight need manual confirmation
-on the user's computer.
+wheel-speed coupling. Real-hardware calibration is still needed. The controller
+setup now guides device connection and per-input detection; each model's input
+mapping and mix are saved under its CAD bundle or XML path, while the selected
+physical controller remains a computer-wide preference. Physical USB controller
+behavior and the visible CAD axis highlight still need manual confirmation on
+the user's computer.
 
 ## Documentation site
 

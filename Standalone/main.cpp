@@ -210,6 +210,7 @@ constexpr int max_input_channels = 16;
 const ImVec4 ui_ink(0.90f, 0.93f, 0.97f, 1.0f);
 const ImVec4 ui_blue(0.39f, 0.70f, 1.00f, 1.0f);
 const ImVec4 ui_teal(0.30f, 0.84f, 0.82f, 1.0f);
+const ImVec4 ui_accent(1.00f, 0.48f, 0.22f, 1.0f);
 const ImVec4 ui_green(0.40f, 0.84f, 0.60f, 1.0f);
 const ImVec4 ui_violet(0.74f, 0.62f, 1.00f, 1.0f);
 const ImVec4 ui_coral(1.00f, 0.57f, 0.45f, 1.0f);
@@ -260,6 +261,7 @@ struct InputChannel {
 struct InputMixer {
   bool enabled = false;
   int channel_count = 3;
+  int capture_channel = -1;  // Temporary input-detection state; never persisted.
   std::string preferred_guid;
   std::array<InputChannel, max_input_channels> channels{};
   std::map<std::string, std::array<float, max_input_channels>> outputs;
@@ -381,66 +383,9 @@ void initialize_default_mixer(InputMixer& mixer) {
   mixer.channels[2] = {true, 0, false, 0.0f};
 }
 
-void load_mixer_settings(InputMixer& mixer) {
-  initialize_default_mixer(mixer);
-  char* preference_path = SDL_GetPrefPath("CombatSim", "CombatSim");
-  if (!preference_path) return;
-  const std::filesystem::path path = std::filesystem::path(preference_path) / "input_mixer.json";
-  SDL_free(preference_path);
-  try {
-    std::ifstream input(path);
-    if (!input) return;
-    const json saved = json::parse(input);
-    mixer.enabled = saved.value("enabled", mixer.enabled);
-    mixer.preferred_guid = saved.value("preferredGuid", std::string{});
-    mixer.channel_count = std::clamp(saved.value("channelCount", mixer.channel_count), 1,
-                                      max_input_channels);
-    if (saved.contains("channels") && saved["channels"].is_array()) {
-      const auto& channels = saved["channels"];
-      for (int i = 0; i < std::min<int>(max_input_channels, channels.size()); ++i) {
-        const auto& item = channels[i];
-        if (!item.is_object()) continue;
-        mixer.channels[i].button = item.value("button", mixer.channels[i].button);
-        mixer.channels[i].source_index = std::max(0, item.value("sourceIndex", mixer.channels[i].source_index));
-        mixer.channels[i].inverted = item.value("inverted", mixer.channels[i].inverted);
-        mixer.channels[i].deadzone = std::clamp(item.value("deadzone", mixer.channels[i].deadzone), 0.0f, 0.95f);
-      }
-    }
-    if (saved.contains("outputs") && saved["outputs"].is_object()) {
-      for (auto it = saved["outputs"].begin(); it != saved["outputs"].end(); ++it) {
-        if (!it.value().is_array()) continue;
-        std::array<float, max_input_channels> weights{};
-        for (int i = 0; i < std::min<int>(max_input_channels, it.value().size()); ++i)
-          if (it.value()[i].is_number()) weights[i] = std::clamp(it.value()[i].get<float>(), -1.0f, 1.0f);
-        mixer.outputs[it.key()] = weights;
-      }
-    }
-    auto load_output_adjustments = [&](const char* key, auto& destination) {
-      if (!saved.contains(key) || !saved[key].is_object()) return;
-      for (auto it = saved[key].begin(); it != saved[key].end(); ++it) {
-        if (!it.value().is_array()) continue;
-        std::array<float, max_input_channels> values{};
-        for (int i = 0; i < std::min<int>(max_input_channels, it.value().size()); ++i)
-          if (it.value()[i].is_number())
-            values[i] = std::clamp(it.value()[i].get<float>(), -1.0f, 1.0f);
-        destination[it.key()] = values;
-      }
-    };
-    load_output_adjustments("outputOffsets", mixer.output_offsets);
-    load_output_adjustments("outputExpos", mixer.output_expos);
-  } catch (const std::exception&) {
-    // A malformed preference file should not prevent the simulator from starting.
-  }
-}
-
-bool save_mixer_settings(const InputMixer& mixer) {
-  char* preference_path = SDL_GetPrefPath("CombatSim", "CombatSim");
-  if (!preference_path) return false;
-  const std::filesystem::path path = std::filesystem::path(preference_path) / "input_mixer.json";
-  SDL_free(preference_path);
+json mixer_profile_json(const InputMixer& mixer) {
   json saved;
   saved["enabled"] = mixer.enabled;
-  saved["preferredGuid"] = mixer.preferred_guid;
   saved["channelCount"] = mixer.channel_count;
   saved["channels"] = json::array();
   for (const auto& channel : mixer.channels) {
@@ -457,6 +402,122 @@ bool save_mixer_settings(const InputMixer& mixer) {
   saved["outputExpos"] = json::object();
   for (const auto& [key, expos] : mixer.output_expos)
     saved["outputExpos"][key] = expos;
+  return saved;
+}
+
+void load_mixer_profile(InputMixer& mixer, const json& saved) {
+  if (!saved.is_object()) return;
+  mixer.enabled = saved.value("enabled", mixer.enabled);
+  mixer.channel_count = std::clamp(saved.value("channelCount", mixer.channel_count), 1,
+                                    max_input_channels);
+  if (saved.contains("channels") && saved["channels"].is_array()) {
+    const auto& channels = saved["channels"];
+    for (int i = 0; i < std::min<int>(max_input_channels, channels.size()); ++i) {
+      const auto& item = channels[i];
+      if (!item.is_object()) continue;
+      mixer.channels[i].button = item.value("button", mixer.channels[i].button);
+      mixer.channels[i].source_index = std::max(0,
+        item.value("sourceIndex", mixer.channels[i].source_index));
+      mixer.channels[i].inverted = item.value("inverted", mixer.channels[i].inverted);
+      mixer.channels[i].deadzone = std::clamp(
+        item.value("deadzone", mixer.channels[i].deadzone), 0.0f, 0.95f);
+    }
+  }
+  if (saved.contains("outputs") && saved["outputs"].is_object()) {
+    for (auto it = saved["outputs"].begin(); it != saved["outputs"].end(); ++it) {
+      if (!it.value().is_array()) continue;
+      std::array<float, max_input_channels> weights{};
+      for (int i = 0; i < std::min<int>(max_input_channels, it.value().size()); ++i)
+        if (it.value()[i].is_number())
+          weights[i] = std::clamp(it.value()[i].get<float>(), -1.0f, 1.0f);
+      mixer.outputs[it.key()] = weights;
+    }
+  }
+  auto load_output_adjustments = [&](const char* key, auto& destination) {
+    if (!saved.contains(key) || !saved[key].is_object()) return;
+    for (auto it = saved[key].begin(); it != saved[key].end(); ++it) {
+      if (!it.value().is_array()) continue;
+      std::array<float, max_input_channels> values{};
+      for (int i = 0; i < std::min<int>(max_input_channels, it.value().size()); ++i)
+        if (it.value()[i].is_number())
+          values[i] = std::clamp(it.value()[i].get<float>(), -1.0f, 1.0f);
+      destination[it.key()] = values;
+    }
+  };
+  load_output_adjustments("outputOffsets", mixer.output_offsets);
+  load_output_adjustments("outputExpos", mixer.output_expos);
+}
+
+std::string mixer_model_profile_key(const FusionBundle& bundle,
+                                    const std::filesystem::path& model_path) {
+  std::filesystem::path identity = bundle.HasBundle() && !bundle.ManifestPath().empty()
+      ? bundle.ManifestPath() : model_path;
+  std::error_code path_error;
+  const auto absolute_identity = std::filesystem::absolute(identity, path_error);
+  if (!path_error) identity = absolute_identity;
+  identity = identity.lexically_normal();
+  std::string key = identity.generic_u8string();
+  std::transform(key.begin(), key.end(), key.begin(), [](unsigned char ch) {
+    return char(std::tolower(ch));
+  });
+  return (bundle.HasBundle() && !bundle.ManifestPath().empty() ? "cad:" : "model:") + key;
+}
+
+std::string mixer_model_profile_name(const FusionBundle& bundle,
+                                     const std::filesystem::path& model_path) {
+  if (bundle.HasBundle() && !bundle.DesignName().empty()) return bundle.DesignName();
+  const auto identity = bundle.HasBundle() && !bundle.ManifestPath().empty()
+      ? bundle.ManifestPath() : model_path;
+  const std::string name = identity.stem().string();
+  return name.empty() ? "Current model" : name;
+}
+
+void load_mixer_settings(InputMixer& mixer, const std::string& model_key) {
+  initialize_default_mixer(mixer);
+  char* preference_path = SDL_GetPrefPath("CombatSim", "CombatSim");
+  if (!preference_path) return;
+  const std::filesystem::path path = std::filesystem::path(preference_path) / "input_mixer.json";
+  SDL_free(preference_path);
+  try {
+    std::ifstream input(path);
+    if (!input) return;
+    const json saved = json::parse(input);
+    mixer.preferred_guid = saved.value("preferredGuid", std::string{});
+    const auto profiles = saved.find("profiles");
+    if (profiles != saved.end() && profiles->is_object()) {
+      const auto profile = profiles->find(model_key);
+      if (profile != profiles->end()) load_mixer_profile(mixer, *profile);
+    } else {
+      // Older builds stored one global mixer. Keep it as the initial model's
+      // profile so existing controller setups survive this format change.
+      load_mixer_profile(mixer, saved);
+    }
+  } catch (const std::exception&) {
+    // A malformed preference file should not prevent the simulator from starting.
+  }
+}
+
+bool save_mixer_settings(const InputMixer& mixer, const std::string& model_key) {
+  char* preference_path = SDL_GetPrefPath("CombatSim", "CombatSim");
+  if (!preference_path) return false;
+  const std::filesystem::path path = std::filesystem::path(preference_path) / "input_mixer.json";
+  SDL_free(preference_path);
+  json saved = json::object();
+  try {
+    std::ifstream input(path);
+    if (input) {
+      json existing = json::parse(input);
+      if (existing.is_object()) saved = std::move(existing);
+    }
+  } catch (const std::exception&) {
+    // Replace a damaged preferences file with the current valid controller setup.
+  }
+  if (!saved.contains("profiles") || !saved["profiles"].is_object())
+    saved["profiles"] = json::object();
+  saved["formatVersion"] = 2;
+  saved["activeModel"] = model_key;
+  saved["preferredGuid"] = mixer.preferred_guid;
+  saved["profiles"][model_key] = mixer_profile_json(mixer);
   std::ofstream output(path, std::ios::trunc);
   if (!output) return false;
   output << saved.dump(2) << '\n';
@@ -1366,96 +1427,129 @@ float output_channel_response(const InputMixer& mixer, const MixerOutputDescript
 }
 
 void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
-                       SDL_JoystickID& joystick_id, const Controls& controls) {
+                       SDL_JoystickID& joystick_id, const Controls& controls,
+                       const std::string& model_key,
+                       const std::string& model_name) {
   bool changed = false;
   const auto devices = joystick_devices();
   const auto outputs = mixer_outputs(controls);
+  if (!joystick) mixer.capture_channel = -1;
   const char* joystick_name = joystick ? SDL_GetJoystickName(joystick) : nullptr;
-  std::string selected_name = joystick_name ? joystick_name : "";
-  if (selected_name.empty()) selected_name = mixer.preferred_guid == "none"
-    ? "No joystick selected" : "Choose USB joystick";
+  const std::string selected_name = joystick_name ? joystick_name :
+    mixer.preferred_guid == "none" ? "No controller selected" :
+    devices.empty() ? "No controller detected" : "Choose a controller";
 
   const float dialog_width = ImGui::GetContentRegionAvail().x;
-  const float input_panel_width = std::min(480.0f, std::max(340.0f, dialog_width * 0.44f));
+  const float input_panel_width = std::min(500.0f, std::max(340.0f, dialog_width * 0.46f));
   constexpr float footer_reserve = 72.0f;
-  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.155f, 0.205f, 1.0f));
-  ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.27f, 0.34f, 0.43f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.075f, 0.081f, 0.092f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.22f, 0.23f, 0.25f, 1.0f));
   ImGui::BeginChild("Controller input setup", ImVec2(input_panel_width, -footer_reserve),
                     ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
                     ImGuiWindowFlags_AlwaysVerticalScrollbar);
-  ImGui::TextColored(ui_blue, "INPUT SOURCES");
-  if (ImGui::BeginCombo("USB joystick", selected_name.c_str())) {
-    if (ImGui::Selectable("No joystick", mixer.preferred_guid == "none")) {
+  ImGui::TextColored(ui_accent, "1  CONNECT YOUR CONTROLLER");
+  ImGui::TextDisabled("This control setup is saved for %s.", model_name.c_str());
+  ImGui::SetNextItemWidth(-1.0f);
+  if (ImGui::BeginCombo("Controller", selected_name.c_str())) {
+    if (ImGui::Selectable("No controller", mixer.preferred_guid == "none")) {
       mixer.preferred_guid = "none";
       changed = true;
+      mixer.capture_channel = -1;
       refresh_joystick(joystick, joystick_id, mixer);
     }
-    for (const auto& device : devices) {
+    for (size_t device_index = 0; device_index < devices.size(); ++device_index) {
+      const auto& device = devices[device_index];
       const bool selected = mixer.preferred_guid == device.guid ||
         (mixer.preferred_guid.empty() && joystick_id == device.id);
-      const std::string label = device.name + "  [" + device.guid.substr(0, 8) + "]";
+      const std::string label = device.name + "##controller_" + std::to_string(device_index);
       if (ImGui::Selectable(label.c_str(), selected)) {
         mixer.preferred_guid = device.guid;
         changed = true;
+        mixer.capture_channel = -1;
         refresh_joystick(joystick, joystick_id, mixer);
       }
     }
     ImGui::EndCombo();
   }
   if (joystick) {
-    ImGui::Text("Connected: %s  |  %d axes, %d buttons", SDL_GetJoystickName(joystick),
-      SDL_GetNumJoystickAxes(joystick), SDL_GetNumJoystickButtons(joystick));
+    ImGui::TextColored(ui_green, "CONNECTED");
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d axes  |  %d buttons", SDL_GetNumJoystickAxes(joystick),
+                        SDL_GetNumJoystickButtons(joystick));
   } else {
-    ImGui::TextDisabled("No selected USB joystick is connected.");
+    ImGui::TextDisabled(devices.empty()
+      ? "Plug in a USB controller, then choose it here."
+      : "Choose a connected controller from the list.");
   }
-  if (ImGui::Checkbox("Enable custom joystick mixer", &mixer.enabled)) changed = true;
-  ImGui::TextDisabled("RC default: left = Ch1 - Ch2; right = Ch1 + Ch2; weapon = Ch3.");
+  if (ImGui::Checkbox("Use controller mapping", &mixer.enabled)) changed = true;
+  ImGui::TextDisabled("This can drive motors and weapon; keyboard stays available when disabled.");
   if (mixer.enabled && !joystick)
-    ImGui::TextColored(ui_amber,
-      "Mixer is enabled but no joystick is connected; keyboard and mapped gamepad controls remain available.");
+    ImGui::TextColored(ui_amber, "Controller mapping is enabled, but no controller is connected.");
 
-  ImGui::SeparatorText("Input channels");
-  if (ImGui::SmallButton("- channel") && mixer.channel_count > 1) {
+  ImGui::SeparatorText("2  SET UP STICKS AND BUTTONS");
+  ImGui::TextWrapped("Each input is one stick axis or button. Use Detect, then move the control you want.");
+  if (ImGui::SmallButton("- input") && mixer.channel_count > 1) {
     --mixer.channel_count; changed = true;
+    if (mixer.capture_channel >= mixer.channel_count) mixer.capture_channel = -1;
   }
   ImGui::SameLine();
-  if (ImGui::SmallButton("+ channel") && mixer.channel_count < max_input_channels) {
+  if (ImGui::SmallButton("+ input") && mixer.channel_count < max_input_channels) {
     const int new_index = mixer.channel_count++;
     mixer.channels[new_index] = {false, new_index, false, 0.12f};
     changed = true;
   }
   ImGui::SameLine();
-  ImGui::TextDisabled("%d / %d channels", mixer.channel_count, max_input_channels);
+  ImGui::TextDisabled("%d inputs", mixer.channel_count);
 
   const auto live_channels = read_input_channels(joystick, mixer);
-  const float input_table_height = std::min(360.0f, 36.0f + 30.0f * mixer.channel_count);
-  if (ImGui::BeginTable("##joystick_input_channels", 6,
-      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX |
+  const float input_table_height = std::min(300.0f, 36.0f + 42.0f * mixer.channel_count);
+  if (ImGui::BeginTable("##joystick_input_channels", 7,
+      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
       ImGuiTableFlags_SizingFixedFit,
       ImVec2(0.0f, input_table_height))) {
-    ImGui::TableSetupColumn("Channel", ImGuiTableColumnFlags_WidthFixed, 55.0f);
-    ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 86.0f);
-    ImGui::TableSetupColumn("Index", ImGuiTableColumnFlags_WidthFixed, 54.0f);
-    ImGui::TableSetupColumn("Reverse", ImGuiTableColumnFlags_WidthFixed, 62.0f);
-    ImGui::TableSetupColumn("Deadzone", ImGuiTableColumnFlags_WidthFixed, 82.0f);
-    ImGui::TableSetupColumn("Live", ImGuiTableColumnFlags_WidthFixed, 75.0f);
+    ImGui::TableSetupColumn("Input", ImGuiTableColumnFlags_WidthFixed, 57.0f);
+    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 63.0f);
+    ImGui::TableSetupColumn("Control #", ImGuiTableColumnFlags_WidthFixed, 98.0f);
+    ImGui::TableSetupColumn("Reverse", ImGuiTableColumnFlags_WidthFixed, 58.0f);
+    ImGui::TableSetupColumn("Deadzone", ImGuiTableColumnFlags_WidthFixed, 65.0f);
+    ImGui::TableSetupColumn("Live", ImGuiTableColumnFlags_WidthFixed, 54.0f);
+    ImGui::TableSetupColumn("Detect", ImGuiTableColumnFlags_WidthFixed, 58.0f);
     ImGui::TableHeadersRow();
     for (int i = 0; i < mixer.channel_count; ++i) {
       auto& channel = mixer.channels[i];
       ImGui::TableNextRow();
-      ImGui::TableSetColumnIndex(0); ImGui::Text("Ch %d", i + 1);
+      ImGui::TableSetColumnIndex(0); ImGui::Text("Input %d", i + 1);
       ImGui::TableSetColumnIndex(1);
       ImGui::PushID(3000 + i);
-      const char* source_name = channel.button ? "Button" : "Axis";
-      if (ImGui::BeginCombo("##source_type", source_name)) {
+      ImGui::SetNextItemWidth(58.0f);
+      if (ImGui::BeginCombo("##source_type", channel.button ? "Button" : "Axis")) {
         if (ImGui::Selectable("Axis", !channel.button)) { channel.button = false; changed = true; }
         if (ImGui::Selectable("Button", channel.button)) { channel.button = true; changed = true; }
         ImGui::EndCombo();
       }
       ImGui::TableSetColumnIndex(2);
-      ImGui::SetNextItemWidth(-1.0f);
-      if (ImGui::InputInt("##source_index", &channel.source_index, 1, 1)) changed = true;
-      channel.source_index = std::clamp(channel.source_index, 0, channel.button ? 127 : 63);
+      const int control_count = joystick
+        ? (channel.button ? SDL_GetNumJoystickButtons(joystick) : SDL_GetNumJoystickAxes(joystick))
+        : (channel.button ? 16 : 8);
+      channel.source_index = std::clamp(channel.source_index, 0,
+        std::max(0, std::min(channel.button ? 127 : 63, control_count - 1)));
+      char selected_control[48]{};
+      std::snprintf(selected_control, sizeof(selected_control), "%s %d",
+        channel.button ? "Button" : "Axis", channel.source_index + 1);
+      ImGui::SetNextItemWidth(92.0f);
+      if (ImGui::BeginCombo("##source_index", selected_control)) {
+        const int visible_count = std::max(control_count, channel.source_index + 1);
+        for (int control = 0; control < visible_count; ++control) {
+          char control_label[48]{};
+          std::snprintf(control_label, sizeof(control_label), "%s %d",
+            channel.button ? "Button" : "Axis", control + 1);
+          if (ImGui::Selectable(control_label, channel.source_index == control)) {
+            channel.source_index = control;
+            changed = true;
+          }
+        }
+        ImGui::EndCombo();
+      }
       ImGui::TableSetColumnIndex(3);
       if (channel.button) ImGui::TextDisabled("—");
       else if (ImGui::Checkbox("##inverted", &channel.inverted)) changed = true;
@@ -1469,20 +1563,63 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
       const float live_value = live_channels[i];
       ImGui::ProgressBar(channel.button ? live_value : (live_value + 1.0f) * 0.5f,
                          ImVec2(-1.0f, 0.0f), "");
+      ImGui::TableSetColumnIndex(6);
+      const bool is_listening = mixer.capture_channel == i;
+      ImGui::BeginDisabled(!joystick);
+      if (ImGui::SmallButton(is_listening ? "Cancel" : "Detect"))
+        mixer.capture_channel = is_listening ? -1 : i;
+      ImGui::EndDisabled();
+      if (!joystick && ImGui::IsItemHovered())
+        ImGui::SetTooltip("Connect a controller first.");
       ImGui::PopID();
     }
     ImGui::EndTable();
   }
+  if (mixer.capture_channel >= 0 && mixer.capture_channel < mixer.channel_count && joystick) {
+    SDL_UpdateJoysticks();
+    auto& channel = mixer.channels[mixer.capture_channel];
+    bool detected = false;
+    const int axis_count = SDL_GetNumJoystickAxes(joystick);
+    for (int axis = 0; axis < axis_count; ++axis) {
+      const float value = float(SDL_GetJoystickAxis(joystick, axis)) / 32768.0f;
+      if (std::abs(value) >= 0.62f) {
+        channel.button = false;
+        channel.source_index = axis;
+        detected = true;
+        break;
+      }
+    }
+    if (!detected) {
+      const int button_count = SDL_GetNumJoystickButtons(joystick);
+      for (int button = 0; button < button_count; ++button) {
+        if (SDL_GetJoystickButton(joystick, button)) {
+          channel.button = true;
+          channel.source_index = button;
+          detected = true;
+          break;
+        }
+      }
+    }
+    if (detected) {
+      changed = true;
+      mixer.capture_channel = -1;
+    } else {
+      ImGui::TextColored(ui_amber, "Move one stick fully or press one button to detect it.");
+    }
+  }
+  ImGui::TextDisabled("Control numbers start at 1. Reverse an axis if its direction feels wrong.");
+  ImGui::TextDisabled("Default mix: Input 1 throttle, Input 2 steering, Input 3 weapon.");
   ImGui::EndChild();
   ImGui::PopStyleColor(2);
 
   ImGui::SameLine(0.0f, 12.0f);
-  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.145f, 0.125f, 0.19f, 1.0f));
-  ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.36f, 0.29f, 0.46f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.075f, 0.081f, 0.092f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.22f, 0.23f, 0.25f, 1.0f));
   ImGui::BeginChild("Controller output mixer", ImVec2(0.0f, -footer_reserve),
                     ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
                     ImGuiWindowFlags_AlwaysVerticalScrollbar);
-  ImGui::TextColored(ui_violet, "OUTPUT MIXES");
+  ImGui::TextColored(ui_accent, "3  MAP INPUTS TO BOT CONTROLS");
+  ImGui::TextDisabled("Choose a motor group or weapon, then tune how each input affects it.");
   static std::string selected_output_key;
   static int graph_channel = 0;
   if (!outputs.empty() && std::none_of(outputs.begin(), outputs.end(), [&](const auto& output) {
@@ -1493,7 +1630,7 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
   });
   const char* selected_output_name = selected_output == outputs.end()
     ? "No outputs available" : selected_output->label.c_str();
-  if (ImGui::BeginCombo("Output function", selected_output_name)) {
+  if (ImGui::BeginCombo("Robot control", selected_output_name)) {
     for (const auto& output : outputs) {
       if (!ImGui::Selectable(output.label.c_str(), output.key == selected_output_key)) continue;
       selected_output_key = output.key;
@@ -1512,14 +1649,14 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
     auto& offsets = mixer.output_offsets[output.key];
     auto& expos = mixer.output_expos[output.key];
     if (weights_inserted) changed = true;
-    if (ImGui::SmallButton("Reset selected output")) {
+    if (ImGui::SmallButton("Reset this control")) {
       weights = default_output_weights(output);
       offsets.fill(0.0f);
       expos.fill(0.0f);
       changed = true;
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("Each channel is a mix line: input x weight + offset, with optional expo.");
+    ImGui::TextDisabled("Weight = strength/direction. Offset = trim. Expo = stick feel.");
     const float output_table_height = std::min(260.0f, 36.0f + 28.0f * mixer.channel_count);
     if (ImGui::BeginTable("##output_mix_lines", 5,
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit,
@@ -1532,7 +1669,7 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
       ImGui::TableHeadersRow();
       for (int i = 0; i < mixer.channel_count; ++i) {
         ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0); ImGui::Text("Ch %d", i + 1);
+        ImGui::TableSetColumnIndex(0); ImGui::Text("Input %d", i + 1);
         ImGui::TableSetColumnIndex(1); ImGui::Text("%+.0f%%", live_channels[i] * 100.0f);
         ImGui::PushID(output.key.c_str()); ImGui::PushID(i);
         ImGui::TableSetColumnIndex(2);
@@ -1559,10 +1696,10 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
     }
 
     graph_channel = std::clamp(graph_channel, 0, std::max(0, mixer.channel_count - 1));
-    const std::string graph_channel_name = "Ch " + std::to_string(graph_channel + 1);
+    const std::string graph_channel_name = "Input " + std::to_string(graph_channel + 1);
     if (ImGui::BeginCombo("Graph input", graph_channel_name.c_str())) {
       for (int i = 0; i < mixer.channel_count; ++i) {
-        const std::string label = "Ch " + std::to_string(i + 1);
+        const std::string label = "Input " + std::to_string(i + 1);
         if (ImGui::Selectable(label.c_str(), graph_channel == i)) graph_channel = i;
       }
       ImGui::EndCombo();
@@ -1571,7 +1708,7 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
     ImGui::SameLine();
     ImGui::TextColored(ui_violet,
                        "Mixed output %+.0f%%", live_output * 100.0f);
-    ImGui::TextDisabled("Curve and amber dot show this input alone; the mixed output includes all channels.");
+    ImGui::TextDisabled("The curve shows this input. The amber dot follows your controller live.");
     const ImVec2 graph_size(std::max(260.0f, ImGui::GetContentRegionAvail().x), 200.0f);
     const ImVec2 graph_min = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("##mixer_response_graph", graph_size);
@@ -1627,11 +1764,11 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
     draw->AddCircleFilled(dot, 7.0f, ImGui::GetColorU32(ImVec4(0.91f, 0.53f, 0.10f, 1.0f)));
     draw->AddCircle(dot, 9.0f, ImGui::GetColorU32(ui_ink), 16, 1.5f);
   }
-  ImGui::TextWrapped("Drive outputs clamp to -100..100%%. Weapon uses 0..100%%. Positive expo softens the center; negative expo sharpens it.");
+  ImGui::TextWrapped("Drive outputs use -100 to 100%%; weapon uses 0 to 100%%. Positive expo softens the center, negative expo sharpens it.");
   ImGui::EndChild();
   ImGui::PopStyleColor(2);
   if (changed) {
-    if (!save_mixer_settings(mixer))
+    if (!save_mixer_settings(mixer, model_key))
       ImGui::TextColored(ui_red, "Could not save mixer settings.");
   }
 }
@@ -2130,6 +2267,35 @@ int main(int argc, char** argv) {
     const auto* motor_a_output = descriptor_for(motor_output_key(0));
     const auto* motor_b_output = descriptor_for(motor_output_key(1));
     const auto* weapon_output = descriptor_for(weapon_output_key());
+    InputMixer first_bot_profile, second_bot_profile;
+    initialize_default_mixer(first_bot_profile);
+    initialize_default_mixer(second_bot_profile);
+    first_bot_profile.enabled = true;
+    first_bot_profile.channel_count = 5;
+    first_bot_profile.channels[0].source_index = 6;
+    first_bot_profile.outputs[motor_output_key(0)][0] = 0.65f;
+    second_bot_profile.channel_count = 3;
+    second_bot_profile.channels[0].source_index = 1;
+    second_bot_profile.outputs[motor_output_key(0)][0] = 0.35f;
+    json model_profiles = json::object();
+    model_profiles["bot-one"] = mixer_profile_json(first_bot_profile);
+    model_profiles["bot-two"] = mixer_profile_json(second_bot_profile);
+    InputMixer restored_first, restored_second;
+    initialize_default_mixer(restored_first);
+    initialize_default_mixer(restored_second);
+    load_mixer_profile(restored_first, model_profiles["bot-one"]);
+    load_mixer_profile(restored_second, model_profiles["bot-two"]);
+    const auto first_model_key = mixer_model_profile_key(
+      FusionBundle{}, std::filesystem::path("models/bot-one.xml"));
+    const auto second_model_key = mixer_model_profile_key(
+      FusionBundle{}, std::filesystem::path("models/bot-two.xml"));
+    const bool model_profiles_isolated = first_model_key != second_model_key &&
+      restored_first.enabled && restored_first.channel_count == 5 &&
+      restored_first.channels[0].source_index == 6 &&
+      std::abs(restored_first.outputs[motor_output_key(0)][0] - 0.65f) < 1e-6f &&
+      !restored_second.enabled && restored_second.channel_count == 3 &&
+      restored_second.channels[0].source_index == 1 &&
+      std::abs(restored_second.outputs[motor_output_key(0)][0] - 0.35f) < 1e-6f;
     if (std::abs(left - 0.35f) > 1e-5f || std::abs(right - 0.85f) > 1e-5f ||
         std::abs(weapon - 1.0f) > 1e-5f ||
         std::abs(shaped_line - 0.508f) > 1e-5f ||
@@ -2141,11 +2307,12 @@ int main(int argc, char** argv) {
         std::abs(output_value(defaults, *weapon_output, input) - 1.0f) > 1e-5f ||
         std::abs(normalize_axis(0, 0.12f)) > 1e-6f ||
         std::abs(normalize_axis(32767, 0.12f) - 1.0f) > 1e-6f ||
-        std::abs(normalize_axis(-32768, 0.12f) + 1.0f) > 1e-6f) {
-      std::fprintf(stderr, "Input mixer failed: elevon sums, weight/offset/expo, weapon range, or axis calibration are incorrect.\n");
+        std::abs(normalize_axis(-32768, 0.12f) + 1.0f) > 1e-6f ||
+        !model_profiles_isolated) {
+      std::fprintf(stderr, "Input mixer failed: motor/weapon mixes, axis calibration, or model-specific profile isolation are incorrect.\n");
       return 1;
     }
-    std::puts("Input mixer passed: combined motor outputs, isolated channel response, elevon sums, weight/offset/expo, weapon channel, and axis normalization.");
+    std::puts("Input mixer passed: drive/weapon mixes, axis calibration, and independent saved profiles for different model keys.");
     return 0;
   }
   if (argc >= 4 && std::string(argv[1]) == "--test-opponent-bundle") {
@@ -3947,7 +4114,9 @@ int main(int argc, char** argv) {
   SDL_GL_SetSwapInterval(1);
   SDL_Gamepad* pad = first_gamepad();
   InputMixer input_mixer;
-  load_mixer_settings(input_mixer);
+  std::string active_mixer_profile_key = mixer_model_profile_key(bundle, model_path);
+  std::string active_mixer_profile_name = mixer_model_profile_name(bundle, model_path);
+  load_mixer_settings(input_mixer, active_mixer_profile_key);
   AppSettings app_settings;
   load_app_settings(app_settings);
   std::string graphics_status;
@@ -3978,7 +4147,8 @@ int main(int argc, char** argv) {
   SDL_JoystickID joystick_id = 0;
   const std::string saved_guid = input_mixer.preferred_guid;
   refresh_joystick(joystick, joystick_id, input_mixer);
-  if (saved_guid != input_mixer.preferred_guid) save_mixer_settings(input_mixer);
+  if (saved_guid != input_mixer.preferred_guid)
+    save_mixer_settings(input_mixer, active_mixer_profile_key);
 
   mjvCamera camera; mjv_defaultCamera(&camera);
   camera.distance = std::clamp(3.5 * double(app_settings.arena_size_m) / 2.0, 1.5, 15.0);
@@ -4056,38 +4226,38 @@ int main(int argc, char** argv) {
   ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_DockingEnable;
   ImGuiStyle& ui = ImGui::GetStyle();
   ImGui::StyleColorsDark(&ui);
-  ui.WindowRounding = 11.0f; ui.ChildRounding = 8.0f; ui.FrameRounding = 5.0f;
+  ui.WindowRounding = 8.0f; ui.ChildRounding = 7.0f; ui.FrameRounding = 5.0f;
   ui.PopupRounding = 7.0f; ui.ScrollbarRounding = 7.0f; ui.GrabRounding = 5.0f;
-  ui.WindowPadding = ImVec2(18, 16); ui.FramePadding = ImVec2(10, 7);
-  ui.ItemSpacing = ImVec2(10, 9); ui.ItemInnerSpacing = ImVec2(8, 6);
+  ui.WindowPadding = ImVec2(18, 16); ui.FramePadding = ImVec2(11, 8);
+  ui.ItemSpacing = ImVec2(10, 10); ui.ItemInnerSpacing = ImVec2(8, 6);
   ui.WindowBorderSize = 0.0f; ui.ChildBorderSize = 1.0f; ui.FrameBorderSize = 0.0f;
   ImVec4* colors = ui.Colors;
   colors[ImGuiCol_Text] = ui_ink;
   colors[ImGuiCol_TextDisabled] = ImVec4(0.58f, 0.63f, 0.70f, 1.0f);
-  colors[ImGuiCol_WindowBg] = ImVec4(0.075f, 0.090f, 0.115f, 1.0f);
-  colors[ImGuiCol_ChildBg] = ImVec4(0.105f, 0.125f, 0.160f, 1.0f);
-  colors[ImGuiCol_PopupBg] = ImVec4(0.105f, 0.125f, 0.160f, 0.99f);
-  colors[ImGuiCol_Border] = ImVec4(0.23f, 0.27f, 0.33f, 0.82f);
+  colors[ImGuiCol_WindowBg] = ImVec4(0.055f, 0.062f, 0.075f, 1.0f);
+  colors[ImGuiCol_ChildBg] = ImVec4(0.075f, 0.083f, 0.098f, 1.0f);
+  colors[ImGuiCol_PopupBg] = ImVec4(0.075f, 0.083f, 0.098f, 0.99f);
+  colors[ImGuiCol_Border] = ImVec4(0.20f, 0.22f, 0.25f, 0.82f);
   colors[ImGuiCol_BorderShadow] = ImVec4(0.015f, 0.020f, 0.030f, 0.22f);
-  colors[ImGuiCol_FrameBg] = ImVec4(0.145f, 0.170f, 0.215f, 1.0f);
-  colors[ImGuiCol_FrameBgHovered] = ImVec4(0.19f, 0.235f, 0.295f, 1.0f);
-  colors[ImGuiCol_FrameBgActive] = ImVec4(0.22f, 0.29f, 0.36f, 1.0f);
-  colors[ImGuiCol_Button] = ImVec4(0.16f, 0.20f, 0.26f, 1.0f);
-  colors[ImGuiCol_ButtonHovered] = ImVec4(0.23f, 0.30f, 0.38f, 1.0f);
-  colors[ImGuiCol_ButtonActive] = ImVec4(0.20f, 0.39f, 0.47f, 1.0f);
-  colors[ImGuiCol_Header] = ImVec4(0.16f, 0.21f, 0.28f, 1.0f);
-  colors[ImGuiCol_HeaderHovered] = ImVec4(0.21f, 0.29f, 0.37f, 1.0f);
-  colors[ImGuiCol_HeaderActive] = ImVec4(0.18f, 0.36f, 0.43f, 1.0f);
-  colors[ImGuiCol_CheckMark] = ui_teal;
-  colors[ImGuiCol_SliderGrab] = ImVec4(0.24f, 0.62f, 0.70f, 1.0f);
-  colors[ImGuiCol_SliderGrabActive] = ui_teal;
-  colors[ImGuiCol_Separator] = ImVec4(0.25f, 0.30f, 0.37f, 0.82f);
-  colors[ImGuiCol_SeparatorHovered] = ImVec4(0.34f, 0.65f, 0.74f, 1.0f);
-  colors[ImGuiCol_SeparatorActive] = ImVec4(0.30f, 0.80f, 0.86f, 1.0f);
-  colors[ImGuiCol_ScrollbarBg] = ImVec4(0.075f, 0.090f, 0.115f, 0.72f);
-  colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.27f, 0.32f, 0.39f, 1.0f);
-  colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.37f, 0.45f, 0.55f, 1.0f);
-  colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.31f, 0.61f, 0.69f, 1.0f);
+  colors[ImGuiCol_FrameBg] = ImVec4(0.13f, 0.145f, 0.17f, 1.0f);
+  colors[ImGuiCol_FrameBgHovered] = ImVec4(0.18f, 0.195f, 0.22f, 1.0f);
+  colors[ImGuiCol_FrameBgActive] = ImVec4(0.22f, 0.23f, 0.25f, 1.0f);
+  colors[ImGuiCol_Button] = ImVec4(0.14f, 0.15f, 0.17f, 1.0f);
+  colors[ImGuiCol_ButtonHovered] = ImVec4(0.22f, 0.23f, 0.25f, 1.0f);
+  colors[ImGuiCol_ButtonActive] = ImVec4(0.48f, 0.22f, 0.12f, 1.0f);
+  colors[ImGuiCol_Header] = ImVec4(0.15f, 0.16f, 0.18f, 1.0f);
+  colors[ImGuiCol_HeaderHovered] = ImVec4(0.20f, 0.21f, 0.23f, 1.0f);
+  colors[ImGuiCol_HeaderActive] = ImVec4(0.33f, 0.19f, 0.13f, 1.0f);
+  colors[ImGuiCol_CheckMark] = ui_accent;
+  colors[ImGuiCol_SliderGrab] = ImVec4(0.83f, 0.36f, 0.17f, 1.0f);
+  colors[ImGuiCol_SliderGrabActive] = ui_accent;
+  colors[ImGuiCol_Separator] = ImVec4(0.22f, 0.23f, 0.25f, 0.82f);
+  colors[ImGuiCol_SeparatorHovered] = ImVec4(0.83f, 0.36f, 0.17f, 1.0f);
+  colors[ImGuiCol_SeparatorActive] = ui_accent;
+  colors[ImGuiCol_ScrollbarBg] = ImVec4(0.055f, 0.062f, 0.075f, 0.72f);
+  colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.25f, 0.26f, 0.28f, 1.0f);
+  colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.38f, 0.38f, 0.39f, 1.0f);
+  colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.68f, 0.32f, 0.17f, 1.0f);
   colors[ImGuiCol_TableHeaderBg] = ImVec4(0.17f, 0.21f, 0.27f, 1.0f);
   colors[ImGuiCol_TableBorderStrong] = ImVec4(0.29f, 0.34f, 0.41f, 1.0f);
   colors[ImGuiCol_TableBorderLight] = ImVec4(0.22f, 0.27f, 0.34f, 1.0f);
@@ -4142,6 +4312,23 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < bytes.size(); ++i) data[i] = 0;
     bytes.clear();
     bytes.shrink_to_fit();
+  };
+  auto activate_mixer_profile_for_current_model = [&] {
+    const std::string next_key = mixer_model_profile_key(bundle, model_path);
+    active_mixer_profile_name = mixer_model_profile_name(bundle, model_path);
+    if (next_key == active_mixer_profile_key) return;
+
+    const std::string selected_device = input_mixer.preferred_guid;
+    if (!save_mixer_settings(input_mixer, active_mixer_profile_key))
+      runtime_error = "Could not save the joystick setup for the previous model.";
+    active_mixer_profile_key = next_key;
+    load_mixer_settings(input_mixer, active_mixer_profile_key);
+    // The selected physical controller is a computer preference; channel maps
+    // and output mixes belong to the model profile.
+    input_mixer.preferred_guid = selected_device;
+    refresh_joystick(joystick, joystick_id, input_mixer);
+    if (!save_mixer_settings(input_mixer, active_mixer_profile_key))
+      runtime_error = "Could not save this model's joystick setup.";
   };
   auto install_model = [&](mjModel* next_model) {
     mjData* next_data = next_model ? mj_makeData(next_model) : nullptr;
@@ -4200,7 +4387,9 @@ int main(int argc, char** argv) {
         if (diagnostic[0]) runtime_error = diagnostic.data();
         return false;
       }
-      return install_model(next_model);
+      if (!install_model(next_model)) return false;
+      activate_mixer_profile_for_current_model();
+      return true;
     }
     std::filesystem::path generated;
     if (!bundle.Generate(generated, opponent_bundle.HasBundle() ? &opponent_bundle : nullptr)) {
@@ -4214,7 +4403,9 @@ int main(int argc, char** argv) {
       if (diagnostic[0]) runtime_error = diagnostic.data();
       return false;
     }
-    return install_model(next_model);
+    if (!install_model(next_model)) return false;
+    activate_mixer_profile_for_current_model();
+    return true;
   };
   auto end_lan_session = [&] {
     lan.Stop();
@@ -4263,7 +4454,8 @@ int main(int argc, char** argv) {
         }
         const std::string previous_guid = input_mixer.preferred_guid;
         refresh_joystick(joystick, joystick_id, input_mixer);
-        if (previous_guid != input_mixer.preferred_guid) save_mixer_settings(input_mixer);
+        if (previous_guid != input_mixer.preferred_guid)
+          save_mixer_settings(input_mixer, active_mixer_profile_key);
       }
 
       if (event.type == SDL_EVENT_MOUSE_WHEEL && !ImGui::GetIO().WantCaptureMouse)
@@ -4562,14 +4754,22 @@ int main(int argc, char** argv) {
 
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(ImVec2(display.x, 62));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.13f, 0.19f, 0.28f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.13f, 0.19f, 0.28f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.035f, 0.040f, 0.050f, 0.97f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.035f, 0.040f, 0.050f, 0.97f));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.97f, 1.0f, 1.0f));
     // The navigation bar stays in one place; each page below owns its controls.
     ImGui::Begin("##main_navigation", nullptr,
       fixed_window | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    ImGui::TextColored(ImVec4(0.64f, 0.88f, 0.98f, 1.0f), "COMBATSIM");
-    ImGui::SameLine(152);
+    ImDrawList* nav_draw = ImGui::GetWindowDrawList();
+    nav_draw->AddRectFilled(ImVec2(0.0f, 61.0f), ImVec2(display.x, 62.0f),
+                            IM_COL32(255, 255, 255, 24));
+    nav_draw->AddRectFilled(ImVec2(21.0f, 15.0f), ImVec2(25.0f, 47.0f),
+                            ImGui::GetColorU32(ui_accent), 2.0f);
+    ImGui::SetCursorScreenPos(ImVec2(37.0f, 13.0f));
+    ImGui::TextColored(ui_ink, "COMBAT");
+    ImGui::SetCursorScreenPos(ImVec2(37.0f, 34.0f));
+    ImGui::TextColored(ImVec4(0.63f, 0.65f, 0.68f, 1.0f), "ROBOT ARENA SIM");
+    float nav_x = 184.0f;
     auto nav_button = [&](const char* label, AppScreen target) {
       const bool active = screen == target;
       const bool disabled = target == AppScreen::Configure &&
@@ -4577,29 +4777,41 @@ int main(int argc, char** argv) {
          lan.GetState() != LanSession::State::Stopped &&
          lan.GetState() != LanSession::State::Failed));
       if (disabled) ImGui::BeginDisabled();
-      const ImVec4 active_color = target == AppScreen::Drive ? ImVec4(0.20f, 0.50f, 0.38f, 1.0f) :
-        target == AppScreen::Configure ? ImVec4(0.34f, 0.40f, 0.68f, 1.0f) :
-        ImVec4(0.24f, 0.43f, 0.64f, 1.0f);
-      push_button_palette(active ? active_color : ImVec4(0.22f, 0.29f, 0.39f, 1.0f),
-        active ? ImVec4(active_color.x + 0.08f, active_color.y + 0.08f,
-                        active_color.z + 0.08f, 1.0f) : ImVec4(0.30f, 0.39f, 0.51f, 1.0f),
-        active ? active_color : ImVec4(0.34f, 0.45f, 0.58f, 1.0f));
-      const bool clicked = ImGui::Button(label, ImVec2(122, 36));
-      pop_button_palette();
+      ImGui::SetCursorScreenPos(ImVec2(nav_x, 10.0f));
+      const bool clicked = ImGui::InvisibleButton(label, ImVec2(94.0f, 42.0f));
+      const bool hovered = ImGui::IsItemHovered();
+      const ImVec2 button_min = ImGui::GetItemRectMin();
+      const ImVec2 button_max = ImGui::GetItemRectMax();
+      if (active || hovered)
+        nav_draw->AddRectFilled(button_min, button_max,
+          active ? IM_COL32(255, 255, 255, 14) : IM_COL32(255, 255, 255, 8), 5.0f);
+      if (active)
+        nav_draw->AddRectFilled(ImVec2(button_min.x + 16.0f, button_max.y - 2.0f),
+          ImVec2(button_max.x - 16.0f, button_max.y), ImGui::GetColorU32(ui_accent), 1.0f);
+      const ImVec2 label_size = ImGui::CalcTextSize(label);
+      nav_draw->AddText(ImVec2(button_min.x + (94.0f - label_size.x) * 0.5f,
+                               button_min.y + (42.0f - label_size.y) * 0.5f),
+        ImGui::GetColorU32(disabled ? ImVec4(0.38f, 0.39f, 0.41f, 1.0f) :
+          active ? ui_ink : ImVec4(0.72f, 0.73f, 0.75f, 1.0f)), label);
       if (clicked) {
         screen = target;
         paused = target != AppScreen::Drive;
       }
       if (disabled) ImGui::EndDisabled();
+      nav_x += 100.0f;
     };
     nav_button("Home", AppScreen::Home);
-    ImGui::SameLine(); nav_button("Drive", AppScreen::Drive);
-    ImGui::SameLine(); nav_button("Configure", AppScreen::Configure);
-    ImGui::SameLine(display.x - 245);
-    ImGui::TextColored((joystick || pad) ? ImVec4(0.35f, 0.84f, 0.58f, 1.0f) :
-                             ImVec4(0.68f, 0.72f, 0.78f, 1.0f),
-                       "%s", joystick ? "USB JOYSTICK CONNECTED" :
-                         pad ? "GAMEPAD CONNECTED" : "KEYBOARD READY");
+    nav_button("Arena", AppScreen::Drive);
+    nav_button("Workshop", AppScreen::Configure);
+    nav_button("Settings", AppScreen::Settings);
+    const bool input_ready = joystick || pad;
+    const ImVec2 status_pos(std::max(nav_x + 8.0f, display.x - 246.0f), 23.0f);
+    nav_draw->AddCircleFilled(ImVec2(status_pos.x, status_pos.y + 6.0f), 4.0f,
+      ImGui::GetColorU32(input_ready ? ui_green : ImVec4(0.62f, 0.64f, 0.67f, 1.0f)));
+    ImGui::SetCursorScreenPos(ImVec2(status_pos.x + 13.0f, status_pos.y));
+    ImGui::TextColored(input_ready ? ui_green : ImVec4(0.67f, 0.68f, 0.70f, 1.0f),
+      "%s", joystick ? "JOYSTICK CONNECTED" :
+        pad ? "GAMEPAD CONNECTED" : "KEYBOARD READY");
     ImGui::End();
     ImGui::PopStyleColor(3);
 
@@ -4616,42 +4828,51 @@ int main(int argc, char** argv) {
       ImDrawList* menu_draw = ImGui::GetWindowDrawList();
       const ImVec2 home_min = ImGui::GetWindowPos();
       const ImVec2 home_max(home_min.x + display.x, home_min.y + display.y - 62.0f);
-      menu_draw->AddRectFilled(home_min, home_max, IM_COL32(7, 10, 16, 142));
+      menu_draw->AddRectFilled(home_min, home_max, IM_COL32(5, 7, 10, 92));
       menu_draw->AddRectFilledMultiColor(
-          home_min, ImVec2(home_min.x + display.x * 0.70f, home_max.y),
-          IM_COL32(7, 11, 18, 245), IM_COL32(8, 13, 21, 75),
-          IM_COL32(8, 13, 21, 75), IM_COL32(7, 11, 18, 245));
+          home_min, ImVec2(home_min.x + display.x * 0.76f, home_max.y),
+          IM_COL32(7, 8, 10, 246), IM_COL32(8, 9, 11, 68),
+          IM_COL32(8, 9, 11, 68), IM_COL32(7, 8, 10, 246));
+      menu_draw->AddRectFilledMultiColor(
+          ImVec2(home_min.x, home_min.y + display.y * 0.59f), home_max,
+          IM_COL32(5, 7, 9, 0), IM_COL32(5, 7, 9, 0),
+          IM_COL32(5, 7, 9, 178), IM_COL32(5, 7, 9, 178));
 
       const float margin = std::clamp(display.x * 0.055f, 28.0f, 76.0f);
       const float menu_width = std::max(230.0f,
           std::min(480.0f, display.x - margin * 2.0f - 20.0f));
       const bool compact_home = display.x < 980.0f;
-      const float title_size = display.y < 660.0f ? 40.0f : 50.0f;
-      const float hero_y = home_min.y + (display.y < 660.0f ? 24.0f : 46.0f);
+      const float title_size = display.y < 700.0f
+          ? (display.y < 620.0f ? 31.0f : 34.0f) : 49.0f;
+      const float hero_y = home_min.y + (display.y < 700.0f ? 24.0f : 46.0f);
       const ImU32 white = IM_COL32(240, 245, 250, 255);
       const ImU32 muted = IM_COL32(164, 177, 193, 255);
-      const ImU32 accent = ImGui::GetColorU32(ui_teal);
-      menu_draw->AddRectFilled(ImVec2(margin, hero_y), ImVec2(margin + 34.0f, hero_y + 3.0f),
+      const ImU32 accent = ImGui::GetColorU32(ui_accent);
+      menu_draw->AddRectFilled(ImVec2(margin, hero_y), ImVec2(margin + 42.0f, hero_y + 3.0f),
                                accent, 1.5f);
       menu_draw->AddText(ImGui::GetFont(), 13.0f, ImVec2(margin, hero_y + 13.0f),
-                         ImGui::GetColorU32(ui_teal), "MUJOCO ROBOT COMBAT SIMULATOR");
+                         accent, "ROBOT COMBAT SIMULATOR  /  PRACTICE MODE");
       menu_draw->AddText(ImGui::GetFont(), title_size, ImVec2(margin, hero_y + 37.0f),
                          white, "COMBAT");
       menu_draw->AddText(ImGui::GetFont(), title_size, ImVec2(margin, hero_y + 37.0f + title_size),
-                         white, "ROBOTICS");
+                         white, "ARENA");
       const float hero_bottom = hero_y + 43.0f + 2.0f * title_size;
       menu_draw->AddText(ImGui::GetFont(), 16.0f, ImVec2(margin + 2.0f, hero_bottom + 4.0f),
-                         muted, "Build your machine. Tune the setup. Enter the arena.");
+                         muted, "Tune your machine. Take it into the arena.");
       const float status_y = hero_bottom + 37.0f;
+      menu_draw->AddRectFilled(ImVec2(margin, status_y - 3.0f),
+          ImVec2(margin + 184.0f, status_y + 20.0f), IM_COL32(12, 18, 16, 210), 11.0f);
+      menu_draw->AddRect(ImVec2(margin, status_y - 3.0f),
+          ImVec2(margin + 184.0f, status_y + 20.0f), IM_COL32(92, 143, 105, 95), 11.0f);
       menu_draw->AddCircleFilled(ImVec2(margin + 5.0f, status_y + 8.0f), 4.0f,
                                  ImGui::GetColorU32(ui_green));
       menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(margin + 17.0f, status_y),
-                         ImGui::GetColorU32(ui_green), "SIMULATION READY");
+                         ImGui::GetColorU32(ui_green), "LOCAL SIMULATION READY");
 
-      const float item_height = std::clamp(display.y * 0.095f, 56.0f, 70.0f);
+      const float item_height = std::clamp(display.y * 0.082f, 48.0f, 64.0f);
+      const float menu_stack_height = 5.0f * item_height + 4.0f * 7.0f;
       const float menu_y = std::min(home_min.y + 285.0f,
-          std::max(status_y + 27.0f,
-                   display.y - (5.0f * item_height + 4.0f * 7.0f + 78.0f)));
+          std::max(status_y + 27.0f, display.y - 72.0f - menu_stack_height));
       float menu_item_y = menu_y;
       auto menu_item = [&](const char* id, const char* index, const char* title,
                            const char* subtitle, ImVec4 item_accent, bool primary,
@@ -4661,19 +4882,17 @@ int main(int argc, char** argv) {
         const bool hovered = ImGui::IsItemHovered();
         const ImVec2 item_min = ImGui::GetItemRectMin();
         const ImVec2 item_max = ImGui::GetItemRectMax();
-        if (primary || hovered) {
-          const ImU32 fill = primary
-              ? IM_COL32(30, 78, 88, hovered ? 218 : 176)
-              : IM_COL32(38, 49, 63, 170);
-          menu_draw->AddRectFilled(item_min, item_max, fill, 5.0f);
-        }
-        if (primary || hovered) {
-          menu_draw->AddRectFilled(ImVec2(item_min.x, item_min.y + 8.0f),
-              ImVec2(item_min.x + 3.0f, item_max.y - 8.0f),
-              ImGui::GetColorU32(item_accent), 1.5f);
-        }
+        const ImU32 fill = primary
+            ? (hovered ? IM_COL32(181, 70, 34, 242) : IM_COL32(133, 52, 29, 228))
+            : (hovered ? IM_COL32(37, 40, 44, 236) : IM_COL32(15, 17, 20, 212));
+        menu_draw->AddRectFilled(item_min, item_max, fill, 7.0f);
+        menu_draw->AddRect(item_min, item_max,
+          primary ? IM_COL32(248, 142, 91, 145) : IM_COL32(205, 211, 219, hovered ? 62 : 25), 7.0f);
+        menu_draw->AddRectFilled(ImVec2(item_min.x, item_min.y + 8.0f),
+            ImVec2(item_min.x + (primary ? 4.0f : 2.0f), item_max.y - 8.0f),
+            primary ? accent : ImGui::GetColorU32(item_accent), 2.0f);
         const ImU32 index_color = ImGui::GetColorU32(item_accent);
-        const ImU32 title_color = (primary || hovered) ? white : IM_COL32(215, 222, 232, 255);
+        const ImU32 title_color = IM_COL32(246, 247, 249, 255);
         menu_draw->AddText(ImGui::GetFont(), 12.0f,
                            ImVec2(item_min.x + 16.0f, item_min.y + 13.0f), index_color, index);
         menu_draw->AddText(ImGui::GetFont(), 19.0f,
@@ -4697,62 +4916,88 @@ int main(int argc, char** argv) {
           ui_coral, false, [&] { lan_popup_requested = true; });
 
       if (!compact_home) {
-        const float info_x = display.x - 374.0f;
+        const float info_x = display.x - margin - 292.0f;
         const float info_y = home_min.y + std::max(112.0f, display.y * 0.20f);
-        menu_draw->AddRectFilled(ImVec2(info_x - 23.0f, info_y - 4.0f),
-                                 ImVec2(info_x - 21.0f, info_y + 326.0f),
-                                 IM_COL32(65, 205, 210, 175), 1.0f);
-        menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x, info_y),
-                           ImGui::GetColorU32(ui_teal), "SESSION READOUT");
-        menu_draw->AddText(ImGui::GetFont(), 14.0f, ImVec2(info_x, info_y + 32.0f),
-                           muted, "PHYSICS ENGINE");
-        menu_draw->AddText(ImGui::GetFont(), 21.0f, ImVec2(info_x, info_y + 53.0f),
-                           white, "MuJoCo");
+        const ImVec2 card_min(info_x - 18.0f, info_y - 18.0f);
+        const ImVec2 card_max(display.x - margin, info_y + 356.0f);
+        menu_draw->AddRectFilled(card_min, card_max, IM_COL32(11, 13, 16, 222), 9.0f);
+        menu_draw->AddRect(card_min, card_max, IM_COL32(220, 224, 229, 46), 9.0f);
+        menu_draw->AddRectFilled(ImVec2(card_min.x, card_min.y + 10.0f),
+          ImVec2(card_min.x + 3.0f, card_max.y - 10.0f), accent, 2.0f);
+        menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x, info_y), accent,
+                           "PRACTICE SESSION");
+        menu_draw->AddText(ImGui::GetFont(), 20.0f, ImVec2(info_x, info_y + 22.0f),
+                           white, "LOCAL ARENA");
         char rate_text[64];
         std::snprintf(rate_text, sizeof(rate_text), "%.0f HZ SOLVER", 1.0 / model->opt.timestep);
-        menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x, info_y + 81.0f),
+        menu_draw->AddCircleFilled(ImVec2(info_x + 5.0f, info_y + 67.0f), 3.5f,
+                                   ImGui::GetColorU32(ui_green));
+        menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x + 15.0f, info_y + 60.0f),
                            ImGui::GetColorU32(ui_green), rate_text);
-        menu_draw->AddLine(ImVec2(info_x, info_y + 111.0f),
-                           ImVec2(display.x - margin, info_y + 111.0f),
-                           IM_COL32(116, 132, 150, 90), 1.0f);
-        menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x, info_y + 128.0f),
+        menu_draw->AddLine(ImVec2(info_x, info_y + 86.0f),
+                           ImVec2(card_max.x - 18.0f, info_y + 86.0f),
+                           IM_COL32(213, 218, 226, 40), 1.0f);
+        menu_draw->AddText(ImGui::GetFont(), 11.0f, ImVec2(info_x, info_y + 102.0f),
                            muted, "ACTIVE MODEL");
         const std::string active_model = model_path.filename().string();
-        menu_draw->AddText(ImGui::GetFont(), 15.0f, ImVec2(info_x, info_y + 149.0f),
+        menu_draw->PushClipRect(ImVec2(info_x, info_y + 121.0f),
+                                ImVec2(card_max.x - 18.0f, info_y + 143.0f), true);
+        menu_draw->AddText(ImGui::GetFont(), 15.0f, ImVec2(info_x, info_y + 121.0f),
                            white, active_model.c_str());
-        menu_draw->AddLine(ImVec2(info_x, info_y + 180.0f),
-                           ImVec2(display.x - margin, info_y + 180.0f),
-                           IM_COL32(116, 132, 150, 90), 1.0f);
-        menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x, info_y + 197.0f),
-                           muted, "FUSION CAD BUNDLE");
-        menu_draw->AddCircleFilled(ImVec2(info_x + 5.0f, info_y + 228.0f), 4.0f,
+        menu_draw->PopClipRect();
+        menu_draw->AddLine(ImVec2(info_x, info_y + 158.0f),
+                           ImVec2(card_max.x - 18.0f, info_y + 158.0f),
+                           IM_COL32(213, 218, 226, 40), 1.0f);
+        char arena_text[64];
+        std::snprintf(arena_text, sizeof(arena_text), "%.2f m  |  %s",
+                      app_settings.arena_size_m,
+                      app_settings.spawn_layout == 0 ? "CENTER LINE" : "DIAGONAL SPAWN");
+        menu_draw->AddText(ImGui::GetFont(), 11.0f, ImVec2(info_x, info_y + 174.0f),
+                           muted, "ARENA CONFIGURATION");
+        menu_draw->AddText(ImGui::GetFont(), 14.0f, ImVec2(info_x, info_y + 194.0f),
+                           white, arena_text);
+        menu_draw->AddLine(ImVec2(info_x, info_y + 222.0f),
+                           ImVec2(card_max.x - 18.0f, info_y + 222.0f),
+                           IM_COL32(213, 218, 226, 40), 1.0f);
+        menu_draw->AddText(ImGui::GetFont(), 11.0f, ImVec2(info_x, info_y + 238.0f),
+                           muted, "CONTROLS");
+        const char* input_label = joystick ? "USB JOYSTICK" :
+          pad ? "GAMEPAD" : "KEYBOARD";
+        menu_draw->AddText(ImGui::GetFont(), 14.0f, ImVec2(info_x, info_y + 258.0f),
+                           white, input_label);
+        menu_draw->AddLine(ImVec2(info_x, info_y + 284.0f),
+                           ImVec2(card_max.x - 18.0f, info_y + 284.0f),
+                           IM_COL32(213, 218, 226, 40), 1.0f);
+        menu_draw->AddText(ImGui::GetFont(), 11.0f, ImVec2(info_x, info_y + 299.0f),
+                           muted, "IMPORTED BOT");
+        menu_draw->AddCircleFilled(ImVec2(info_x + 5.0f, info_y + 321.0f), 4.0f,
             ImGui::GetColorU32(bundle.HasBundle() ? ui_green : ui_amber));
-        menu_draw->AddText(ImGui::GetFont(), 14.0f, ImVec2(info_x + 17.0f, info_y + 220.0f),
-            white, bundle.HasBundle() ? "Loaded" : "Not loaded");
+        menu_draw->AddText(ImGui::GetFont(), 13.0f, ImVec2(info_x + 17.0f, info_y + 313.0f),
+            white, bundle.HasBundle() ? "READY" : "SAMPLE MODEL");
         if (bundle.HasBundle()) {
           char parts_text[64];
           std::snprintf(parts_text, sizeof(parts_text), "%d imported bodies", bundle.PartCount());
-          menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x, info_y + 246.0f),
+          menu_draw->AddText(ImGui::GetFont(), 11.0f, ImVec2(info_x, info_y + 337.0f),
                              muted, parts_text);
         }
-        menu_draw->AddLine(ImVec2(info_x, info_y + 281.0f),
-                           ImVec2(display.x - margin, info_y + 281.0f),
-                           IM_COL32(116, 132, 150, 90), 1.0f);
-        menu_draw->AddText(ImGui::GetFont(), 12.0f, ImVec2(info_x, info_y + 298.0f),
-                           muted, "PLAYER  WASD  /  SPACE WEAPON");
       }
 
       if (!runtime_error.empty()) {
         ImGui::SetCursorScreenPos(ImVec2(margin, menu_y - 24.0f));
         ImGui::TextColored(ui_red, "%s", runtime_error.c_str());
       }
-      const float footer_y = display.y - 45.0f;
-      menu_draw->AddLine(ImVec2(margin, footer_y - 10.0f),
-          ImVec2(display.x - margin, footer_y - 10.0f), IM_COL32(116, 132, 150, 65), 1.0f);
+      const float footer_y = display.y - 47.0f;
+      menu_draw->AddLine(ImVec2(margin, footer_y - 12.0f),
+          ImVec2(display.x - margin, footer_y - 12.0f), IM_COL32(213, 218, 226, 42), 1.0f);
       ImGui::SetCursorScreenPos(ImVec2(margin, footer_y));
-      ImGui::TextDisabled("W / S DRIVE     A / D TURN     SPACE WEAPON");
+      ImGui::TextColored(ImVec4(0.69f, 0.70f, 0.72f, 1.0f),
+                         "W / S DRIVE    A / D STEER    SPACE WEAPON");
       ImGui::SameLine(display.x - margin - 104.0f);
+      push_button_palette(ImVec4(0.12f, 0.13f, 0.15f, 0.92f),
+                          ImVec4(0.23f, 0.13f, 0.10f, 1.0f),
+                          ImVec4(0.36f, 0.16f, 0.10f, 1.0f));
       if (ImGui::Button("QUIT GAME", ImVec2(104.0f, 28.0f))) running = false;
+      pop_button_palette();
       ImGui::End();
       ImGui::PopStyleVar();
       ImGui::PopStyleColor(2);
@@ -5018,16 +5263,16 @@ int main(int argc, char** argv) {
       if (!drive_sidebar_dragging) requested_drive_sidebar_width = drive_sidebar_width;
       ImGui::SetNextWindowPos(ImVec2(16, 76), ImGuiCond_Always);
       ImGui::SetNextWindowSize(ImVec2(drive_sidebar_width, display.y - 92), ImGuiCond_Always);
-      ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.075f, 0.105f, 0.12f, 0.98f));
-      ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.34f, 0.36f, 0.95f));
+      ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.045f, 0.050f, 0.060f, 0.96f));
+      ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.21f, 0.23f, 0.95f));
       // Drive owns match controls, controller telemetry, and manual robot gizmos.
       ImGui::Begin("##drive_dashboard", nullptr, fixed_window);
       const float drive_content_height = ImGui::GetContentRegionAvail().y;
-      ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.105f, 0.145f, 0.16f, 0.98f));
+      ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.070f, 0.077f, 0.088f, 0.98f));
       ImGui::BeginChild("Drive sidebar contents", ImVec2(-8.0f, 0.0f),
                         ImGuiChildFlags_None, ImGuiWindowFlags_AlwaysVerticalScrollbar);
       ImGui::PushTextWrapPos(520.0f);
-      ImGui::TextColored(ui_green, "PRACTICE DRIVE");
+      ImGui::TextColored(ui_accent, "PRACTICE DRIVE");
       ImGui::TextDisabled("MuJoCo simulation  |  %.0f Hz", 1.0 / model->opt.timestep);
       ImGui::Spacing();
       if (lan_client) {
@@ -5692,16 +5937,18 @@ int main(int argc, char** argv) {
       ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                               ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
       ImGui::SetNextWindowSize(mixer_window_size, ImGuiCond_Appearing);
-      ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.09f, 0.085f, 0.13f, 0.99f));
-      ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.30f, 0.25f, 0.39f, 1.0f));
+      ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.055f, 0.060f, 0.070f, 0.99f));
+      ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.25f, 0.26f, 0.28f, 1.0f));
       if (ImGui::BeginPopupModal("Controller mixer setup", &mixer_popup_open,
           ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
-        ImGui::TextColored(ui_violet, "CONTROLLER MIXER");
-        ImGui::TextDisabled("Set input channels, tune each output mix line, then move the controller to test its response graph.");
+        ImGui::TextColored(ui_accent, "CONTROLLER SETUP");
+        ImGui::TextDisabled("Connect a controller, detect its sticks and buttons, then map inputs to this bot.");
         ImGui::Separator();
-        draw_mixer_dialog(input_mixer, joystick, joystick_id, controls);
+        draw_mixer_dialog(input_mixer, joystick, joystick_id, controls,
+                          active_mixer_profile_key, active_mixer_profile_name);
         ImGui::Separator();
-        ImGui::TextDisabled("Weights, offsets and expo save automatically and carry over when you load another bot.");
+        ImGui::TextDisabled("Controller map is saved for %s; other bots keep their own setup.",
+                            active_mixer_profile_name.c_str());
         ImGui::SameLine(ImGui::GetWindowWidth() - 118.0f);
         if (ImGui::Button("Close", ImVec2(96.0f, 34.0f))) {
           mixer_popup_open = false;
@@ -5750,8 +5997,8 @@ int main(int argc, char** argv) {
     SDL_GL_SwapWindow(window);
   }
 
-  if (!save_mixer_settings(input_mixer))
-    std::fprintf(stderr, "Could not save USB mixer settings on exit.\n");
+  if (!save_mixer_settings(input_mixer, active_mixer_profile_key))
+    std::fprintf(stderr, "Could not save the active model's USB mixer settings on exit.\n");
   if (pad) SDL_CloseGamepad(pad);
   if (joystick) SDL_CloseJoystick(joystick);
   ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplSDL3_Shutdown(); ImGui::DestroyContext();

@@ -204,6 +204,7 @@ class FusionBundle {
   const std::string& Error() const { return error_; }
   bool IsMemoryLoaded() const { return memory_loaded_; }
   const std::filesystem::path& ManifestPath() const { return manifest_; }
+  const std::string& DesignName() const { return design_name_; }
   void DiscardSessionMeshBuffers();
   const std::string& PickMessage() const { return pick_message_; }
   double& BatteryVoltage() { return battery_voltage_; }
