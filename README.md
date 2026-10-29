@@ -5,7 +5,7 @@ MuJoCo for physics and can import robot assemblies exported from Fusion 360.
 
 ## Start here
 
-- [Read the user guide](https://poondproplayz.github.io/CombatSim/)
+- [Read the user guide](https://poondproplayz.github.io/KineticArena/)
 - [Browse the user guide source](docs/index.md)
 - [Preview the documentation site locally](docs/development/building.md#documentation-preview)
 - [Install and build on Windows](docs/getting-started.md)
