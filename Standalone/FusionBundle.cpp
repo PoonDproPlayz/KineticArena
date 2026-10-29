@@ -1677,15 +1677,17 @@ bool FusionBundle::LoadContent(
       if (part.friction <= 0) part.friction = 0.6;
       part.scale = item.value("unitToMeters", default_scale);
       if (!std::isfinite(part.scale) || part.scale <= 0) throw std::runtime_error("Invalid STL unit scale: " + part.file);
-      if (item.contains("positionFusionMeters")) {
-        part.position = ReadArray<3>(item, "positionFusionMeters", {});
-        part.rotation = ReadArray<4>(item, "rotationFusionWxyz", {1, 0, 0, 0});
-      } else {
-        const auto unity_pos = ReadArray<3>(item, "positionMeters", {});
-        const auto unity_rot = ReadArray<4>(item, "rotationUnity", {0, 0, 0, 1});
-        part.position = {unity_pos[0], unity_pos[2], unity_pos[1]};
-        part.rotation = {-unity_rot[3], unity_rot[0], unity_rot[2], unity_rot[1]};
-      }
+      if (!item.contains("positionFusionMeters") ||
+          !item.at("positionFusionMeters").is_array() ||
+          item.at("positionFusionMeters").size() != 3 ||
+          !item.contains("rotationFusionWxyz") ||
+          !item.at("rotationFusionWxyz").is_array() ||
+          item.at("rotationFusionWxyz").size() != 4)
+        throw std::runtime_error(
+            "Manifest part is missing valid Fusion-native transforms; "
+            "re-export with the current Fusion exporter: " + part.file);
+      part.position = ReadArray<3>(item, "positionFusionMeters", {});
+      part.rotation = ReadArray<4>(item, "rotationFusionWxyz", {1, 0, 0, 0});
       const double qlength = std::sqrt(part.rotation[0]*part.rotation[0]+part.rotation[1]*part.rotation[1]+
                                        part.rotation[2]*part.rotation[2]+part.rotation[3]*part.rotation[3]);
       if (qlength < 1e-8) throw std::runtime_error("Invalid rotation: " + part.file);

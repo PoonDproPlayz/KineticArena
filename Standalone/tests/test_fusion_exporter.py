@@ -155,6 +155,31 @@ class FusionExporterTests(unittest.TestCase):
         for actual, wanted in zip(inertia, expected):
             self.assertAlmostEqual(actual, wanted, places=12)
 
+    def test_transform_export_uses_fusion_native_xyz_and_wxyz(self):
+        class Transform:
+            translation = Vector(1.0, -2.0, 3.0)
+
+            def __init__(self, matrix):
+                self.matrix = matrix
+
+            def getCell(self, row, column):
+                return self.matrix[row][column]
+
+        root_two_over_two = math.sqrt(0.5)
+        transform = Transform([
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        exported = self.exporter._transform_data(transform)
+
+        self.assertEqual(exported["positionFusionMeters"], [0.01, -0.02, 0.03])
+        self.assertEqual(set(exported), {"positionFusionMeters", "rotationFusionWxyz"})
+        for actual, expected in zip(
+                exported["rotationFusionWxyz"],
+                [root_two_over_two, 0.0, 0.0, root_two_over_two]):
+            self.assertAlmostEqual(actual, expected)
+
     def test_occurrence_iterator_recurses_through_nested_assembly_tree(self):
         leaf = Occurrence("Wheel:1")
         subassembly = Occurrence("Drive module:1", [leaf])

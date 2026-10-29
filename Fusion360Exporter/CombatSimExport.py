@@ -51,9 +51,9 @@ def _unit_to_meters(unit_name):
     raise ValueError("Unsupported Fusion length unit: " + str(unit_name))
 
 
-def _quat_from_transform(transform):
-    # Fusion rotation matrices use a right-handed z-up basis. Convert the
-    # quaternion into the Unity y-up basis used by the importer.
+def _fusion_quat_wxyz_from_transform(transform):
+    # Fusion uses a right-handed z-up basis. Keep its native axis order and
+    # serialize the quaternion as WXYZ for MuJoCo.
     m = [[transform.getCell(row, col) for col in range(3)] for row in range(3)]
     trace = m[0][0] + m[1][1] + m[2][2]
     if trace > 0.0:
@@ -80,25 +80,19 @@ def _quat_from_transform(transform):
         qx = (m[0][2] + m[2][0]) / s
         qy = (m[1][2] + m[2][1]) / s
         qz = 0.25 * s
-    # MjEngineTool's mapping: Unity quaternion = (x, z, y, -w).
-    return [qx, qz, qy, -qw]
+    return [qw, qx, qy, qz]
 
 
 def _transform_data(transform):
     if transform is None:
         return {
-            "positionMeters": [0.0, 0.0, 0.0],
-            "rotationUnity": [0.0, 0.0, 0.0, 1.0],
             "positionFusionMeters": [0.0, 0.0, 0.0],
             "rotationFusionWxyz": [1.0, 0.0, 0.0, 0.0],
         }
     translation = transform.translation
-    unity_quat = _quat_from_transform(transform)
     return {
-        "positionMeters": [translation.x * 0.01, translation.z * 0.01, translation.y * 0.01],
-        "rotationUnity": unity_quat,
         "positionFusionMeters": [translation.x * 0.01, translation.y * 0.01, translation.z * 0.01],
-        "rotationFusionWxyz": [-unity_quat[3], unity_quat[0], unity_quat[2], unity_quat[1]],
+        "rotationFusionWxyz": _fusion_quat_wxyz_from_transform(transform),
     }
 
 
@@ -651,8 +645,6 @@ def _append_part(parts, export_manager, body, body_name, occurrence_path,
         "materialProperties": material_properties,
         "frictionEstimate": 0.0,
         "unitToMeters": unit_to_meters,
-        "positionMeters": transform_fields["positionMeters"],
-        "rotationUnity": transform_fields["rotationUnity"],
         "positionFusionMeters": transform_fields["positionFusionMeters"],
         "rotationFusionWxyz": transform_fields["rotationFusionWxyz"],
     })

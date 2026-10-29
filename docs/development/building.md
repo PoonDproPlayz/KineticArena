@@ -39,18 +39,29 @@ how to switch renderers in the app.
 
 ## Documentation preview
 
-Install the documentation dependency and serve the pages locally:
+The guide is a MkDocs Material site. From the repository root, install its
+requirements once and start the local preview server:
 
 ```powershell
 python -m pip install -r requirements-docs.txt
 python -m mkdocs serve
 ```
 
-GitHub Actions builds the site on documentation pull requests and publishes it
-when changes reach `main`. See [Code layout](code-layout.md).
+Then open http://127.0.0.1:8000 in a browser. MkDocs rebuilds the preview as
+you edit documentation; press Ctrl+C in PowerShell to stop it.
 
-To enable the site in the repository, open **Settings → Pages** on GitHub and
-set **Build and deployment → Source** to **GitHub Actions**. After a push to
-`main`, the workflow builds only the `docs/` content and publishes it at the
-project Pages URL. Pages is a public website even when the source repository is
-private; GitHub's plan must allow Pages for a private repository.
+To generate a static copy, run `python -m mkdocs build --strict`. The files are
+written to `site/`.
+
+## Public documentation site
+
+The guide is published at <https://poondproplayz.github.io/CombatSim/>. After
+GitHub Pages is enabled, pushes to `main` that change the docs, MkDocs config,
+documentation requirements, or deployment workflow build and deploy the site
+automatically. Pull requests run the strict build check without deploying.
+
+To enable publishing, open the repository on GitHub and go to **Settings >
+Pages > Build and deployment > Source**, select **GitHub Actions**, and save.
+Then push this workflow and the site files to `main`. Check the **Actions** tab
+for the first **Publish documentation** run; its deployment job publishes the
+site. See [Code layout](code-layout.md).

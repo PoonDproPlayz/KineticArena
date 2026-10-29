@@ -43,7 +43,9 @@ visibility. It does not replace or modify the original CAD design.
   and UVs for smoother appearance and texture mapping.
 - Fusion color, normal, and roughness maps are copied when the exporter can
   resolve them. Face-level appearances within one body are not all preserved.
-- Older STL-only bundles can still load, but do not include UV texture maps.
+- Older STL-only bundles with Fusion-native transforms can still load, but do
+  not include UV texture maps. Manifests without `positionFusionMeters` and
+  `rotationFusionWxyz` must be re-exported with the current Fusion exporter.
 - Assignments outside the selected assembly are supported; a body does not have
   to be nested beneath its wheel or weapon folder in the Fusion tree.
 - A flexible wire or cable can remain visible and contribute mass while its

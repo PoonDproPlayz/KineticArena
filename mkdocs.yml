@@ -1,8 +1,8 @@
 site_name: CombatSim Documentation
 site_description: User guide and developer documentation for CombatSim.
-site_url: https://poondproplayz.github.io/KineticArena/
-repo_url: https://github.com/PoonDproPlayz/KineticArena
-repo_name: PoonDproPlayz/KineticArena
+site_url: https://poondproplayz.github.io/CombatSim/
+repo_url: https://github.com/PoonDproPlayz/CombatSim
+repo_name: PoonDproPlayz/CombatSim
 docs_dir: docs
 site_dir: site
 

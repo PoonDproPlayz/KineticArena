@@ -3496,7 +3496,7 @@ int main(int argc, char** argv) {
     if (fit) {
       const auto& axis = bundle.Assembly(target);
       if (!highlight_render_ready) {
-        std::fprintf(stderr, "Detected Sparrow rim, but its hover line geoms were not registered for rendering.\n");
+        std::fprintf(stderr, "Detected a rim, but its hover line geoms were not registered for rendering.\n");
         mjv_freeScene(&checked_scene); mj_deleteData(checked_data); mj_deleteModel(checked);
         return 1;
       }
