@@ -7,7 +7,7 @@ To edit or build the source code, follow the source setup below.
 ## Download and launch
 
 1. Open the [latest release](https://github.com/PoonDproPlayz/KineticArena/releases/latest).
-2. Download `CombatSim-<version>-windows-x64.zip` and extract the whole ZIP to a
+2. Download `CombatSim-vX.Y.Z-windows-x64.zip` and extract the whole ZIP to a
    normal folder.
 3. Double-click `CombatSim.exe` in the extracted folder.
 

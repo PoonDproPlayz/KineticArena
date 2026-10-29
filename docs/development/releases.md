@@ -13,13 +13,18 @@ are needed for it to run.
 
 ## Automated release builds
 
-Pushing a `v*` tag to GitHub starts
-`.github/workflows/release.yml`. The workflow builds the Windows x64 Release
+The `.github/workflows/release.yml` workflow builds the Windows x64 Release
 configuration, packages and smoke-tests it, then creates a GitHub Release with
-the ZIP and SHA-256 checksum attached.
+the ZIP and SHA-256 checksum attached. Start it either by pushing a `v*` tag or
+from the Actions tab.
 
-For a new version, commit and push the desired source to `main`, then create and
-push a version tag. For example:
+To start it from GitHub, open **Actions > Build and publish Windows release >
+Run workflow**, select the `main` branch, enter a version such as `v0.1.0`, and
+run the workflow. It builds that version from the current `main` branch and
+creates its release tag automatically.
+
+For a new version from Git, commit and push the desired source to `main`, then
+create and push a version tag. For example:
 
 ```powershell
 git switch main

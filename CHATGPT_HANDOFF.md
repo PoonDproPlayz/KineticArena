@@ -77,8 +77,9 @@ Run python -m mkdocs build --strict to create a static copy in site/.
 
 ## Windows releases
 
-Tag pushes matching v* run the Windows release workflow. It builds the classic
-renderer, packages CombatSim.exe with SDL3, MuJoCo, Visual C++ runtime DLLs, the
+Tag pushes matching v* or a manual run from the Actions tab on `main` can start
+the Windows release workflow. It builds the classic renderer, packages
+CombatSim.exe with SDL3, MuJoCo, Visual C++ runtime DLLs, the
 stock model XML, and third-party notices, then runs a packaged-app drive smoke
 test and uploads a ZIP plus SHA-256 file to GitHub Releases. The ZIP has one
 application EXE to launch; required runtime files stay beside it. Create local

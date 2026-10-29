@@ -40,6 +40,7 @@ catch {
 
     $releaseBody = @{
         tag_name = $Version
+        target_commitish = 'main'
         name = "CombatSim $Version"
         generate_release_notes = $true
     } | ConvertTo-Json

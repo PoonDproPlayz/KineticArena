@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version to build from main, for example v0.1.0
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,7 +20,10 @@ concurrency:
 
 jobs:
   windows-release:
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: windows-2022
+    env:
+      RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -51,7 +60,7 @@ jobs:
         shell: pwsh
         run: |
           & .\Standalone\package_release.ps1 `
-            -Version $env:GITHUB_REF_NAME `
+            -Version $env:RELEASE_VERSION `
             -BuildDirectory .\Standalone\build `
             -OutputDirectory .\Standalone\release-output `
             -MujocoRoot $env:MUJOCO_ROOT
@@ -62,5 +71,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           & .\Standalone\publish_release.ps1 `
-            -Version $env:GITHUB_REF_NAME `
+            -Version $env:RELEASE_VERSION `
             -ReleaseDirectory .\Standalone\release-output

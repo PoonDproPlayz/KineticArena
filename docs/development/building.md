@@ -77,8 +77,8 @@ powershell -ExecutionPolicy Bypass -File .\Standalone\package_release.ps1 -Versi
 
 The ZIP and SHA-256 checksum are written to `Standalone/release-output/`. The
 package smoke test runs before the ZIP is created. To publish a GitHub Release,
-push a version tag such as `v0.1.0`; the release workflow builds and uploads the
-ZIP automatically. See [Release packaging](releases.md).
+push a version tag such as `v0.1.0`, or run the release workflow from the
+Actions tab on `main`. See [Release packaging](releases.md).
 
 ## Public documentation site
 
