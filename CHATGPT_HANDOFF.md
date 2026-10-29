@@ -21,6 +21,9 @@ practice model is Standalone/models/CombatRobot500g.xml.
 - Fusion360Exporter/CombatSimExport.py is the Fusion 360 add-in.
 - Standalone/LanSession.cpp and LanSession.h handle direct LAN sessions.
 - docs/ contains the MkDocs Material user and developer guides.
+- .github/workflows/release.yml builds Windows ZIP assets on v* tags.
+- Standalone/package_release.ps1 packages and smoke-tests releases;
+  Standalone/publish_release.ps1 creates the release and uploads assets.
 
 ## Fusion workflow
 
@@ -72,6 +75,16 @@ then run:
 Open http://127.0.0.1:8000 in a browser. Press Ctrl+C to stop the preview.
 Run python -m mkdocs build --strict to create a static copy in site/.
 
+## Windows releases
+
+Tag pushes matching v* run the Windows release workflow. It builds the classic
+renderer, packages CombatSim.exe with SDL3, MuJoCo, Visual C++ runtime DLLs, the
+stock model XML, and third-party notices, then runs a packaged-app drive smoke
+test and uploads a ZIP plus SHA-256 file to GitHub Releases. The ZIP has one
+application EXE to launch; required runtime files stay beside it. Create local
+packages after building with `powershell -ExecutionPolicy Bypass -File
+Standalone/package_release.ps1 -Version v0.1.0`.
+
 ## Build, launch, and validation
 
 From the repository root:
@@ -80,6 +93,8 @@ From the repository root:
   .\Standalone\setup.ps1
 - Build without launching: add -NoRun to that command.
 - Everyday launch: Run CombatSim.bat.
+- Build a release ZIP locally: powershell -ExecutionPolicy Bypass -File
+  .\Standalone\package_release.ps1 -Version v0.1.0.
 - Release build: cmake --build Standalone/build --config Release
 - Fusion exporter tests: python -B -m unittest
   Standalone.tests.test_fusion_exporter

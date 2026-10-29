@@ -25,3 +25,5 @@ Desktop.ini
 /Standalone/filament-build/
 /Standalone/.deps/
 /Standalone/filament-check/
+/Standalone/release-output/
+/Standalone/release-output/

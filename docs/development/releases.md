@@ -1,24 +1,45 @@
 # Release packaging
 
-CombatSim does not have a packaged GitHub release yet. The current Windows
-workflow builds from source and needs CMake, a C++ toolchain, MuJoCo, SDL, and
-other build dependencies.
+Windows builds are published on the
+[GitHub Releases page](https://github.com/PoonDproPlayz/KineticArena/releases).
+Each release ZIP contains one `CombatSim.exe` to launch, its runtime DLLs, the
+stock practice model, and third-party license notices. Extract the whole ZIP
+and double-click the EXE. Keep the supporting files next to it.
 
-## Planned one-file download
+The release uses the classic renderer. The ZIP also contains SDL3, MuJoCo, and
+the Visual C++ runtime files required on a clean Windows x64 machine. The
+application executable is the only EXE in the package; the DLLs and model data
+are needed for it to run.
 
-The requested user experience is a ZIP containing a single `CombatSim.exe`.
-The practical way to provide that is a self-extracting portable launcher:
+## Automated release builds
 
-1. Build a release version of the app and collect the required runtime DLLs,
-   Filament assets (for the PBR build), and stock model files.
-2. Bundle and compress those files as resources inside the launcher executable.
-3. On first run, extract them to a versioned directory under the user's local
-   application data, then start CombatSim. Do not require administrator access.
-4. Include third-party notices and licenses with the release information.
-5. Produce a ZIP containing only the launcher, then attach it to a tagged GitHub
-   Release. Verify it on a clean Windows machine that has no developer tools.
+Pushing a `v*` tag to GitHub starts
+`.github/workflows/release.yml`. The workflow builds the Windows x64 Release
+configuration, packages and smoke-tests it, then creates a GitHub Release with
+the ZIP and SHA-256 checksum attached.
 
-That packaging flow is a design target only. It has not been implemented, and
-there is no current release ZIP to download. A normal C++ executable cannot
-launch the complete app from one file unless its runtime libraries and data are
-also embedded or extracted at run time.
+For a new version, commit and push the desired source to `main`, then create and
+push a version tag. For example:
+
+```powershell
+git switch main
+git pull
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Watch the **Build and publish Windows release** workflow in the repository's
+Actions tab. The release is published after the build and packaged-app smoke
+test pass.
+
+## Local package check
+
+After building from source, create the same ZIP locally with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Standalone\package_release.ps1 -Version v0.1.0
+```
+
+The output and checksum are written to the ignored
+`Standalone/release-output/` directory. This command packages files locally;
+the GitHub Actions workflow publishes the release assets.

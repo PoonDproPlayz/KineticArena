@@ -34,7 +34,11 @@ gamepad control, telemetry, and direct LAN matches.
 - A classic renderer and an optional experimental Filament PBR renderer.
 - LAN matches where the host runs the shared physics simulation.
 
-The app is currently built from source. A one-file portable release package is
-planned but is not available yet; see [Release packaging](development/releases.md).
+Download the [latest Windows release](https://github.com/PoonDproPlayz/KineticArena/releases/latest)
+to run CombatSim without setting up a C++ build environment. The ZIP has one
+application executable to launch plus its required runtime files. To modify or
+build the code, see [Build from source](development/building.md). Release assets
+and versioning are described in [Release packaging](development/releases.md).
+
 Match timers, winner declaration, and per-part damage are also not implemented
 in the current build.

@@ -1,0 +1,66 @@
+name: Build and publish Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-release:
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Download MuJoCo
+        shell: pwsh
+        run: |
+          $depsRoot = Join-Path $env:RUNNER_TEMP 'mujoco-3.3.7-windows-x86_64'
+          $archive = Join-Path $env:RUNNER_TEMP 'mujoco-3.3.7-windows-x86_64.zip'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/google-deepmind/mujoco/releases/download/3.3.7/mujoco-3.3.7-windows-x86_64.zip' `
+            -OutFile $archive
+          New-Item -ItemType Directory -Path $depsRoot -Force | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $depsRoot -Force
+          if (-not (Test-Path -LiteralPath (Join-Path $depsRoot 'include\mujoco\mujoco.h'))) {
+            throw 'The MuJoCo archive did not contain include\mujoco\mujoco.h.'
+          }
+          "MUJOCO_ROOT=$depsRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S Standalone -B Standalone/build -G 'Visual Studio 17 2022' -A x64 `
+            "-DMUJOCO_ROOT=$env:MUJOCO_ROOT"
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed: $LASTEXITCODE" }
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          cmake --build Standalone/build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw "Build failed: $LASTEXITCODE" }
+
+      - name: Package and smoke-test
+        shell: pwsh
+        run: |
+          & .\Standalone\package_release.ps1 `
+            -Version $env:GITHUB_REF_NAME `
+            -BuildDirectory .\Standalone\build `
+            -OutputDirectory .\Standalone\release-output `
+            -MujocoRoot $env:MUJOCO_ROOT
+
+      - name: Create GitHub Release and upload ZIP
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          & .\Standalone\publish_release.ps1 `
+            -Version $env:GITHUB_REF_NAME `
+            -ReleaseDirectory .\Standalone\release-output

@@ -1,8 +1,12 @@
 # Build from source
 
+For a ready-to-run application, use the
+[latest Windows release](https://github.com/PoonDproPlayz/KineticArena/releases/latest).
+Follow this page when you want to build or modify the main branch.
+
 ## Automated Windows build
 
-From the repository root, run:
+For the first setup, open PowerShell at the repository root and run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Standalone\setup.ps1 -NoRun
@@ -10,7 +14,16 @@ powershell -ExecutionPolicy Bypass -File .\Standalone\setup.ps1 -NoRun
 
 The script installs missing Git, CMake, and Visual Studio 2022 C++ Build Tools
 with WinGet, downloads MuJoCo 3.3.7, configures CMake, and builds the classic
-renderer. Remove `-NoRun` to launch the stock scene after building.
+renderer. `-NoRun` skips the initial launch. After setup, double-click
+`Run CombatSim.bat` in the repository root to build changed source and launch
+the simulator. The same command from PowerShell is:
+
+```powershell
+& '.\Run CombatSim.bat'
+```
+
+The batch file does not update the checkout; run `git pull` before it if you
+want the latest main branch.
 
 ## Manual CMake build
 
@@ -52,6 +65,20 @@ you edit documentation; press Ctrl+C in PowerShell to stop it.
 
 To generate a static copy, run `python -m mkdocs build --strict`. The files are
 written to `site/`.
+
+## Package a release ZIP locally
+
+After the automated source build succeeds, package the executable and its
+runtime files with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Standalone\package_release.ps1 -Version v0.1.0
+```
+
+The ZIP and SHA-256 checksum are written to `Standalone/release-output/`. The
+package smoke test runs before the ZIP is created. To publish a GitHub Release,
+push a version tag such as `v0.1.0`; the release workflow builds and uploads the
+ZIP automatically. See [Release packaging](releases.md).
 
 ## Public documentation site
 

@@ -1,33 +1,47 @@
 # Install CombatSim
 
-The current app is a native Windows x64 program. The first setup builds it from
-source and downloads its required libraries; a ready-to-run single-file release
-is not available yet.
+CombatSim runs on Windows x64. For most users, download the
+[latest release](https://github.com/PoonDproPlayz/KineticArena/releases/latest).
+To edit or build the source code, follow the source setup below.
 
-## First setup
+## Download and launch
 
-1. Install or update **App Installer** so the `winget` command is available.
-2. Open PowerShell in the CombatSim repository folder.
-3. Run:
+1. Open the [latest release](https://github.com/PoonDproPlayz/KineticArena/releases/latest).
+2. Download `CombatSim-<version>-windows-x64.zip` and extract the whole ZIP to a
+   normal folder.
+3. Double-click `CombatSim.exe` in the extracted folder.
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\Standalone\setup.ps1
-   ```
+Keep the DLL files, `models` folder, and `licenses` folder beside the EXE. The
+release ZIP includes the stock scene and required runtime libraries. You do not
+need the source repository, CMake, Visual Studio, setup script, or batch file to
+run it.
 
-The script checks for Git, CMake, and Visual Studio 2022 C++ Build Tools. It
-installs missing tools with WinGet, downloads MuJoCo, configures the C++ build,
-and launches CombatSim. Windows may ask for permission to install the C++ build
-tools. The first build also downloads SDL and Dear ImGui through CMake, so an
-internet connection is required.
+## Build from source
 
-To install/build without opening the simulator, add `-NoRun`:
+Use this if you want to edit the code or run the current unreleased main branch.
+The one-time setup needs WinGet and an internet connection. From the repository
+folder, run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Standalone\setup.ps1 -NoRun
 ```
 
-After a successful build, double-click `Run CombatSim.bat` in the repository
-folder. It rebuilds changed source and launches the classic renderer.
+The script checks for Git, CMake, and Visual Studio 2022 C++ Build Tools. It
+installs missing tools with WinGet, downloads MuJoCo, configures the C++ build,
+and compiles CombatSim. Windows may ask for permission to install the C++ build
+tools. The first build also downloads SDL and Dear ImGui through CMake.
+
+After setup, launch or rebuild the current source by double-clicking
+`Run CombatSim.bat` in the repository folder. In PowerShell, run it with:
+
+```powershell
+& '.\Run CombatSim.bat'
+```
+
+The batch file builds changed source and then launches the classic renderer; it
+does not update your checkout. Run `git pull` first when you want the latest
+main branch. The optional `-NoRun` switch on `setup.ps1` only skips the initial
+launch after setup.
 
 ## Optional PBR renderer
 
@@ -44,11 +58,5 @@ to switch renderers. The setting is saved for the current Windows user.
 
 Filament provides real-time physically based raster rendering. It is not a ray
 tracer. The classic renderer is the default and remains available separately.
-
-## What gets installed
-
-The scripts keep downloaded libraries and build output under `Standalone/`.
-They do not install a packaged CombatSim application. To use a different
-computer, build there from the repository or wait for a portable release.
 
 For manual CMake instructions, see [Build from source](development/building.md).
