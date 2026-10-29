@@ -55,7 +55,7 @@ on the user's computer.
 ## Documentation site
 
 The guide is a MkDocs Material site published with GitHub Pages at
-https://poondproplayz.github.io/CombatSim/. Pushes to `main` that change the
+https://poondproplayz.github.io/KineticArena/. Pushes to `main` that change the
 documentation, MkDocs config, requirements, or deployment workflow build and
 deploy automatically. Pull requests run a strict build check without
 deploying. The repository's Pages source must be set to **GitHub Actions** in
