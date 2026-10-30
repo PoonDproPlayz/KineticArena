@@ -17,9 +17,11 @@ without W or S; the two wheel sides counter-rotate for a spot turn.
 
 The main bot can use a USB joystick/gamepad. Open **Controller setup** and
 follow its three steps: connect the device, use **Detect** to assign each stick
-or button, then map inputs to drive motor groups or the weapon. The live bars
-show which controls are moving. Use **Reverse** if a control acts in the wrong
-direction and **Deadzone** if a centered stick drifts.
+or button, then map inputs to the left motor side, right motor side, or weapon.
+If your transmitter already mixes the two sides, select each side and detect
+its control separately. The live bars show which controls are moving. Use
+**Reverse** if a control acts in the wrong direction and **Deadzone** if a
+centered stick drifts.
 
 The selected physical controller is remembered on this computer. Input
 assignments and output mixes are saved separately for each loaded bot model and

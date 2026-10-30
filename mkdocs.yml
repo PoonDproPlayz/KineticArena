@@ -48,6 +48,7 @@ nav:
   - Drive:
       - Keyboard and gamepad: drive/controls.md
       - Controller mixer: drive/controller-mixer.md
+      - Fight replays: drive/replays.md
       - Opponent AI: drive/opponent-ai.md
       - LAN multiplayer: drive/multiplayer.md
   - Settings:

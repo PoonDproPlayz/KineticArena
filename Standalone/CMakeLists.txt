@@ -31,7 +31,7 @@ else()
   set(COMBAT_SIM_MUJOCO_TARGET mujoco)
 endif()
 
-add_executable(CombatSimStandalone main.cpp AppSettings.cpp FusionBundle.cpp LanSession.cpp
+add_executable(CombatSimStandalone main.cpp AppSettings.cpp FusionBundle.cpp LanSession.cpp Replay.cpp
   ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp ${imgui_SOURCE_DIR}/imgui_widgets.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp

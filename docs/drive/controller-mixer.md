@@ -8,14 +8,18 @@ Open **Controller setup** from Home or Drive. The setup has three steps:
    **Detect** beside an input. Move one stick fully or press one button. CombatSim
    assigns that physical control to the input and shows its live value. Repeat for
    each input you need. Control numbers start at 1.
-3. **Map inputs to bot controls.** Choose a motor group or Weapon. Set each input's
-   weight, offset, and expo, then move the controller and watch the response graph.
+3. **Map inputs to bot controls.** Choose the left motor side, right motor side,
+   or Weapon. Press **Detect input for selected control**, then move the stick or
+   press the button that already controls it on your transmitter. CombatSim maps
+   that input directly to the selected control. Repeat for the other motor side
+   if the transmitter already mixes steering and throttle.
 
-The default mix uses Input 1 for throttle, Input 2 for steering, and Input 3 for
-the weapon. Fine tune **Reverse** if an axis moves the wrong way. Increase its
-**Deadzone** if a stick drifts while centered. The default drive mix combines
-throttle and steering for left and right motors; weapon output ranges from 0% to
-100%.
+You can also set the mix in CombatSim: each side can combine multiple inputs
+with **Weight**, **Offset**, and **Expo**. The default uses Input 1 for throttle,
+Input 2 for steering, and Input 3 for the weapon. Use **Reverse** if an axis
+moves the wrong way and increase **Deadzone** if a stick drifts while centered.
+The response graph shows the selected input's effect on the chosen side or
+weapon.
 
 The selected physical controller is remembered on this computer. Each bot keeps
 its own channel map and output mix, saved automatically when changed. Load a bot

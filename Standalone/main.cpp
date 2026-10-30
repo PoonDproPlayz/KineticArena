@@ -15,6 +15,7 @@
 #include "FusionBundle.h"
 #include "LanSession.h"
 #include "AppSettings.h"
+#include "Replay.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -27,9 +28,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
+#include <set>
 #include <string>
+#include <sstream>
+#include <ctime>
 #include <thread>
 #include <vector>
 
@@ -59,6 +64,28 @@ std::filesystem::path executable_directory() {
   if (length == 0 || length >= path.size()) return {};
   path.resize(length);
   return std::filesystem::path(path).parent_path();
+}
+
+std::filesystem::path replay_storage_directory() {
+  char* preference_path = SDL_GetPrefPath("CombatSim", "CombatSim");
+  if (!preference_path) return {};
+  const std::filesystem::path path = std::filesystem::path(preference_path) / "replays";
+  SDL_free(preference_path);
+  std::error_code error;
+  std::filesystem::create_directories(path, error);
+  return error ? std::filesystem::path{} : path;
+}
+
+std::filesystem::path next_replay_path(const std::filesystem::path& folder) {
+  const std::time_t now = std::time(nullptr);
+  std::tm local{};
+  localtime_s(&local, &now);
+  std::ostringstream name;
+  name << "fight_" << std::put_time(&local, "%Y%m%d_%H%M%S");
+  auto path = folder / (name.str() + ".kar");
+  for (int suffix = 2; std::filesystem::exists(path); ++suffix)
+    path = folder / (name.str() + "_" + std::to_string(suffix) + ".kar");
+  return path;
 }
 
 // Find the sample model relative to the checkout or packaged executable so
@@ -262,6 +289,7 @@ struct InputMixer {
   bool enabled = false;
   int channel_count = 3;
   int capture_channel = -1;  // Temporary input-detection state; never persisted.
+  std::string capture_output_key;  // Target output for a pending direct mapping.
   std::string preferred_guid;
   std::array<InputChannel, max_input_channels> channels{};
   std::map<std::string, std::array<float, max_input_channels>> outputs;
@@ -328,6 +356,10 @@ std::string motor_output_key(int group) {
 
 std::string ungrouped_wheel_output_key(bool left, size_t index) {
   return std::string(left ? "left_wheel:" : "right_wheel:") + std::to_string(index);
+}
+
+std::string drive_side_output_key(bool left) {
+  return left ? "drive_left" : "drive_right";
 }
 
 std::string weapon_output_key() { return "weapon"; }
@@ -1345,52 +1377,39 @@ struct MixerOutputDescriptor {
 };
 
 std::vector<MixerOutputDescriptor> mixer_outputs(const Controls& controls) {
-  std::map<std::string, MixerOutputDescriptor> drives;
-  auto add_wheels = [&](const std::vector<std::pair<int, double>>& wheels, bool left) {
-    size_t ungrouped_index = 0;
-    for (const auto& [id, direction] : wheels) {
-      (void)direction;
-      const auto motor = controls.motor_models.find(id);
-      std::string key;
-      std::string label;
-      if (motor != controls.motor_models.end()) {
-        const int group = std::clamp(motor->second.drive_group, 0, 7);
-        key = motor_output_key(group);
-        label = "Motor " + std::string(1, char('A' + group));
-      } else {
-        key = ungrouped_wheel_output_key(left, ungrouped_index);
-        label = std::string(left ? "Left motor " : "Right motor ") +
-                std::to_string(ungrouped_index + 1);
-        ++ungrouped_index;
-      }
-      auto& output = drives[key];
-      output.key = key;
-      output.label = label;
-      output.left = output.left || left;
-      output.right = output.right || !left;
-      ++output.wheel_count;
-    }
-  };
-  add_wheels(controls.left, true);
-  add_wheels(controls.right, false);
-
   std::vector<MixerOutputDescriptor> result;
-  for (auto& [key, output] : drives) {
-    (void)key;
-    if (output.label.rfind("Motor ", 0) == 0 && output.wheel_count > 1)
-      output.label += " (" + std::to_string(output.wheel_count) + " wheels)";
-    result.push_back(output);
-  }
+  if (!controls.left.empty())
+    result.push_back({drive_side_output_key(true),
+      "Left motor side (" + std::to_string(controls.left.size()) + " wheels)",
+      true, false, false, static_cast<int>(controls.left.size())});
+  if (!controls.right.empty())
+    result.push_back({drive_side_output_key(false),
+      "Right motor side (" + std::to_string(controls.right.size()) + " wheels)",
+      false, true, false, static_cast<int>(controls.right.size())});
   result.push_back({weapon_output_key(), "Weapon", false, false, true});
   return result;
 }
 
+bool map_output_to_detected_input(InputMixer& mixer, const std::string& output_key,
+                                  int input_index) {
+  if (input_index < 0 || input_index >= max_input_channels || output_key.empty())
+    return false;
+  mixer.channel_count = std::max(mixer.channel_count, input_index + 1);
+  auto& weights = mixer.outputs[output_key];
+  weights.fill(0.0f);
+  weights[input_index] = 1.0f;
+  mixer.output_offsets[output_key].fill(0.0f);
+  mixer.output_expos[output_key].fill(0.0f);
+  mixer.enabled = true;
+  return true;
+}
+
 std::string wheel_output_key(const Controls& controls, int actuator_id,
                              bool left, size_t ungrouped_index) {
-  const auto motor = controls.motor_models.find(actuator_id);
-  if (motor != controls.motor_models.end())
-    return motor_output_key(std::clamp(motor->second.drive_group, 0, 7));
-  return ungrouped_wheel_output_key(left, ungrouped_index);
+  (void)controls;
+  (void)actuator_id;
+  (void)ungrouped_index;
+  return drive_side_output_key(left);
 }
 
 std::array<float, max_input_channels> default_output_weights(
@@ -1404,6 +1423,40 @@ std::array<float, max_input_channels> default_output_weights(
     else if (output.right && !output.left) weights[1] = 1.0f;
   }
   return weights;
+}
+
+bool migrate_legacy_side_mix(InputMixer& mixer,
+                             const std::vector<std::pair<int, double>>& wheels,
+                             const Controls& controls, bool left) {
+  const std::string side_key = drive_side_output_key(left);
+  if (mixer.outputs.find(side_key) != mixer.outputs.end() || wheels.empty()) return false;
+  std::set<std::string> legacy_keys;
+  size_t ungrouped_index = 0;
+  for (const auto& [actuator_id, direction] : wheels) {
+    (void)direction;
+    const auto motor = controls.motor_models.find(actuator_id);
+    if (motor != controls.motor_models.end())
+      legacy_keys.insert(motor_output_key(std::clamp(motor->second.drive_group, 0, 7)));
+    else
+      legacy_keys.insert(ungrouped_wheel_output_key(left, ungrouped_index++));
+  }
+  if (legacy_keys.size() != 1) return false;
+  const auto old_mix = mixer.outputs.find(*legacy_keys.begin());
+  if (old_mix == mixer.outputs.end()) return false;
+  mixer.outputs[side_key] = old_mix->second;
+  const auto old_offsets = mixer.output_offsets.find(*legacy_keys.begin());
+  if (old_offsets != mixer.output_offsets.end())
+    mixer.output_offsets[side_key] = old_offsets->second;
+  const auto old_expos = mixer.output_expos.find(*legacy_keys.begin());
+  if (old_expos != mixer.output_expos.end())
+    mixer.output_expos[side_key] = old_expos->second;
+  return true;
+}
+
+bool migrate_legacy_drive_mixes(InputMixer& mixer, const Controls& controls) {
+  bool changed = migrate_legacy_side_mix(mixer, controls.left, controls, true);
+  changed = migrate_legacy_side_mix(mixer, controls.right, controls, false) || changed;
+  return changed;
 }
 
 float output_value(const InputMixer& mixer, const MixerOutputDescriptor& output,
@@ -1433,7 +1486,11 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
   bool changed = false;
   const auto devices = joystick_devices();
   const auto outputs = mixer_outputs(controls);
-  if (!joystick) mixer.capture_channel = -1;
+  changed = migrate_legacy_drive_mixes(mixer, controls);
+  if (!joystick) {
+    mixer.capture_channel = -1;
+    mixer.capture_output_key.clear();
+  }
   const char* joystick_name = joystick ? SDL_GetJoystickName(joystick) : nullptr;
   const std::string selected_name = joystick_name ? joystick_name :
     mixer.preferred_guid == "none" ? "No controller selected" :
@@ -1448,13 +1505,17 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
                     ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
                     ImGuiWindowFlags_AlwaysVerticalScrollbar);
   ImGui::TextColored(ui_accent, "1  CONNECT YOUR CONTROLLER");
+  ImGui::PushTextWrapPos(0.0f);
   ImGui::TextDisabled("This control setup is saved for %s.", model_name.c_str());
+  ImGui::PopTextWrapPos();
+  ImGui::TextDisabled("Controller");
   ImGui::SetNextItemWidth(-1.0f);
-  if (ImGui::BeginCombo("Controller", selected_name.c_str())) {
+  if (ImGui::BeginCombo("##controller_device", selected_name.c_str())) {
     if (ImGui::Selectable("No controller", mixer.preferred_guid == "none")) {
       mixer.preferred_guid = "none";
       changed = true;
       mixer.capture_channel = -1;
+      mixer.capture_output_key.clear();
       refresh_joystick(joystick, joystick_id, mixer);
     }
     for (size_t device_index = 0; device_index < devices.size(); ++device_index) {
@@ -1466,6 +1527,7 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
         mixer.preferred_guid = device.guid;
         changed = true;
         mixer.capture_channel = -1;
+        mixer.capture_output_key.clear();
         refresh_joystick(joystick, joystick_id, mixer);
       }
     }
@@ -1482,7 +1544,9 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
       : "Choose a connected controller from the list.");
   }
   if (ImGui::Checkbox("Use controller mapping", &mixer.enabled)) changed = true;
+  ImGui::PushTextWrapPos(0.0f);
   ImGui::TextDisabled("This can drive motors and weapon; keyboard stays available when disabled.");
+  ImGui::PopTextWrapPos();
   if (mixer.enabled && !joystick)
     ImGui::TextColored(ui_amber, "Controller mapping is enabled, but no controller is connected.");
 
@@ -1490,7 +1554,8 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
   ImGui::TextWrapped("Each input is one stick axis or button. Use Detect, then move the control you want.");
   if (ImGui::SmallButton("- input") && mixer.channel_count > 1) {
     --mixer.channel_count; changed = true;
-    if (mixer.capture_channel >= mixer.channel_count) mixer.capture_channel = -1;
+    if (mixer.capture_output_key.empty() &&
+        mixer.capture_channel >= mixer.channel_count) mixer.capture_channel = -1;
   }
   ImGui::SameLine();
   if (ImGui::SmallButton("+ input") && mixer.channel_count < max_input_channels) {
@@ -1502,80 +1567,72 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
   ImGui::TextDisabled("%d inputs", mixer.channel_count);
 
   const auto live_channels = read_input_channels(joystick, mixer);
-  const float input_table_height = std::min(300.0f, 36.0f + 42.0f * mixer.channel_count);
-  if (ImGui::BeginTable("##joystick_input_channels", 7,
-      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-      ImGuiTableFlags_SizingFixedFit,
-      ImVec2(0.0f, input_table_height))) {
-    ImGui::TableSetupColumn("Input", ImGuiTableColumnFlags_WidthFixed, 57.0f);
-    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 63.0f);
-    ImGui::TableSetupColumn("Control #", ImGuiTableColumnFlags_WidthFixed, 98.0f);
-    ImGui::TableSetupColumn("Reverse", ImGuiTableColumnFlags_WidthFixed, 58.0f);
-    ImGui::TableSetupColumn("Deadzone", ImGuiTableColumnFlags_WidthFixed, 65.0f);
-    ImGui::TableSetupColumn("Live", ImGuiTableColumnFlags_WidthFixed, 54.0f);
-    ImGui::TableSetupColumn("Detect", ImGuiTableColumnFlags_WidthFixed, 58.0f);
-    ImGui::TableHeadersRow();
-    for (int i = 0; i < mixer.channel_count; ++i) {
-      auto& channel = mixer.channels[i];
-      ImGui::TableNextRow();
-      ImGui::TableSetColumnIndex(0); ImGui::Text("Input %d", i + 1);
-      ImGui::TableSetColumnIndex(1);
-      ImGui::PushID(3000 + i);
-      ImGui::SetNextItemWidth(58.0f);
-      if (ImGui::BeginCombo("##source_type", channel.button ? "Button" : "Axis")) {
-        if (ImGui::Selectable("Axis", !channel.button)) { channel.button = false; changed = true; }
-        if (ImGui::Selectable("Button", channel.button)) { channel.button = true; changed = true; }
-        ImGui::EndCombo();
-      }
-      ImGui::TableSetColumnIndex(2);
-      const int control_count = joystick
-        ? (channel.button ? SDL_GetNumJoystickButtons(joystick) : SDL_GetNumJoystickAxes(joystick))
-        : (channel.button ? 16 : 8);
-      channel.source_index = std::clamp(channel.source_index, 0,
-        std::max(0, std::min(channel.button ? 127 : 63, control_count - 1)));
-      char selected_control[48]{};
-      std::snprintf(selected_control, sizeof(selected_control), "%s %d",
-        channel.button ? "Button" : "Axis", channel.source_index + 1);
-      ImGui::SetNextItemWidth(92.0f);
-      if (ImGui::BeginCombo("##source_index", selected_control)) {
-        const int visible_count = std::max(control_count, channel.source_index + 1);
-        for (int control = 0; control < visible_count; ++control) {
-          char control_label[48]{};
-          std::snprintf(control_label, sizeof(control_label), "%s %d",
-            channel.button ? "Button" : "Axis", control + 1);
-          if (ImGui::Selectable(control_label, channel.source_index == control)) {
-            channel.source_index = control;
-            changed = true;
-          }
-        }
-        ImGui::EndCombo();
-      }
-      ImGui::TableSetColumnIndex(3);
-      if (channel.button) ImGui::TextDisabled("—");
-      else if (ImGui::Checkbox("##inverted", &channel.inverted)) changed = true;
-      ImGui::TableSetColumnIndex(4);
-      if (channel.button) ImGui::TextDisabled("—");
-      else {
-        ImGui::SetNextItemWidth(-1.0f);
-        if (ImGui::SliderFloat("##deadzone", &channel.deadzone, 0.0f, 0.50f, "%.2f")) changed = true;
-      }
-      ImGui::TableSetColumnIndex(5);
-      const float live_value = live_channels[i];
-      ImGui::ProgressBar(channel.button ? live_value : (live_value + 1.0f) * 0.5f,
-                         ImVec2(-1.0f, 0.0f), "");
-      ImGui::TableSetColumnIndex(6);
-      const bool is_listening = mixer.capture_channel == i;
-      ImGui::BeginDisabled(!joystick);
-      if (ImGui::SmallButton(is_listening ? "Cancel" : "Detect"))
-        mixer.capture_channel = is_listening ? -1 : i;
-      ImGui::EndDisabled();
-      if (!joystick && ImGui::IsItemHovered())
-        ImGui::SetTooltip("Connect a controller first.");
-      ImGui::PopID();
+  for (int i = 0; i < mixer.channel_count; ++i) {
+    auto& channel = mixer.channels[i];
+    ImGui::PushID(3000 + i);
+    ImGui::Separator();
+    ImGui::Text("Input %d", i + 1);
+    const bool is_listening = mixer.capture_output_key.empty() &&
+      mixer.capture_channel == i;
+    ImGui::BeginDisabled(!joystick);
+    if (ImGui::Button(is_listening ? "Cancel detection" : "Detect this input",
+                      ImVec2(-1.0f, 0.0f))) {
+      mixer.capture_channel = is_listening ? -1 : i;
+      mixer.capture_output_key.clear();
     }
-    ImGui::EndTable();
+    ImGui::EndDisabled();
+    if (!joystick && ImGui::IsItemHovered())
+      ImGui::SetTooltip("Connect a controller first.");
+
+    const int axis_count = joystick ? SDL_GetNumJoystickAxes(joystick) : 8;
+    const int button_count = joystick ? SDL_GetNumJoystickButtons(joystick) : 16;
+    channel.source_index = std::clamp(channel.source_index, 0,
+      std::max(0, std::min(channel.button ? 127 : 63,
+                           (channel.button ? button_count : axis_count) - 1)));
+    char selected_control[48]{};
+    std::snprintf(selected_control, sizeof(selected_control), "%s %d",
+      channel.button ? "Button" : "Axis", channel.source_index + 1);
+    ImGui::TextDisabled("Controller control");
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::BeginCombo("##controller_control", selected_control)) {
+      for (int axis = 0; axis < std::min(axis_count, 64); ++axis) {
+        char control_label[48]{};
+        std::snprintf(control_label, sizeof(control_label), "Axis %d", axis + 1);
+        if (ImGui::Selectable(control_label,
+              !channel.button && channel.source_index == axis)) {
+          channel.button = false;
+          channel.source_index = axis;
+          changed = true;
+        }
+      }
+      ImGui::Separator();
+      for (int button = 0; button < std::min(button_count, 128); ++button) {
+        char control_label[48]{};
+        std::snprintf(control_label, sizeof(control_label), "Button %d", button + 1);
+        if (ImGui::Selectable(control_label,
+              channel.button && channel.source_index == button)) {
+          channel.button = true;
+          channel.source_index = button;
+          changed = true;
+        }
+      }
+      ImGui::EndCombo();
+    }
+    if (channel.button) {
+      ImGui::TextDisabled("Button input is on or off.");
+    } else {
+      if (ImGui::Checkbox("Reverse", &channel.inverted)) changed = true;
+      ImGui::TextDisabled("Deadzone");
+      ImGui::SetNextItemWidth(-1.0f);
+      if (ImGui::SliderFloat("##deadzone", &channel.deadzone, 0.0f, 0.50f,
+                             "%.2f")) changed = true;
+    }
+    const float live_value = live_channels[i];
+    ImGui::ProgressBar(channel.button ? live_value : (live_value + 1.0f) * 0.5f,
+                       ImVec2(-1.0f, 0.0f), "Live input");
+    ImGui::PopID();
   }
-  if (mixer.capture_channel >= 0 && mixer.capture_channel < mixer.channel_count && joystick) {
+  if (mixer.capture_channel >= 0 && mixer.capture_channel < max_input_channels && joystick) {
     SDL_UpdateJoysticks();
     auto& channel = mixer.channels[mixer.capture_channel];
     bool detected = false;
@@ -1601,14 +1658,21 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
       }
     }
     if (detected) {
+      if (!mixer.capture_output_key.empty()) {
+        map_output_to_detected_input(mixer, mixer.capture_output_key,
+                                     mixer.capture_channel);
+        mixer.capture_output_key.clear();
+      }
       changed = true;
       mixer.capture_channel = -1;
     } else {
       ImGui::TextColored(ui_amber, "Move one stick fully or press one button to detect it.");
     }
   }
+  ImGui::PushTextWrapPos(0.0f);
   ImGui::TextDisabled("Control numbers start at 1. Reverse an axis if its direction feels wrong.");
   ImGui::TextDisabled("Default mix: Input 1 throttle, Input 2 steering, Input 3 weapon.");
+  ImGui::PopTextWrapPos();
   ImGui::EndChild();
   ImGui::PopStyleColor(2);
 
@@ -1619,7 +1683,9 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
                     ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
                     ImGuiWindowFlags_AlwaysVerticalScrollbar);
   ImGui::TextColored(ui_accent, "3  MAP INPUTS TO BOT CONTROLS");
-  ImGui::TextDisabled("Choose a motor group or weapon, then tune how each input affects it.");
+  ImGui::PushTextWrapPos(0.0f);
+  ImGui::TextDisabled("Select a bot motor side or weapon. Detect its controller input below.");
+  ImGui::PopTextWrapPos();
   static std::string selected_output_key;
   static int graph_channel = 0;
   if (!outputs.empty() && std::none_of(outputs.begin(), outputs.end(), [&](const auto& output) {
@@ -1630,7 +1696,7 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
   });
   const char* selected_output_name = selected_output == outputs.end()
     ? "No outputs available" : selected_output->label.c_str();
-  if (ImGui::BeginCombo("Robot control", selected_output_name)) {
+  if (ImGui::BeginCombo("Bot control", selected_output_name)) {
     for (const auto& output : outputs) {
       if (!ImGui::Selectable(output.label.c_str(), output.key == selected_output_key)) continue;
       selected_output_key = output.key;
@@ -1642,6 +1708,37 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
   }
 
   if (selected_output != outputs.end()) {
+    const int output_slot = static_cast<int>(std::distance(outputs.begin(), selected_output));
+    const bool output_is_listening = !mixer.capture_output_key.empty() &&
+      mixer.capture_channel == output_slot &&
+      mixer.capture_output_key == selected_output->key;
+    const std::string detect_label = output_is_listening
+      ? "Cancel detection"
+      : "Detect input for this control";
+    ImGui::BeginDisabled(!joystick || output_slot >= max_input_channels);
+    if (ImGui::Button(detect_label.c_str(), ImVec2(-1.0f, 0.0f))) {
+      if (output_is_listening) {
+        mixer.capture_channel = -1;
+        mixer.capture_output_key.clear();
+      } else {
+        mixer.capture_channel = output_slot;
+        mixer.capture_output_key = selected_output->key;
+      }
+    }
+    ImGui::EndDisabled();
+    if (!joystick && ImGui::IsItemHovered())
+      ImGui::SetTooltip("Connect a controller first.");
+    else if (output_slot >= max_input_channels && ImGui::IsItemHovered())
+      ImGui::SetTooltip("This bot has more controls than the 16 controller inputs supported.");
+    if (output_is_listening)
+      ImGui::TextColored(ui_amber,
+        "Move the stick or press the button assigned to %s.", selected_output->label.c_str());
+    else {
+      ImGui::PushTextWrapPos(0.0f);
+      ImGui::TextDisabled("This directly maps one controller input. Use weights below to combine inputs.");
+      ImGui::PopTextWrapPos();
+    }
+
     const auto& output = *selected_output;
     auto [weights_it, weights_inserted] = mixer.outputs.try_emplace(
       output.key, default_output_weights(output));
@@ -1655,8 +1752,9 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
       expos.fill(0.0f);
       changed = true;
     }
-    ImGui::SameLine();
+    ImGui::PushTextWrapPos(0.0f);
     ImGui::TextDisabled("Weight = strength/direction. Offset = trim. Expo = stick feel.");
+    ImGui::PopTextWrapPos();
     const float output_table_height = std::min(260.0f, 36.0f + 28.0f * mixer.channel_count);
     if (ImGui::BeginTable("##output_mix_lines", 5,
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit,
@@ -1708,7 +1806,9 @@ void draw_mixer_dialog(InputMixer& mixer, SDL_Joystick*& joystick,
     ImGui::SameLine();
     ImGui::TextColored(ui_violet,
                        "Mixed output %+.0f%%", live_output * 100.0f);
+    ImGui::PushTextWrapPos(0.0f);
     ImGui::TextDisabled("The curve shows this input. The amber dot follows your controller live.");
+    ImGui::PopTextWrapPos();
     const ImVec2 graph_size(std::max(260.0f, ImGui::GetContentRegionAvail().x), 200.0f);
     const ImVec2 graph_min = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("##mixer_response_graph", graph_size);
@@ -2264,19 +2364,38 @@ int main(int argc, char** argv) {
       });
       return found == descriptors.end() ? nullptr : &*found;
     };
-    const auto* motor_a_output = descriptor_for(motor_output_key(0));
-    const auto* motor_b_output = descriptor_for(motor_output_key(1));
+    const auto* left_side_output = descriptor_for(drive_side_output_key(true));
+    const auto* right_side_output = descriptor_for(drive_side_output_key(false));
     const auto* weapon_output = descriptor_for(weapon_output_key());
+    InputMixer direct_side_mixer;
+    initialize_default_mixer(direct_side_mixer);
+    const bool direct_side_mapping = left_side_output && right_side_output &&
+      map_output_to_detected_input(direct_side_mixer, left_side_output->key, 0) &&
+      map_output_to_detected_input(direct_side_mixer, right_side_output->key, 1) &&
+      left_side_output->label.rfind("Left motor side", 0) == 0 &&
+      right_side_output->label.rfind("Right motor side", 0) == 0 &&
+      std::abs(output_value(direct_side_mixer, *left_side_output,
+                            std::array<float, max_input_channels>{0.28f, -0.73f}) - 0.28f) < 1e-5f &&
+      std::abs(output_value(direct_side_mixer, *right_side_output,
+                            std::array<float, max_input_channels>{0.28f, -0.73f}) + 0.73f) < 1e-5f;
+    InputMixer legacy_side_mixer;
+    initialize_default_mixer(legacy_side_mixer);
+    legacy_side_mixer.outputs[motor_output_key(0)][0] = 0.42f;
+    legacy_side_mixer.outputs[motor_output_key(1)][0] = -0.37f;
+    const bool legacy_side_migration =
+      migrate_legacy_drive_mixes(legacy_side_mixer, sample_controls) &&
+      std::abs(legacy_side_mixer.outputs[drive_side_output_key(true)][0] - 0.42f) < 1e-6f &&
+      std::abs(legacy_side_mixer.outputs[drive_side_output_key(false)][0] + 0.37f) < 1e-6f;
     InputMixer first_bot_profile, second_bot_profile;
     initialize_default_mixer(first_bot_profile);
     initialize_default_mixer(second_bot_profile);
     first_bot_profile.enabled = true;
     first_bot_profile.channel_count = 5;
     first_bot_profile.channels[0].source_index = 6;
-    first_bot_profile.outputs[motor_output_key(0)][0] = 0.65f;
+    first_bot_profile.outputs[drive_side_output_key(true)][0] = 0.65f;
     second_bot_profile.channel_count = 3;
     second_bot_profile.channels[0].source_index = 1;
-    second_bot_profile.outputs[motor_output_key(0)][0] = 0.35f;
+    second_bot_profile.outputs[drive_side_output_key(true)][0] = 0.35f;
     json model_profiles = json::object();
     model_profiles["bot-one"] = mixer_profile_json(first_bot_profile);
     model_profiles["bot-two"] = mixer_profile_json(second_bot_profile);
@@ -2292,19 +2411,20 @@ int main(int argc, char** argv) {
     const bool model_profiles_isolated = first_model_key != second_model_key &&
       restored_first.enabled && restored_first.channel_count == 5 &&
       restored_first.channels[0].source_index == 6 &&
-      std::abs(restored_first.outputs[motor_output_key(0)][0] - 0.65f) < 1e-6f &&
+      std::abs(restored_first.outputs[drive_side_output_key(true)][0] - 0.65f) < 1e-6f &&
       !restored_second.enabled && restored_second.channel_count == 3 &&
       restored_second.channels[0].source_index == 1 &&
-      std::abs(restored_second.outputs[motor_output_key(0)][0] - 0.35f) < 1e-6f;
+      std::abs(restored_second.outputs[drive_side_output_key(true)][0] - 0.35f) < 1e-6f;
     if (std::abs(left - 0.35f) > 1e-5f || std::abs(right - 0.85f) > 1e-5f ||
         std::abs(weapon - 1.0f) > 1e-5f ||
         std::abs(shaped_line - 0.508f) > 1e-5f ||
         std::abs(capped - 1.0f) > 1e-5f || std::abs(weapon_off) > 1e-6f ||
-        !motor_a_output || !motor_b_output || !weapon_output ||
-        std::abs(output_value(defaults, *motor_a_output, input) - 0.35f) > 1e-5f ||
-        std::abs(output_channel_response(defaults, *motor_a_output, 0, input[0]) - 0.6f) > 1e-5f ||
-        std::abs(output_value(defaults, *motor_b_output, input) - 0.85f) > 1e-5f ||
+        !left_side_output || !right_side_output || !weapon_output ||
+        std::abs(output_value(defaults, *left_side_output, input) - 0.35f) > 1e-5f ||
+        std::abs(output_channel_response(defaults, *left_side_output, 0, input[0]) - 0.6f) > 1e-5f ||
+        std::abs(output_value(defaults, *right_side_output, input) - 0.85f) > 1e-5f ||
         std::abs(output_value(defaults, *weapon_output, input) - 1.0f) > 1e-5f ||
+        !direct_side_mapping || !legacy_side_migration ||
         std::abs(normalize_axis(0, 0.12f)) > 1e-6f ||
         std::abs(normalize_axis(32767, 0.12f) - 1.0f) > 1e-6f ||
         std::abs(normalize_axis(-32768, 0.12f) + 1.0f) > 1e-6f ||
@@ -2312,7 +2432,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "Input mixer failed: motor/weapon mixes, axis calibration, or model-specific profile isolation are incorrect.\n");
       return 1;
     }
-    std::puts("Input mixer passed: drive/weapon mixes, axis calibration, and independent saved profiles for different model keys.");
+    std::puts("Input mixer passed: drive/weapon mixes, per-side direct input mapping, axis calibration, and model-specific saved profiles.");
     return 0;
   }
   if (argc >= 4 && std::string(argv[1]) == "--test-opponent-bundle") {
@@ -4045,6 +4165,8 @@ int main(int argc, char** argv) {
     }
   } else if (filament_render_smoke) {
     model_path = argv[2];
+  } else if (argc >= 2 && std::string(argv[1]) == "--test-replay") {
+    model_path = argc >= 3 ? argv[2] : stock_model_path();
   } else {
     model_path = argc > 1 ? argv[1] :
       stock_model_path();
@@ -4065,6 +4187,44 @@ int main(int argc, char** argv) {
                   model->nbody, model->opt.timestep);
     else
       std::fprintf(stderr, "Renderer restart bundle restore did not produce the expected two-bot model.\n");
+    mj_deleteModel(model);
+    return valid ? 0 : 1;
+  }
+  if (argc >= 2 && std::string(argv[1]) == "--test-replay") {
+    mjData* test_data = mj_makeData(model);
+    FightReplay recorder;
+    std::string error;
+    bool valid = test_data && recorder.Begin(model, test_data, error);
+    for (int i = 0; valid && i < 400; ++i) {
+      mj_step(model, test_data);
+      valid = recorder.Capture(model, test_data, error);
+    }
+    recorder.Stop();
+    const auto replay_path = std::filesystem::temp_directory_path() /
+      ("combatsim_replay_test_" + std::to_string(GetCurrentProcessId()) + ".kar");
+    if (valid) valid = recorder.FrameCount() > 1 && recorder.Save(replay_path, error);
+    FightReplay loaded;
+    if (valid) valid = loaded.Load(replay_path, error);
+    mjModel* replay_test_model = valid ? loaded.CreateModel(error) : nullptr;
+    mjData* replay_test_data = replay_test_model ? mj_makeData(replay_test_model) : nullptr;
+    if (valid && replay_test_data) {
+      const double seek_time = loaded.Duration() * 0.5;
+      valid = loaded.Apply(replay_test_model, replay_test_data, seek_time, error) &&
+        std::abs(replay_test_data->time - seek_time) < 1e-5;
+    } else if (valid) {
+      valid = false;
+      error = "Could not instantiate the replay's embedded model.";
+    }
+    std::error_code remove_error;
+    std::filesystem::remove(replay_path, remove_error);
+    if (valid)
+      std::printf("Replay record/save/load/scrub check passed (%zu poses, %.3f s).\n",
+                  loaded.FrameCount(), loaded.Duration());
+    else
+      std::fprintf(stderr, "Replay check failed: %s\n", error.c_str());
+    if (replay_test_data) mj_deleteData(replay_test_data);
+    if (replay_test_model) mj_deleteModel(replay_test_model);
+    if (test_data) mj_deleteData(test_data);
     mj_deleteModel(model);
     return valid ? 0 : 1;
   }
@@ -4117,6 +4277,8 @@ int main(int argc, char** argv) {
   std::string active_mixer_profile_key = mixer_model_profile_key(bundle, model_path);
   std::string active_mixer_profile_name = mixer_model_profile_name(bundle, model_path);
   load_mixer_settings(input_mixer, active_mixer_profile_key);
+  if (migrate_legacy_drive_mixes(input_mixer, controls))
+    save_mixer_settings(input_mixer, active_mixer_profile_key);
   AppSettings app_settings;
   load_app_settings(app_settings);
   std::string graphics_status;
@@ -4157,6 +4319,10 @@ int main(int argc, char** argv) {
   setup_camera.distance = 1.0; setup_camera.elevation = -45; setup_camera.azimuth = 45;
   mjvOption options; mjv_defaultOption(&options);
   mjvScene scene; mjv_defaultScene(&scene); mjv_makeScene(model, &scene, 2000);
+  mjvScene replay_scene; mjv_defaultScene(&replay_scene);
+  mjModel* replay_model = nullptr;
+  mjData* replay_data = nullptr;
+  mjrContext replay_context; mjr_defaultContext(&replay_context);
   mjModel* setup_model = nullptr;
   mjData* setup_data = nullptr;
   mjvScene setup_scene; mjv_defaultScene(&setup_scene);
@@ -4273,7 +4439,7 @@ int main(int argc, char** argv) {
   ImGui_ImplSDL3_InitForOpenGL(window, gl);
   ImGui_ImplOpenGL3_Init("#version 330");
 
-  enum class AppScreen { Home, Drive, Configure, Settings };
+  enum class AppScreen { Home, Drive, Replay, Configure, Settings };
   enum class SettingsSection { Arena, Graphics };
   enum class GizmoMode { Move, Rotate };
   AppScreen screen = AppScreen::Home;
@@ -4293,6 +4459,107 @@ int main(int argc, char** argv) {
   bool mixer_popup_open = false;
   bool lan_popup_open = false;
   std::string runtime_error;
+  std::string replay_status;
+  FightReplay fight_replay;
+  const std::filesystem::path replay_folder = replay_storage_directory();
+  std::vector<std::filesystem::path> replay_files;
+  std::filesystem::path selected_replay_path;
+  std::filesystem::path loaded_replay_path;
+  std::filesystem::path playback_replay_path;
+  float replay_position = 0.0f;
+  float replay_speed = 1.0f;
+  int replay_follow_target = 0;
+  bool replay_playing = false;
+  auto refresh_replay_files = [&] {
+    replay_files.clear();
+    selected_replay_path.clear();
+    std::error_code error;
+    if (replay_folder.empty() || !std::filesystem::exists(replay_folder, error)) return;
+    for (std::filesystem::directory_iterator it(replay_folder, error), end;
+         !error && it != end; it.increment(error)) {
+      if (it->is_regular_file(error) && it->path().extension() == ".kar")
+        replay_files.push_back(it->path());
+    }
+    std::sort(replay_files.begin(), replay_files.end(), [](const auto& a, const auto& b) {
+      std::error_code left_error, right_error;
+      return std::filesystem::last_write_time(a, left_error) >
+             std::filesystem::last_write_time(b, right_error);
+    });
+    if (!replay_files.empty()) selected_replay_path = replay_files.front();
+  };
+  auto save_replay = [&] {
+    if (!fight_replay.HasReplay()) return false;
+    if (replay_folder.empty()) {
+      replay_status = "Could not access the local replay folder.";
+      return false;
+    }
+    const auto path = next_replay_path(replay_folder);
+    std::string error;
+    if (!fight_replay.Save(path, error)) {
+      replay_status = error;
+      return false;
+    }
+    loaded_replay_path = path;
+    selected_replay_path = path;
+    refresh_replay_files();
+    selected_replay_path = path;
+    replay_status = "Saved " + path.filename().string();
+    return true;
+  };
+  auto finish_recording = [&] {
+    if (!fight_replay.IsRecording()) return;
+    fight_replay.Stop();
+    save_replay();
+  };
+  auto load_replay_file = [&](const std::filesystem::path& path) {
+    FightReplay candidate;
+    std::string error;
+    if (!candidate.Load(path, error)) {
+      replay_status = error;
+      return false;
+    }
+    mjModel* next_model = candidate.CreateModel(error);
+    if (!next_model) {
+      replay_status = error;
+      return false;
+    }
+    mjData* next_data = mj_makeData(next_model);
+    if (!next_data) {
+      mj_deleteModel(next_model);
+      replay_status = "Could not allocate playback state for this replay.";
+      return false;
+    }
+
+    mjr_freeContext(&replay_context);
+    mjv_freeScene(&replay_scene);
+    if (replay_data) mj_deleteData(replay_data);
+    if (replay_model) mj_deleteModel(replay_model);
+    fight_replay = std::move(candidate);
+    replay_model = next_model;
+    replay_data = next_data;
+    replay_model->vis.quality.offsamples = 0;
+    mjv_defaultScene(&replay_scene);
+    mjv_makeScene(replay_model, &replay_scene, 2000);
+    mjr_defaultContext(&replay_context);
+    make_render_context(replay_model, &replay_context);
+    loaded_replay_path = path;
+    selected_replay_path = path;
+    playback_replay_path = path;
+    replay_position = 0.0f;
+    replay_playing = false;
+    camera.lookat[0] = camera.lookat[1] = camera.lookat[2] = 0.0;
+    camera.distance = std::clamp(3.5 * double(app_settings.arena_size_m) / 2.0,
+                                 1.5, 30.0);
+    camera.elevation = -55.0;
+    camera.azimuth = 90.0;
+    if (!fight_replay.Apply(replay_model, replay_data, replay_position, error)) {
+      replay_status = error;
+      return false;
+    }
+    replay_status = "Loaded " + path.filename().string();
+    return true;
+  };
+  refresh_replay_files();
   char lan_address[256] = "127.0.0.1";
   char lan_port_text[16] = "29811";
   char lan_passphrase[65]{};
@@ -4323,6 +4590,7 @@ int main(int argc, char** argv) {
       runtime_error = "Could not save the joystick setup for the previous model.";
     active_mixer_profile_key = next_key;
     load_mixer_settings(input_mixer, active_mixer_profile_key);
+    migrate_legacy_drive_mixes(input_mixer, controls);
     // The selected physical controller is a computer preference; channel maps
     // and output mixes belong to the model profile.
     input_mixer.preferred_guid = selected_device;
@@ -4338,6 +4606,7 @@ int main(int argc, char** argv) {
       if (next_model) mj_deleteModel(next_model);
       return false;
     }
+    finish_recording();
 #if defined(COMBATSIM_USE_FILAMENT)
     apply_filament_material_defaults(next_model);
 #endif
@@ -4550,12 +4819,18 @@ int main(int argc, char** argv) {
                                     rotation_pivot, rotation_local_pivot);
             ring_previous_angle = hit.angle;
           }
-        } else if (window_height > 0 && screen == AppScreen::Drive &&
+        } else if (window_height > 0 &&
+                   (screen == AppScreen::Drive || screen == AppScreen::Replay) &&
                    (event.motion.state & SDL_BUTTON_RMASK)) {
-          mjv_moveCamera(model, mjMOUSE_MOVE_H,
+          mjvScene* active_camera_scene = screen == AppScreen::Replay && replay_model
+            ? &replay_scene : &scene;
+          mjModel* active_camera_model = screen == AppScreen::Replay && replay_model
+            ? replay_model : model;
+          mjv_moveCamera(active_camera_model, mjMOUSE_MOVE_H,
               event.motion.xrel / static_cast<mjtNum>(window_height),
-              -event.motion.yrel / static_cast<mjtNum>(window_height), &scene, &camera);
-        } else if ((!placement_mode || screen == AppScreen::Drive) &&
+              -event.motion.yrel / static_cast<mjtNum>(window_height), active_camera_scene, &camera);
+        } else if ((!placement_mode || screen == AppScreen::Drive ||
+                    screen == AppScreen::Replay) &&
                    (event.motion.state & SDL_BUTTON_LMASK)) {
           camera.azimuth += event.motion.xrel * 0.4;
           camera.elevation = std::clamp(camera.elevation - event.motion.yrel * 0.4, -89.0, 89.0);
@@ -4655,7 +4930,9 @@ int main(int argc, char** argv) {
     }
 
     const auto now = std::chrono::steady_clock::now();
-    accumulator += std::min(0.1, std::chrono::duration<double>(now - last).count());
+    const double frame_seconds = std::min(0.1,
+        std::chrono::duration<double>(now - last).count());
+    accumulator += frame_seconds;
     last = now;
     if (paused || screen != AppScreen::Drive) accumulator = 0.0;
     int steps = 0;
@@ -4686,35 +4963,72 @@ int main(int argc, char** argv) {
       drive(model, data, opponent_controls, nullptr, nullptr, input_mixer,
             opponent_command, false);
       mj_step(model, data);
+      if (fight_replay.IsRecording()) {
+        std::string capture_error;
+        if (!fight_replay.Capture(model, data, capture_error)) {
+          replay_status = capture_error;
+          save_replay();
+        }
+      }
       accumulator -= model->opt.timestep;
     }
     if (steps >= 250) accumulator = 0.0;
     if (lan_host)
       lan.SendSnapshot(data->time, data->qpos, model->nq, data->qvel, model->nv);
 
+    if (screen == AppScreen::Replay && fight_replay.HasReplay() && replay_data) {
+      if (replay_playing) {
+        replay_position += float(frame_seconds * replay_speed);
+        if (replay_position >= fight_replay.Duration()) {
+          replay_position = float(fight_replay.Duration());
+          replay_playing = false;
+        }
+      }
+      std::string replay_error;
+      if (!fight_replay.Apply(replay_model, replay_data, replay_position, replay_error)) {
+        replay_status = replay_error;
+        replay_playing = false;
+      } else if (replay_follow_target > 0) {
+        const char* body_name = replay_follow_target == 1 ? "Player_Robot" : "Target_Robot";
+        const int body = mj_name2id(replay_model, mjOBJ_BODY, body_name);
+        if (body > 0) {
+          camera.lookat[0] = replay_data->subtree_com[3*body];
+          camera.lookat[1] = replay_data->subtree_com[3*body + 1];
+          camera.lookat[2] = replay_data->subtree_com[3*body + 2];
+        }
+      }
+    }
+
     int width = 0, height = 0;
     SDL_GetWindowSizeInPixels(window, &width, &height);
     mjrRect viewport{0, 0, width, height};
+    const bool use_replay_scene = screen == AppScreen::Replay && replay_model &&
+      replay_data && fight_replay.HasReplay();
+    mjModel* display_model = use_replay_scene ? replay_model : model;
+    mjData* display_data = use_replay_scene ? replay_data : data;
+    mjvScene* display_scene = use_replay_scene ? &replay_scene : &scene;
+    mjrContext* display_context = use_replay_scene ? &replay_context : &context;
 #if !defined(COMBATSIM_USE_FILAMENT)
-    mjr_setBuffer(mjFB_WINDOW, &context);
+    mjr_setBuffer(mjFB_WINDOW, display_context);
 #endif
-    apply_arena_lighting(model, app_settings);
-    mjv_updateScene(model, data, &options, nullptr, &camera, mjCAT_ALL, &scene);
-    if (local_bot_is_guest) {
+    if (!use_replay_scene) apply_arena_lighting(model, app_settings);
+    mjv_updateScene(display_model, display_data, &options, nullptr, &camera,
+                    mjCAT_ALL, display_scene);
+    if (!use_replay_scene && local_bot_is_guest) {
       if (opponent_bundle.ShowAxisMarkers())
-        opponent_bundle.AddAxisMarkers(model, data, scene, true);
-    } else if (bundle.ShowAxisMarkers()) {
-      bundle.AddAxisMarkers(model, data, scene);
+        opponent_bundle.AddAxisMarkers(model, display_data, *display_scene, true);
+    } else if (!use_replay_scene && bundle.ShowAxisMarkers()) {
+      bundle.AddAxisMarkers(model, display_data, *display_scene);
     }
     if (screen == AppScreen::Drive && placement_mode) {
       const int player_root = mj_name2id(model, mjOBJ_BODY, "Player_Robot");
       gizmo_length = std::clamp(camera.distance * 0.11, 0.18, 0.65);
       add_transform_gizmo(model, data, player_root, gizmo_mode == GizmoMode::Rotate,
-                          gizmo_drag_axis, gizmo_length, scene);
+                          gizmo_drag_axis, gizmo_length, *display_scene);
     }
 #if defined(COMBATSIM_USE_FILAMENT)
     if (width != main_scene_width || height != main_scene_height) {
-      if (main_scene_width > 0) mjr_setBuffer(mjFB_WINDOW, &context);
+      if (main_scene_width > 0) mjr_setBuffer(mjFB_WINDOW, display_context);
       main_scene_width = width;
       main_scene_height = height;
       main_scene_pixels.resize(size_t(width) * height * 3);
@@ -4724,16 +5038,16 @@ int main(int argc, char** argv) {
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0,
                    GL_RGB, GL_UNSIGNED_BYTE, nullptr);
     }
-    mjr_setBuffer(mjFB_OFFSCREEN, &context);
-    mjr_render(viewport, &scene, &context);
+    mjr_setBuffer(mjFB_OFFSCREEN, display_context);
+    mjr_render(viewport, display_scene, display_context);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    mjr_readPixels(main_scene_pixels.data(), nullptr, viewport, &context);
+    mjr_readPixels(main_scene_pixels.data(), nullptr, viewport, display_context);
     glBindTexture(GL_TEXTURE_2D, main_scene_texture);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
                     GL_RGB, GL_UNSIGNED_BYTE, main_scene_pixels.data());
 #else
-    mjr_render(viewport, &scene, &context);
+    mjr_render(viewport, display_scene, display_context);
 #endif
     ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL3_NewFrame(); ImGui::NewFrame();
 #if defined(COMBATSIM_USE_FILAMENT)
@@ -4794,6 +5108,13 @@ int main(int argc, char** argv) {
         ImGui::GetColorU32(disabled ? ImVec4(0.38f, 0.39f, 0.41f, 1.0f) :
           active ? ui_ink : ImVec4(0.72f, 0.73f, 0.75f, 1.0f)), label);
       if (clicked) {
+        if (screen == AppScreen::Drive && target != AppScreen::Drive)
+          finish_recording();
+        if (screen == AppScreen::Replay && target != AppScreen::Replay)
+          replay_playing = false;
+        if (target == AppScreen::Replay && !loaded_replay_path.empty() &&
+            playback_replay_path != loaded_replay_path)
+          load_replay_file(loaded_replay_path);
         screen = target;
         paused = target != AppScreen::Drive;
       }
@@ -4802,6 +5123,7 @@ int main(int argc, char** argv) {
     };
     nav_button("Home", AppScreen::Home);
     nav_button("Arena", AppScreen::Drive);
+    nav_button("Replays", AppScreen::Replay);
     nav_button("Workshop", AppScreen::Configure);
     nav_button("Settings", AppScreen::Settings);
     const bool input_ready = joystick || pad;
@@ -5340,6 +5662,46 @@ int main(int argc, char** argv) {
       if (ImGui::Button("Controller mixer", ImVec2(280.0f, 38.0f))) {
         mixer_popup_requested = true;
       }
+      if (fight_replay.IsRecording()) {
+        if (ImGui::Button("Stop recording and save", ImVec2(280.0f, 38.0f)))
+          finish_recording();
+        ImGui::TextColored(ui_red, "RECORDING  %.1f s  |  %zu frames",
+            fight_replay.Duration(), fight_replay.FrameCount());
+      } else {
+        const bool recording_unavailable = lan_client || placement_mode;
+        if (recording_unavailable) ImGui::BeginDisabled();
+        if (ImGui::Button("Record fight", ImVec2(280.0f, 38.0f))) {
+          std::string error;
+          if (fight_replay.Begin(model, data, error)) {
+            replay_status = "Recording started. Stop it to save this fight.";
+            replay_playing = false;
+            loaded_replay_path.clear();
+          } else {
+            replay_status = error;
+          }
+        }
+        if (recording_unavailable) ImGui::EndDisabled();
+        if (lan_client)
+          ImGui::TextDisabled("The host owns the live physics state; ask the host to record.");
+        else if (placement_mode)
+          ImGui::TextDisabled("Finish moving the bot before recording.");
+      }
+      if (fight_replay.HasReplay() && !fight_replay.IsRecording()) {
+        if (loaded_replay_path.empty() &&
+            ImGui::Button("Retry saving replay", ImVec2(280.0f, 38.0f)))
+          save_replay();
+        if (!loaded_replay_path.empty() &&
+            ImGui::Button("Review replay", ImVec2(280.0f, 38.0f))) {
+          if (!loaded_replay_path.empty() && load_replay_file(loaded_replay_path)) {
+            screen = AppScreen::Replay;
+            paused = true;
+          } else {
+            if (loaded_replay_path.empty())
+              replay_status = "Replay was not saved yet. Stop recording to save it first.";
+          }
+        }
+      }
+      if (!replay_status.empty()) ImGui::TextWrapped("Replay: %s", replay_status.c_str());
       if (lan_match_started) {
         ImGui::TextColored(ui_green, "%s multiplayer match",
           lan.GetRole() == LanSession::Role::Host ? "Hosting" : "Joined");
@@ -5524,6 +5886,94 @@ int main(int argc, char** argv) {
           ImVec2(ghost_x, 76.0f), ImVec2(ghost_x, display.y - 16.0f),
           drive_splitter_color, 2.0f);
       }
+      ImGui::End();
+      ImGui::PopStyleColor(2);
+    } else if (screen == AppScreen::Replay) {
+      ImGui::SetNextWindowPos(ImVec2(16, 76), ImGuiCond_Always);
+      ImGui::SetNextWindowSize(ImVec2(std::min(440.0f, display.x - 32.0f),
+                                      display.y - 92.0f), ImGuiCond_Always);
+      ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.045f, 0.050f, 0.060f, 0.96f));
+      ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.21f, 0.23f, 0.95f));
+      ImGui::Begin("##fight_replay", nullptr, fixed_window);
+      ImGui::PushTextWrapPos(390.0f);
+      ImGui::TextColored(ui_accent, "FIGHT REPLAY");
+      ImGui::TextDisabled("Review a recorded fight in the live 3D arena.");
+      if (fight_replay.HasReplay()) {
+        ImGui::Spacing();
+        const std::string replay_label = loaded_replay_path.empty()
+          ? "Current recording" : loaded_replay_path.filename().string();
+        ImGui::TextWrapped("%s", replay_label.c_str());
+        ImGui::TextDisabled("%.2f s  |  %zu poses  |  up to %.0f samples/s",
+          fight_replay.Duration(), fight_replay.FrameCount(), fight_replay.SampleRate());
+        if (ImGui::Button(replay_playing ? "Pause" : "Play", ImVec2(92.0f, 34.0f)))
+          replay_playing = !replay_playing && replay_position < fight_replay.Duration();
+        ImGui::SameLine();
+        if (ImGui::Button("-5 s", ImVec2(70.0f, 34.0f))) {
+          replay_position = std::max(0.0f, replay_position - 5.0f);
+          replay_playing = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("+5 s", ImVec2(70.0f, 34.0f))) {
+          replay_position = std::min(float(fight_replay.Duration()), replay_position + 5.0f);
+          replay_playing = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Restart", ImVec2(82.0f, 34.0f))) {
+          replay_position = 0.0f;
+          replay_playing = false;
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        if (fight_replay.Duration() > 0.0) {
+          ImGui::SliderFloat("Timeline", &replay_position, 0.0f,
+            float(fight_replay.Duration()), "%.2f s");
+          if (ImGui::IsItemActivated() || ImGui::IsItemDeactivatedAfterEdit())
+            replay_playing = false;
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat("Playback speed", &replay_speed, 0.1f, 4.0f, "%.1fx");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::Combo("Camera follow", &replay_follow_target,
+                     "Free camera\0Player bot\0Opponent bot\0");
+        ImGui::TextDisabled("Left-drag orbit, right-drag pan, wheel zoom.");
+      } else {
+        ImGui::Spacing();
+        ImGui::TextWrapped("No replay loaded. Record a fight from the Arena page, or select a saved replay below.");
+      }
+      if (fight_replay.HasReplay() && loaded_replay_path.empty() &&
+          !fight_replay.IsRecording() &&
+          ImGui::Button("Retry saving current replay", ImVec2(240.0f, 34.0f)))
+        save_replay();
+      ImGui::SeparatorText("Saved fights");
+      if (ImGui::Button("Refresh list", ImVec2(130.0f, 32.0f))) refresh_replay_files();
+      ImGui::SameLine();
+      if (ImGui::Button("Open replay folder", ImVec2(160.0f, 32.0f))) {
+        if (!replay_folder.empty())
+          ShellExecuteW(nullptr, L"open", replay_folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      }
+      ImGui::BeginChild("##replay_file_list", ImVec2(-1.0f, 180.0f),
+                        ImGuiChildFlags_Borders, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+      if (replay_files.empty()) {
+        ImGui::TextDisabled("No .kar files found. Saved fights appear here.");
+      } else {
+        for (const auto& path : replay_files) {
+          const bool selected = selected_replay_path == path;
+          if (ImGui::Selectable(path.filename().string().c_str(), selected))
+            selected_replay_path = path;
+        }
+      }
+      ImGui::EndChild();
+      ImGui::BeginDisabled(selected_replay_path.empty());
+      if (ImGui::Button("Load selected replay", ImVec2(190.0f, 36.0f))) {
+        load_replay_file(selected_replay_path);
+      }
+      ImGui::EndDisabled();
+      if (!replay_status.empty()) ImGui::TextWrapped("%s", replay_status.c_str());
+      if (ImGui::Button("Back to Arena", ImVec2(150.0f, 34.0f))) {
+        replay_playing = false;
+        screen = AppScreen::Drive;
+        paused = true;
+      }
+      ImGui::PopTextWrapPos();
       ImGui::End();
       ImGui::PopStyleColor(2);
     } else {
@@ -5947,8 +6397,7 @@ int main(int argc, char** argv) {
         draw_mixer_dialog(input_mixer, joystick, joystick_id, controls,
                           active_mixer_profile_key, active_mixer_profile_name);
         ImGui::Separator();
-        ImGui::TextDisabled("Controller map is saved for %s; other bots keep their own setup.",
-                            active_mixer_profile_name.c_str());
+        ImGui::TextDisabled("Saved for this bot; other bots keep separate controller presets.");
         ImGui::SameLine(ImGui::GetWindowWidth() - 118.0f);
         if (ImGui::Button("Close", ImVec2(96.0f, 34.0f))) {
           mixer_popup_open = false;
@@ -5997,6 +6446,10 @@ int main(int argc, char** argv) {
     SDL_GL_SwapWindow(window);
   }
 
+  finish_recording();
+  if (fight_replay.HasReplay() && loaded_replay_path.empty())
+    std::fprintf(stderr, "Could not save the active fight replay: %s\n",
+                 replay_status.c_str());
   if (!save_mixer_settings(input_mixer, active_mixer_profile_key))
     std::fprintf(stderr, "Could not save the active model's USB mixer settings on exit.\n");
   if (pad) SDL_CloseGamepad(pad);
@@ -6010,6 +6463,9 @@ int main(int argc, char** argv) {
     mjr_freeContext(&setup_context); mjv_freeScene(&setup_scene);
     mj_deleteData(setup_data); mj_deleteModel(setup_model);
   }
+  mjr_freeContext(&replay_context); mjv_freeScene(&replay_scene);
+  if (replay_data) mj_deleteData(replay_data);
+  if (replay_model) mj_deleteModel(replay_model);
   mjr_freeContext(&context); mjv_freeScene(&scene);
   SDL_GL_DestroyContext(gl); SDL_DestroyWindow(window); SDL_Quit();
   mj_deleteData(data); mj_deleteModel(model);
