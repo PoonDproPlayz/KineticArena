@@ -1,4 +1,9 @@
-# Arena and graphics settings
+---
+title: Combat Robot Arena Size and Graphics Settings
+description: 'Change the KineticArena practice arena size, save arena size presets, and configure camera, lighting, and the classic or Filament renderer.'
+---
+
+# Arena size and graphics settings
 
 Open **Settings** from Home. Arena settings and graphics settings are separate
 pages.
@@ -24,7 +29,7 @@ Adjust ambient, key, fill, and camera lighting, or select the classic renderer
 or experimental Filament PBR renderer. The settings are saved for the current
 Windows user.
 
-Filament must be built once before switching to it. See [Install CombatSim](../getting-started.md#optional-pbr-renderer). The graphics option restarts into the
+Filament must be built once before switching to it. See [Install KineticArena](../getting-started.md#optional-pbr-renderer). The graphics option restarts into the
 matching executable. The Filament renderer uses real-time rasterization, not
 ray tracing.
 

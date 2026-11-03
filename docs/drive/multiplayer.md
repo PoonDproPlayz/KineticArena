@@ -1,6 +1,11 @@
-# LAN multiplayer
+---
+title: LAN Multiplayer Combat Robot Simulator
+description: 'Host or join a KineticArena combat robot practice match over a local network, configure the host, and connect another player.'
+---
 
-LAN multiplayer connects two CombatSim instances directly. The host runs the
+# LAN multiplayer practice matches
+
+LAN multiplayer connects two KineticArena instances directly. The host runs the
 MuJoCo simulation; the joining player sends control input and receives physics
 snapshots. It currently supports one joining player and requires a reachable
 network route between the computers.
@@ -18,7 +23,7 @@ of the host's Fusion bundle on disk.
 3. Share the displayed session key, port, and the host computer's local IPv4
    address. In PowerShell, `ipconfig` shows the active Wi-Fi or Ethernet
    address.
-4. If Windows asks, allow CombatSim through the firewall on private networks.
+4. If Windows asks, allow KineticArena through the firewall on private networks.
 
 ## Join a match
 
@@ -27,13 +32,13 @@ of the host's Fusion bundle on disk.
 3. Choose **Join match** and wait for both apps to report ready.
 
 Each player uses W/A/S/D and Space for their own robot. On one computer, only
-the focused CombatSim window reads local keyboard/gamepad input. Drive telemetry
+the focused KineticArena window reads local keyboard/gamepad input. Drive telemetry
 shows the local player's weapon and wheel RPM. Axis visibility is local to each
 player's own bot.
 
 ## Test on one computer
 
-Open CombatSim twice. In the first window, host the match. In the second, join
+Open KineticArena twice. In the first window, host the match. In the second, join
 using `127.0.0.1`, port `29811`, and the same session key. Load a local bot in
 both windows before connecting.
 

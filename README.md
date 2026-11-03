@@ -1,7 +1,8 @@
-# CombatSim
+# KineticArena
 
-CombatSim is a Windows desktop simulator for small combat robots. It uses
-MuJoCo for physics and can import robot assemblies exported from Fusion 360.
+KineticArena is a Windows desktop combat robot simulator for practicing robot
+driving and testing custom designs. It uses MuJoCo rigid-body physics and can
+import robot assemblies exported from Fusion 360.
 
 ## Start here
 
@@ -13,7 +14,8 @@ MuJoCo for physics and can import robot assemblies exported from Fusion 360.
 - [Import a Fusion 360 robot](docs/configuration/fusion-import.md)
 - [Build and code layout](docs/development/building.md)
 
-The Windows release ZIP includes one `CombatSim.exe` to launch, its runtime DLLs,
-and the stock practice model. Extract the ZIP and double-click the executable.
+The KineticArena Windows release includes a simulator ZIP with `CombatSim.exe`,
+its runtime DLLs, and the stock practice model, plus a separate ZIP for the
+Fusion 360 exporter. Extract the simulator ZIP and double-click its executable.
 To build or change the source, use the instructions in
 [Build from source](docs/development/building.md).

@@ -1,4 +1,9 @@
-# Parts and mechanisms
+---
+title: Combat Robot Parts, Wheels, Weapons, and Axes
+description: 'Configure imported combat robot bodies in KineticArena: assign frames, wheels, weapon assemblies, forks, rotation axes, mass, material, and friction.'
+---
+
+# Configure combat robot parts and mechanisms
 
 The Fusion assembly tree and preview work together. Hover over a preview part
 to highlight it. Click a part to select it, focus its tree entry, expand its
@@ -57,6 +62,12 @@ Each body can use its Fusion mass, a manual mass, or an applied printed-part
 estimate. Material presets provide starting density and friction values. The
 friction estimate is editable because real contact depends on both surfaces and
 their finish; it is not a universal coefficient for a material name.
+For imported wheel and gravity-fork contacts with the floor, the part's value
+is used directly as the contact coefficient. This lets a silicone tread set to
+1.8 produce a 1.8 wheel-floor coefficient; gravity-fork parts can use a low
+value such as 0.01. Chassis and fixed-frame floor contacts continue to use the
+arena floor coefficient. Both tangential directions use the same coefficient,
+so grip does not depend on the contact frame's arbitrary tangent orientation.
 
 Presets cover UHMW, 7075 aluminum, tool steels, PA12 and generic nylon, ABS,
 TPU 95A, platinum-cure silicone 40A and 20A, carbon-fiber composite, and

@@ -1,14 +1,20 @@
-# Import a Fusion 360 robot
+---
+title: Import a Fusion 360 Robot into KineticArena
+description: 'Export a Fusion 360 combat robot assembly with its STL collision meshes, body tree, mass, inertia, materials, and textures for KineticArena.'
+---
 
-CombatSim imports a Fusion bundle: a manifest plus the mesh and texture files
+# Import a Fusion 360 robot into KineticArena
+
+KineticArena imports a Fusion bundle: a manifest plus the mesh and texture files
 exported beside it. Keep the complete output folder together when you copy or
 move a bundle.
 
 ## Export from Fusion
 
 1. Open the robot design in Fusion 360.
-2. Open **Utilities → Add-ins → Scripts and Add-ins** and add the
-   `Fusion360Exporter` folder from this repository as a script location.
+2. Open **Utilities > Scripts and Add-ins > Scripts** and add the extracted
+   `Fusion360Exporter` folder as a script location. The separate exporter ZIP
+   is available on the [GitHub Releases page](https://github.com/PoonDproPlayz/KineticArena/releases).
 3. Run **CombatSimExport** and choose an output folder.
 4. Wait for the exporter to finish. The bundle includes `manifest.json`,
    per-solid-body physics STL files, render OBJ files, and supported appearance
@@ -21,7 +27,7 @@ skip unavailable occurrences and write an `export_warnings.txt` file.
 
 ## Load the bundle
 
-1. Open CombatSim and choose **Configure bot**.
+1. Open KineticArena and choose **Configure bot**.
 2. Select **Player bot** or **Opponent bot**, then choose **Browse...** and
    select that bot's `manifest.json`.
 3. Wait for the part tree and 3D preview to load. Keep the `Parts/` and
@@ -39,8 +45,10 @@ visibility. It does not replace or modify the original CAD design.
 
 ## Mesh and appearance notes
 
-- The STL is used for picking and physics bounds. The OBJ carries render normals
-  and UVs for smoother appearance and texture mapping.
+- The STL is used for physics collision and picking. MuJoCo evaluates its
+  triangle surface through a signed-distance collider so concave details and
+  holes are retained. The OBJ carries render normals and UVs for smoother
+  appearance and texture mapping.
 - Fusion color, normal, and roughness maps are copied when the exporter can
   resolve them. Face-level appearances within one body are not all preserved.
 - Older STL-only bundles with Fusion-native transforms can still load, but do
@@ -49,8 +57,8 @@ visibility. It does not replace or modify the original CAD design.
 - Assignments outside the selected assembly are supported; a body does not have
   to be nested beneath its wheel or weapon folder in the Fusion tree.
 - A flexible wire or cable can remain visible and contribute mass while its
-  collision option is disabled. A rigid convex collision shape may snag the
-  floor if used for a flexible part.
+  collision option is disabled. Fine STL details can create unwanted contacts,
+  so disable collision for flexible or non-structural parts.
 
 The robot mass readout combines the imported CAD bodies and configured
 mechanisms. If the same physical wheel or weapon is present both in the CAD

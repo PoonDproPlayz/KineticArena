@@ -1,6 +1,11 @@
-# Troubleshooting
+---
+title: KineticArena Combat Robot Simulator Troubleshooting
+description: 'Fix common KineticArena issues with launching, Fusion 360 imports, robot mass, collision meshes, axes, and LAN multiplayer.'
+---
 
-## CombatSim does not launch
+# Troubleshoot KineticArena
+
+## KineticArena does not launch
 
 - If the executable is missing, run `Standalone/setup.ps1` from PowerShell and
   wait for the build to finish.
@@ -47,7 +52,7 @@ estimates depend on the source Fusion data and the configured axis.
 
 Run two app instances, host in the first, and enter `127.0.0.1`, the same port,
 and the same session key in the second. For two computers, use the host's LAN
-IPv4 address and allow CombatSim through the private-network firewall.
+IPv4 address and allow KineticArena through the private-network firewall.
 
 ## Match result or damage features are missing
 

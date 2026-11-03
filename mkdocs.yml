@@ -1,8 +1,8 @@
-site_name: CombatSim Documentation
-site_description: User guide and developer documentation for CombatSim.
+site_name: KineticArena
+site_description: KineticArena is a MuJoCo-powered combat robot simulator for designing, configuring, and practicing with custom combat robots.
 site_url: https://poondproplayz.github.io/KineticArena/
 repo_url: https://github.com/PoonDproPlayz/KineticArena
-repo_name: PoonDproPlayz/CombatSim
+repo_name: PoonDproPlayz/KineticArena
 docs_dir: docs
 site_dir: site
 
@@ -61,6 +61,7 @@ nav:
       - Release packaging: development/releases.md
 
 markdown_extensions:
+  - meta
   - admonition
   - attr_list
   - def_list

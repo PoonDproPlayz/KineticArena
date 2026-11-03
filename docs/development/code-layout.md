@@ -1,4 +1,9 @@
-# Code layout
+---
+title: KineticArena Source Code Layout
+description: 'Find the MuJoCo simulator, robot import pipeline, Fusion 360 exporter, replay system, and build scripts in the KineticArena source repository.'
+---
+
+# KineticArena code layout
 
 The native app is separated into a few main modules:
 

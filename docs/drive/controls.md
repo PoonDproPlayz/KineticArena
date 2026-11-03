@@ -1,3 +1,8 @@
+---
+title: Combat Robot Simulator Keyboard and Gamepad Controls
+description: 'Control a KineticArena combat robot using the keyboard or a USB gamepad, and configure drive and weapon inputs.'
+---
+
 # Keyboard and gamepad controls
 
 ## Keyboard

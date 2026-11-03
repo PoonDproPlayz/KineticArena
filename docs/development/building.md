@@ -1,4 +1,9 @@
-# Build from source
+---
+title: Build the KineticArena Combat Robot Simulator from Source
+description: 'Set up Windows C++ build tools and compile KineticArena, its MuJoCo simulation runtime, Filament renderer, and documentation site.'
+---
+
+# Build KineticArena from source
 
 For a ready-to-run application, use the
 [latest Windows release](https://github.com/PoonDproPlayz/KineticArena/releases/latest).
@@ -47,7 +52,7 @@ internet connection is required the first time these dependencies are fetched.
 
 `Standalone/build_filament.ps1` builds the separate experimental Filament
 renderer with its compatible MuJoCo version. The classic and Filament build
-directories remain separate. See [Install CombatSim](../getting-started.md) for
+directories remain separate. See [Install KineticArena](../getting-started.md) for
 how to switch renderers in the app.
 
 ## Documentation preview
@@ -75,10 +80,11 @@ runtime files with:
 powershell -ExecutionPolicy Bypass -File .\Standalone\package_release.ps1 -Version v0.1.0
 ```
 
-The ZIP and SHA-256 checksum are written to `Standalone/release-output/`. The
-package smoke test runs before the ZIP is created. To publish a GitHub Release,
-push a version tag such as `v0.1.0`, or run the release workflow from the
-Actions tab on `main`. See [Release packaging](releases.md).
+The simulator ZIP and Fusion exporter ZIP are written with separate SHA-256
+checksums to `Standalone/release-output/`. The package smoke test runs before
+the simulator ZIP is created. To publish a GitHub Release, push a version tag
+such as `v0.1.0`, or run the release workflow from the Actions tab on `main`.
+See [Release packaging](releases.md).
 
 ## Public documentation site
 

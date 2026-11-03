@@ -1,4 +1,9 @@
-# First drive
+---
+title: Drive a Combat Robot in the KineticArena Simulator
+description: 'Learn keyboard controls, USB gamepad driving, wheel slip telemetry, manual placement, and arena controls in KineticArena.'
+---
+
+# First drive in KineticArena
 
 Start from **Home → Practice drive**. The stock practice scene loads two bots
 facing each other. The selected arena start layout is applied when the match

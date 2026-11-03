@@ -1,4 +1,9 @@
-# Estimate printed-part mass
+---
+title: Estimate 3D Printed Robot Part Weight and Mass
+description: 'Estimate combat robot 3D printed part mass from material, infill, wall count, top and bottom layers, and slicer settings in KineticArena.'
+---
+
+# Estimate 3D printed part mass
 
 Printed-part estimates are configured per body in the bot workshop. They use
 the body's Fusion-exported density, not a slicer-profile material density. The
@@ -22,7 +27,7 @@ you want the new settings.
 
 ## How to read the estimate
 
-CombatSim estimates shells, top/bottom regions, and sparse infill from the
+KineticArena estimates shells, top/bottom regions, and sparse infill from the
 exported mesh and print settings. The density comes from Fusion's physical
 material data, with Fusion mass and volume used to recover it when possible. If
 the bundle has no usable Fusion density, the app reports that it cannot estimate

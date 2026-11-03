@@ -1,6 +1,11 @@
-# Fight replays
+---
+title: Record and Replay 3D Combat Robot Fights
+description: 'Record a KineticArena robot fight, replay it in the 3D arena, move the camera, and review the simulation at different playback speeds.'
+---
 
-CombatSim can save a fight and play it back in the 3D arena.
+# Record and review 3D fight replays
+
+KineticArena can save a fight and play it back in the 3D arena.
 
 ## Record a fight
 
@@ -9,7 +14,7 @@ CombatSim can save a fight and play it back in the 3D arena.
    paused.
 3. Select **Stop recording and save** when the fight is over.
 
-CombatSim also saves the recording when you leave the Arena page or close the
+KineticArena also saves the recording when you leave the Arena page or close the
 app. Each recording is limited to ten minutes. A multiplayer host can record a
 fight; clients do not own the simulation state.
 
@@ -26,6 +31,11 @@ and playback speed from 0.1x to 4x. **Camera follow** can track either bot or
 leave the camera free. In free camera mode, left-drag to orbit, right-drag to
 pan, and scroll to zoom.
 
-Replays capture up to 120 poses per second, depending on the simulation
-timestep, and stop after ten minutes. They are for visual review; playback does
-not re-run the physics or let you change the fight.
+Replays capture poses for scrubbing and record actuator inputs at each physics
+step. New replay files can use **Re-simulate recorded inputs** to run those
+commands through the embedded MuJoCo model again. This is useful for checking a
+trajectory and reproducing a run in the same simulator build; floating-point
+solver differences can still affect results across machines or versions.
+
+Old pose-only replay files remain viewable, but cannot be re-simulated. Replay
+recording is limited to ten minutes and stops if its file would exceed 512 MB.

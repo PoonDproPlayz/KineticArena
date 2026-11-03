@@ -1,4 +1,9 @@
-# Opponent AI
+---
+title: Combat Robot Opponent AI Practice Mode
+description: 'Practice driving and weapon control against the built-in opponent robot in the KineticArena combat robotics simulator.'
+---
+
+# Opponent AI practice mode
 
 The Drive screen includes a basic aim-and-ram opponent. It turns toward the
 player, drives forward, and activates its weapon when one is assigned.

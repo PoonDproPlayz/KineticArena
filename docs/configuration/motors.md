@@ -1,4 +1,9 @@
-# Drive and weapon motors
+---
+title: Combat Robot Drive and Weapon Motor Simulation
+description: 'Set motor KV, current, battery voltage, gear ratio, and weapon or wheel drive settings in the KineticArena combat robot simulator.'
+---
+
+# Combat robot drive and weapon motors
 
 Motor settings are stored with each bot setup. Configure motors in **Bot
 workshop → Drive motor settings** or **Weapon motor settings**.
@@ -8,8 +13,10 @@ workshop → Drive motor settings** or **Weapon motor settings**.
 Assign wheel assemblies to motor groups. Put wheels driven by the same physical
 motor in the same group. Set the number of motors in that group and the peak
 current for each motor. The group's available torque is shared across its
-assigned wheel assemblies; the current model does not lock wheel speeds
-together through a chain, belt, or differential.
+assigned wheel assemblies. **Couple wheels in this motor group** constrains
+their shaft speeds using their configured reductions and wheel-axis directions.
+This is a rigid linkage approximation: it does not model chain stretch, backlash,
+slip, or differential action. Turn it off for independently driven outputs.
 
 The **Drive layout** can be **2WD** or **4WD**. For 2WD, select the front or
 rear axle. The other axle's assignments and settings remain saved and return
@@ -31,10 +38,20 @@ for example `16:1`; the simulator divides motor speed by the reduction ratio.
 
 Phase-to-phase resistance for brushless motors, armature resistance for
 brushed motors, and an ESC current limit are optional. Leave unknown values at
-zero. Without resistance, CombatSim uses an approximate current-limited torque
-curve. Peak current is treated as torque-producing motor current. The model
-does not include battery sag, winding heating, or thermal derating, so peak
-torque can persist indefinitely in the simulation.
+zero. Without resistance, KineticArena uses an approximate current-limited torque
+curve. Peak current is treated as torque-producing motor current. Optional pack
+internal resistance adds a first-order voltage sag estimate from estimated
+drive current. This estimate does not model cell chemistry, state of charge,
+voltage recovery, wiring, winding heating, or thermal derating. Estimated
+current is approximate, so use measured pack data for calibration.
+
+Each imported part can be excluded from collision while remaining visible and
+mass-bearing. Fusion-imported collisions use an STL-backed signed-distance
+shape, preserving the mesh's concave cuts and holes instead of replacing the
+part with one convex hull. The contact solver approximates contact points from
+that surface; watertight STL bodies give the most reliable inside/outside
+classification. **Show STL collision shape** temporarily shows the collision
+mesh in place of the smoother render mesh.
 
 ## What the motor model changes
 
@@ -47,13 +64,25 @@ missing.
 The optional manual wheel RPM override uses a speed servo and bypasses the
 motor model. Use it for a forced-speed check, not as a realistic motor setup.
 
+Assemblies have an optional **Impact failure threshold (N)**. Zero (the default)
+keeps failures disabled. If a contact on that assembly exceeds its configured
+normal-force threshold, KineticArena disables the assembly's drive actuator for the
+rest of that run. This is a simple configurable trip condition; it does not
+fracture, detach, deform, or change the assembly's collision geometry. Restart
+or rebuild the simulation to clear the failed state.
+
 ## Weapon motor
 
 The weapon torque model uses motor speed/current data and the weapon assembly's
 inertia about its configured axis. Holding the weapon control applies motor
-torque; releasing it lets the weapon coast under modeled losses. The UI also
-estimates time to reach 90% of no-load speed. The estimate omits battery sag,
-impact loading, and heat effects.
+torque; releasing it lets the weapon coast under configured bearing and
+aerodynamic drag, when those optional values are entered. The UI also estimates
+time to reach 90% of no-load speed. The estimate omits battery sag, impact
+loading, changing motor temperature, and heat effects.
+
+Printed-part mass is an area-based shell and infill estimate. It does not
+simulate slicer toolpaths exactly, print strength, anisotropy, or flex. The CAD
+collision surface remains the imported mesh approximation.
 
 When the weapon torque model is off, the legacy target-RPM and spin-up controls
 remain available. The stock practice model's weapon target is 30,000 RPM.

@@ -1,6 +1,11 @@
-# Install CombatSim
+---
+title: Download and Install KineticArena for Windows
+description: 'Download the KineticArena combat robot simulator, launch the Windows release, or build the MuJoCo simulator from source.'
+---
 
-CombatSim runs on Windows x64. For most users, download the
+# Install KineticArena
+
+KineticArena runs on Windows x64. For most users, download the
 [latest release](https://github.com/PoonDproPlayz/KineticArena/releases/latest).
 To edit or build the source code, follow the source setup below.
 
@@ -28,7 +33,7 @@ powershell -ExecutionPolicy Bypass -File .\Standalone\setup.ps1 -NoRun
 
 The script checks for Git, CMake, and Visual Studio 2022 C++ Build Tools. It
 installs missing tools with WinGet, downloads MuJoCo, configures the C++ build,
-and compiles CombatSim. Windows may ask for permission to install the C++ build
+and compiles KineticArena. Windows may ask for permission to install the C++ build
 tools. The first build also downloads SDL and Dear ImGui through CMake.
 
 After setup, launch or rebuild the current source by double-clicking

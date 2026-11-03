@@ -1,20 +1,25 @@
-# Controller setup
+---
+title: USB RC Controller Mixer for Combat Robot Simulation
+description: 'Map USB joystick, gamepad, or transmitter channels to combat robot drive and weapon functions with input detection, weights, offsets, and live curves.'
+---
+
+# Set up a USB controller mixer
 
 Open **Controller setup** from Home or Drive. The setup has three steps:
 
 1. **Connect your controller.** Plug it in and select it from the Controller list.
    The green Connected status shows the number of axes and buttons detected.
 2. **Map the sticks and buttons.** Enable **Use controller mapping**, then press
-   **Detect** beside an input. Move one stick fully or press one button. CombatSim
+   **Detect** beside an input. Move one stick fully or press one button. KineticArena
    assigns that physical control to the input and shows its live value. Repeat for
    each input you need. Control numbers start at 1.
 3. **Map inputs to bot controls.** Choose the left motor side, right motor side,
    or Weapon. Press **Detect input for selected control**, then move the stick or
-   press the button that already controls it on your transmitter. CombatSim maps
+   press the button that already controls it on your transmitter. KineticArena maps
    that input directly to the selected control. Repeat for the other motor side
    if the transmitter already mixes steering and throttle.
 
-You can also set the mix in CombatSim: each side can combine multiple inputs
+You can also set the mix in KineticArena: each side can combine multiple inputs
 with **Weight**, **Offset**, and **Expo**. The default uses Input 1 for throttle,
 Input 2 for steering, and Input 3 for the weapon. Use **Reverse** if an axis
 moves the wrong way and increase **Deadzone** if a stick drifts while centered.

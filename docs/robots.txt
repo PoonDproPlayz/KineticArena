@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://poondproplayz.github.io/KineticArena/sitemap.xml
