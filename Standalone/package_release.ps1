@@ -20,6 +20,7 @@ $modelSource = Join-Path $PSScriptRoot 'models\CombatRobot500g.xml'
 $mujocoLicense = Join-Path $PSScriptRoot 'licenses\MuJoCo-3.3.7-LICENSE.txt'
 $mujocoNotices = Join-Path $MujocoRoot 'THIRD_PARTY_NOTICES.txt'
 $depsSource = Join-Path $BuildDirectory '_deps'
+$signalingSource = Join-Path (Split-Path $PSScriptRoot -Parent) 'services\cloudflare-signaling'
 
 foreach ($requiredFile in @($exeSource, $sdlSource, $mujocoDllSource, $modelSource,
         $mujocoLicense, $mujocoNotices,
@@ -28,6 +29,13 @@ foreach ($requiredFile in @($exeSource, $sdlSource, $mujocoDllSource, $modelSour
         (Join-Path $depsSource 'json-src\LICENSE.MIT'))) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
         throw "Required release file is missing: $requiredFile"
+    }
+}
+
+foreach ($relativePath in @('deploy.ps1', 'package.json', 'wrangler.jsonc', 'src\index.js')) {
+    $serviceFile = Join-Path $signalingSource $relativePath
+    if (-not (Test-Path -LiteralPath $serviceFile -PathType Leaf)) {
+        throw "Online setup file is missing: $serviceFile"
     }
 }
 
@@ -66,6 +74,8 @@ $packageRoot = Join-Path $stageRoot $packageName
 
 try {
     New-Item -ItemType Directory -Path (Join-Path $packageRoot 'models') -Force | Out-Null
+    $signalingTarget = Join-Path $packageRoot 'services\cloudflare-signaling'
+    New-Item -ItemType Directory -Path $signalingTarget -Force | Out-Null
     $licenseDirectory = Join-Path $packageRoot 'licenses'
     New-Item -ItemType Directory -Path $licenseDirectory -Force | Out-Null
 
@@ -74,6 +84,12 @@ try {
     Copy-Item -LiteralPath $mujocoDllSource -Destination $packageRoot
     Copy-Item -LiteralPath $crtFiles.FullName -Destination $packageRoot
     Copy-Item -LiteralPath $modelSource -Destination (Join-Path $packageRoot 'models\CombatRobot500g.xml')
+    Copy-Item -LiteralPath (Join-Path $signalingSource 'deploy.ps1') -Destination $signalingTarget
+    Copy-Item -LiteralPath (Join-Path $signalingSource 'package.json') -Destination $signalingTarget
+    Copy-Item -LiteralPath (Join-Path $signalingSource 'wrangler.jsonc') -Destination $signalingTarget
+    Copy-Item -LiteralPath (Join-Path $signalingSource 'README.md') -Destination $signalingTarget
+    Copy-Item -LiteralPath (Join-Path $signalingSource 'src') `
+        -Destination (Join-Path $signalingTarget 'src') -Recurse
 
     Copy-Item -LiteralPath $mujocoLicense -Destination (Join-Path $licenseDirectory 'MuJoCo-3.3.7-LICENSE.txt')
     Copy-Item -LiteralPath $mujocoNotices -Destination (Join-Path $licenseDirectory 'MuJoCo-THIRD-PARTY-NOTICES.txt')
@@ -92,6 +108,12 @@ Keep the DLL files, models folder, and licenses folder next to CombatSim.exe.
 The ZIP includes the stock practice scene and the runtime libraries needed to
 launch it. No source checkout, setup script, batch file, compiler, or CMake is
 needed to run this release.
+
+LAN Multiplayer has a Set up online service button for the one-time owner setup.
+It opens a browser so the owner can create/sign in to a free Cloudflare account
+and authorize deployment. Players do not need Cloudflare accounts. This build
+still uses LAN TCP for matches; internet gameplay needs the WebRTC transport,
+which is not included yet.
 
 For source builds and development instructions, visit:
 https://github.com/PoonDproPlayz/KineticArena
@@ -132,3 +154,7 @@ finally {
         Remove-Item -LiteralPath $stageFullPath -Recurse -Force
     }
 }
+
+& (Join-Path $PSScriptRoot 'package_fusion_exporter.ps1') `
+    -Version $Version `
+    -OutputDirectory $outputRoot

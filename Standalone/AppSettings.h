@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,14 @@ struct AppSettings {
   int renderer = default_renderer_id;  // 0 = classic, 1 = Filament PBR.
   int spawn_layout = 0;                // 0 = center line, 1 = opposite diagonal.
   float arena_size_m = 2.0f;           // Full side length of the square arena.
+  float arena_width_m = 2.0f;
+  float arena_depth_m = 2.0f;
+  std::string arena_manifest_path;      // Optional Fusion-exported static arena.
+  bool custom_spawn_enabled = false;
+  std::array<float, 2> player_spawn_xy_m{-0.55f, 0.0f};
+  std::array<float, 2> opponent_spawn_xy_m{0.55f, 0.0f};
+  float player_spawn_yaw_offset_deg = 0.0f;
+  float opponent_spawn_yaw_offset_deg = 0.0f;
   std::vector<ArenaSizePreset> arena_presets;
   float ambient_light = 0.12f;
   float key_light = 0.68f;

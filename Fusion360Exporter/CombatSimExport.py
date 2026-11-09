@@ -401,6 +401,47 @@ def _material_properties(body):
     return exported
 
 
+def _material_friction_estimate(material_name, properties):
+    """Use an explicit Fusion friction property, then a material-name estimate.
+
+    Fusion's standard PhysicalProperties API exposes density, mass, volume,
+    center of mass, and inertia, but no standard coefficient of friction. A
+    custom physical-material property named with "friction" takes precedence.
+    The name-based values are fallback estimates for simulator contact pairs.
+    """
+    for prop in properties:
+        label = (str(prop.get("id", "")) + " " +
+                 str(prop.get("name", ""))).lower()
+        value = prop.get("value")
+        if "friction" not in label or isinstance(value, bool):
+            continue
+        try:
+            estimate = float(value)
+            if math.isfinite(estimate) and 0.0 <= estimate <= 5.0:
+                return estimate, "Fusion custom property: " + str(
+                    prop.get("name") or prop.get("id") or "friction")
+        except (TypeError, ValueError):
+            continue
+
+    label = str(material_name).lower()
+    if any(token in label for token in ("silicone", "silicon rubber")):
+        return 1.8, "material-name estimate"
+    if any(token in label for token in ("plywood", "laminate", "wood", "mdf")):
+        return 0.75, "material-name estimate"
+    if any(token in label for token in ("polycarbonate", "acrylic", "plexiglass")):
+        return 0.40, "material-name estimate"
+    if any(token in label for token in ("tpu", "elastomer", "rubber")):
+        return 1.0, "material-name estimate"
+    if any(token in label for token in (
+            "steel", "aluminum", "aluminium", "metal", "titanium", "copper")):
+        return 0.45, "material-name estimate"
+    if any(token in label for token in (
+            "uhmw", "polyethylene", "nylon", "pa12", "abs", "plastic",
+            "polymer", "acetal", "delrin")):
+        return 0.55, "material-name estimate"
+    return 0.60, "fallback estimate (unknown material)"
+
+
 def _valid_binary_stl(filepath):
     if not os.path.isfile(filepath):
         return False
@@ -623,6 +664,9 @@ def _append_part(parts, export_manager, body, body_name, occurrence_path,
     _write_render_mesh_obj(body, render_filepath, unit_to_meters, mesh,
                            include_uv=bool(textures))
     material_properties = _material_properties(body)
+    friction_estimate, friction_source = _material_friction_estimate(
+        material_name, material_properties)
+    collision_only = str(part_name).strip().lower().startswith("collisionproxy_")
     transform_fields = _transform_data(transform)
     parts.append({
         "bodyName": body_name,
@@ -643,7 +687,9 @@ def _append_part(parts, export_manager, body, body_name, occurrence_path,
         "colorRgba": appearance["colorRgba"],
         "roughness": appearance["roughness"],
         "materialProperties": material_properties,
-        "frictionEstimate": 0.0,
+        "frictionEstimate": friction_estimate,
+        "frictionEstimateSource": friction_source,
+        "collisionOnly": collision_only,
         "unitToMeters": unit_to_meters,
         "positionFusionMeters": transform_fields["positionFusionMeters"],
         "rotationFusionWxyz": transform_fields["rotationFusionWxyz"],

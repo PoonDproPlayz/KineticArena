@@ -62,12 +62,20 @@ Each body can use its Fusion mass, a manual mass, or an applied printed-part
 estimate. Material presets provide starting density and friction values. The
 friction estimate is editable because real contact depends on both surfaces and
 their finish; it is not a universal coefficient for a material name.
-For imported wheel and gravity-fork contacts with the floor, the part's value
-is used directly as the contact coefficient. This lets a silicone tread set to
-1.8 produce a 1.8 wheel-floor coefficient; gravity-fork parts can use a low
-value such as 0.01. Chassis and fixed-frame floor contacts continue to use the
-arena floor coefficient. Both tangential directions use the same coefficient,
-so grip does not depend on the contact frame's arbitrary tangent orientation.
+The arena uses generic sliding-friction estimates of **0.75** for the laminate
+floor and **0.40** for the polycarbonate walls. The floor value is the midpoint
+of [generic-rubber/laminate tests](https://en.mariterm.se/wp-content/uploads/2016/08/N-208-SE-Friction-tests.pdf)
+(about 0.70 dynamic and 0.78 static); the wall value is a midpoint of reported
+[steel/polycarbonate tests](https://www.m-ep.co.jp/assets/document/product/pdf/en/physicality.pdf)
+(about 0.35–0.45 for steel sliding on polycarbonate). Since imported bots may use different
+materials, these are arena defaults rather than exact coefficients for every
+possible contact pair. For generated bots and imported arenas, each explicit
+contact pair uses the geometric mean of the two surface estimates. For example,
+a tire set to 1.8 on a floor set to 0.75 uses about 1.16. This is a transparent
+fallback estimate, not a measured coefficient for that exact pair. Both
+tangential directions use the same value, so grip does not depend on the contact
+frame's arbitrary tangent orientation. The stock practice model uses the same
+rule for its configured floor contacts.
 
 Presets cover UHMW, 7075 aluminum, tool steels, PA12 and generic nylon, ABS,
 TPU 95A, platinum-cure silicone 40A and 20A, carbon-fiber composite, and

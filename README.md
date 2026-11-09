@@ -7,6 +7,7 @@ import robot assemblies exported from Fusion 360.
 ## Start here
 
 - [Download the latest Windows release](https://github.com/PoonDproPlayz/KineticArena/releases/latest)
+- [Read the changelog](CHANGELOG.md)
 - [Read the user guide](https://poondproplayz.github.io/KineticArena/)
 - [Browse the user guide source](docs/index.md)
 - [Preview the documentation site locally](docs/development/building.md#documentation-preview)

@@ -8,8 +8,9 @@
 #include <limits>
 
 namespace {
-constexpr std::array<char, 8> replay_magic{'K', 'A', 'R', 'E', 'P', 'L', 'Y', '2'};
-constexpr uint32_t replay_version = 2;
+constexpr std::array<char, 8> replay_magic_v2{'K', 'A', 'R', 'E', 'P', 'L', 'Y', '2'};
+constexpr std::array<char, 8> replay_magic_v3{'K', 'A', 'R', 'E', 'P', 'L', 'Y', '3'};
+constexpr uint32_t replay_version = 3;
 constexpr uint64_t max_replay_file_bytes = 512ull * 1024ull * 1024ull;
 constexpr double max_recording_seconds = 600.0;
 
@@ -100,12 +101,21 @@ bool FightReplay::Begin(const mjModel* model, const mjData* data, std::string& e
   error.clear();
   recording_ = false;
   frames_.clear();
+  controls_.clear();
+  initial_state_.clear();
+  resimulation_frames_.clear();
+  physics_steps_ = 0;
+  resimulation_ready_ = false;
+  resimulating_ = false;
   model_blob_.clear();
   if (!model || !data || model->nq <= 0 || !std::isfinite(data->time)) {
     error = "The current simulation state cannot be recorded.";
     return false;
   }
   nq_ = model->nq;
+  nv_ = model->nv;
+  nu_ = model->nu;
+  state_size_ = mj_stateSize(model, mjSTATE_INTEGRATION);
   timestep_ = model->opt.timestep;
   model_signature_ = model_signature(model);
   const int model_size = mj_sizeModel(model);
@@ -115,6 +125,16 @@ bool FightReplay::Begin(const mjModel* model, const mjData* data, std::string& e
   }
   model_blob_.resize(size_t(model_size));
   mj_saveModel(model, nullptr, model_blob_.data(), model_size);
+  if (state_size_ <= 0) {
+    error = "MuJoCo could not size the replay's initial integration state.";
+    model_blob_.clear();
+    return false;
+  }
+  std::vector<mjtNum> state;
+  state.resize(static_cast<size_t>(state_size_));
+  mj_getState(model, data, state.data(), mjSTATE_INTEGRATION);
+  initial_state_.reserve(state.size());
+  for (mjtNum value : state) initial_state_.push_back(static_cast<double>(value));
   start_time_ = data->time;
   recording_ = true;
   error_.clear();
@@ -129,7 +149,7 @@ bool FightReplay::Begin(const mjModel* model, const mjData* data, std::string& e
 bool FightReplay::Capture(const mjModel* model, const mjData* data, std::string& error) {
   error.clear();
   if (!recording_) return true;
-  if (!model || !data || model->nq != nq_) {
+  if (!model || !data || model->nq != nq_ || model->nv != nv_ || model->nu != nu_) {
     recording_ = false;
     error = "Recording stopped because the active model changed.";
     error_ = error;
@@ -142,28 +162,42 @@ bool FightReplay::Capture(const mjModel* model, const mjData* data, std::string&
     error_ = error;
     return false;
   }
-  if (elapsed >= max_recording_seconds || frames_.size() >= max_frame_count_) {
+  if (elapsed >= max_recording_seconds ||
+      physics_steps_ >= max_physics_step_count_ || frames_.size() >= max_frame_count_) {
     recording_ = false;
     error = "Recording reached the 10 minute limit and stopped.";
     error_ = error;
     return false;
   }
-  const double minimum_interval = 1.0 / sample_rate_hz_;
-  if (elapsed - frames_.back().time + 1e-10 < minimum_interval) return true;
-  const uint64_t frame_bytes = 8 + uint64_t(nq_) * sizeof(float);
-  if (48 + uint64_t(model_blob_.size()) +
-      uint64_t(frames_.size() + 1) * frame_bytes > max_replay_file_bytes) {
+  const uint64_t projected_size = 68 + uint64_t(model_blob_.size()) +
+      uint64_t(initial_state_.size()) * sizeof(double) +
+      uint64_t(physics_steps_ + 1) * uint64_t(nu_) * sizeof(double) +
+      uint64_t(frames_.size() + 1) * (8 + uint64_t(nq_) * sizeof(float));
+  if (projected_size > max_replay_file_bytes) {
     recording_ = false;
     error = "Recording reached the replay file size limit and stopped.";
     error_ = error;
     return false;
   }
 
-  Frame frame;
-  frame.time = elapsed;
-  frame.qpos.reserve(nq_);
-  for (int i = 0; i < nq_; ++i) frame.qpos.push_back(static_cast<float>(data->qpos[i]));
-  frames_.push_back(std::move(frame));
+  for (int i = 0; i < nu_; ++i) {
+    if (!std::isfinite(data->ctrl[i])) {
+      recording_ = false;
+      error = "Recording stopped because an actuator input became invalid.";
+      error_ = error;
+      return false;
+    }
+    controls_.push_back(static_cast<double>(data->ctrl[i]));
+  }
+  ++physics_steps_;
+  const double minimum_interval = 1.0 / sample_rate_hz_;
+  if (elapsed - frames_.back().time + 1e-10 >= minimum_interval) {
+    Frame frame;
+    frame.time = elapsed;
+    frame.qpos.reserve(nq_);
+    for (int i = 0; i < nq_; ++i) frame.qpos.push_back(static_cast<float>(data->qpos[i]));
+    frames_.push_back(std::move(frame));
+  }
   return true;
 }
 
@@ -179,7 +213,9 @@ bool FightReplay::Save(const std::filesystem::path& path, std::string& error) co
     error = "Could not create replay folder: " + ec.message();
     return false;
   }
-  const uint64_t estimated_size = 8 + 4 + 4 + 8 + 8 + 8 + 8 + model_blob_.size() +
+  const uint64_t estimated_size = 68 + uint64_t(model_blob_.size()) +
+      uint64_t(initial_state_.size()) * sizeof(double) +
+      uint64_t(controls_.size()) * sizeof(double) +
       uint64_t(frames_.size()) * (8 + uint64_t(nq_) * sizeof(float));
   if (estimated_size > max_replay_file_bytes) {
     error = "Replay is too large to save safely.";
@@ -190,20 +226,38 @@ bool FightReplay::Save(const std::filesystem::path& path, std::string& error) co
     error = "Could not open the replay file for writing.";
     return false;
   }
-  output.write(replay_magic.data(), replay_magic.size());
+  output.write(replay_magic_v3.data(), replay_magic_v3.size());
   const uint32_t nq = uint32_t(nq_);
+  const uint32_t nv = uint32_t(nv_);
+  const uint32_t nu = uint32_t(nu_);
+  const uint32_t state_size = uint32_t(state_size_);
   const uint64_t count = uint64_t(frames_.size());
+  const uint64_t physics_steps = uint64_t(physics_steps_);
   const uint64_t model_blob_size = model_blob_.size();
   if (!output || !write_value(output, replay_version) || !write_value(output, nq) ||
-      !write_value(output, count) || !write_value(output, model_signature_) ||
+      !write_value(output, nv) || !write_value(output, nu) ||
+      !write_value(output, state_size) || !write_value(output, count) ||
+      !write_value(output, physics_steps) || !write_value(output, model_signature_) ||
       !write_value(output, timestep_) || !write_value(output, model_blob_size)) {
     error = "Could not write the replay header.";
+    return false;
+  }
+  output.write(reinterpret_cast<const char*>(initial_state_.data()),
+               std::streamsize(initial_state_.size() * sizeof(double)));
+  if (!output) {
+    error = "Could not write the replay's initial physics state.";
     return false;
   }
   output.write(reinterpret_cast<const char*>(model_blob_.data()),
                std::streamsize(model_blob_.size()));
   if (!output) {
     error = "Could not write the embedded simulation model.";
+    return false;
+  }
+  output.write(reinterpret_cast<const char*>(controls_.data()),
+               std::streamsize(controls_.size() * sizeof(double)));
+  if (!output) {
+    error = "Could not write replay actuator inputs.";
     return false;
   }
   for (const auto& frame : frames_) {
@@ -232,30 +286,75 @@ bool FightReplay::Load(const std::filesystem::path& path, std::string& error) {
   std::ifstream input(path, std::ios::binary);
   std::array<char, 8> magic{};
   input.read(magic.data(), magic.size());
-  uint32_t version = 0, nq = 0;
-  uint64_t count = 0, signature = 0, model_blob_size = 0;
+  uint32_t version = 0, nq = 0, nv = 0, nu = 0, state_size = 0;
+  uint64_t count = 0, physics_steps = 0, signature = 0, model_blob_size = 0;
   double timestep = 0.0;
-  if (!input || magic != replay_magic || !read_value(input, version) ||
-      !read_value(input, nq) || !read_value(input, count) ||
-      !read_value(input, signature) || !read_value(input, timestep) ||
-      !read_value(input, model_blob_size)) {
+  if (!input || !read_value(input, version) || !read_value(input, nq)) {
     error = "This is not a valid KineticArena replay file.";
     return false;
   }
-  if (version != replay_version) {
+  const bool legacy_v2 = version == 2 && magic == replay_magic_v2;
+  const bool current_v3 = version == replay_version && magic == replay_magic_v3;
+  if (!legacy_v2 && !current_v3) {
     error = "This replay was made by a different, unsupported format version.";
     return false;
   }
-  if (nq == 0 || model_blob_size == 0 || model_blob_size > max_replay_file_bytes / 2) {
+  if (legacy_v2) {
+    if (!read_value(input, count) || !read_value(input, signature) ||
+        !read_value(input, timestep) || !read_value(input, model_blob_size)) {
+      error = "Replay header is incomplete.";
+      return false;
+    }
+  } else if (!read_value(input, nv) || !read_value(input, nu) ||
+             !read_value(input, state_size) || !read_value(input, count) ||
+             !read_value(input, physics_steps) || !read_value(input, signature) ||
+             !read_value(input, timestep) || !read_value(input, model_blob_size)) {
+    error = "Replay header is incomplete.";
+    return false;
+  }
+  if (nq == 0 || model_blob_size == 0 || model_blob_size > max_replay_file_bytes / 2 ||
+      !std::isfinite(timestep) || timestep <= 0.0) {
     error = "Replay has invalid model data.";
     return false;
   }
-  if (count == 0 || count > max_frame_count_ ||
-      count > (max_replay_file_bytes - 48 - model_blob_size) /
-          (8 + uint64_t(nq) * sizeof(float)) ||
-      file_size != 48 + model_blob_size + count * (8 + uint64_t(nq) * sizeof(float))) {
+  if (count == 0 || count > max_frame_count_) {
+    error = "Replay frame count is outside the supported range.";
+    return false;
+  }
+  const uint64_t frame_bytes = 8 + uint64_t(nq) * sizeof(float);
+  uint64_t expected_size = 0;
+  if (legacy_v2) {
+    expected_size = 48 + model_blob_size + count * frame_bytes;
+  } else {
+    if (nv == 0 || state_size == 0 || physics_steps > max_physics_step_count_ ||
+        uint64_t(state_size) > max_replay_file_bytes / sizeof(double)) {
+      error = "Replay has invalid initial state or actuator input data.";
+      return false;
+    }
+    const uint64_t control_values = physics_steps * uint64_t(nu);
+    if (control_values > max_replay_file_bytes / sizeof(double)) {
+      error = "Replay actuator input trace is too large.";
+      return false;
+    }
+    expected_size = 68 + uint64_t(state_size) * sizeof(double) + model_blob_size +
+        control_values * sizeof(double) + count * frame_bytes;
+  }
+  if (expected_size > max_replay_file_bytes ||
+      file_size != expected_size) {
     error = "Replay frame data is invalid or incomplete.";
     return false;
+  }
+  std::vector<double> loaded_initial_state;
+  std::vector<double> loaded_controls;
+  if (current_v3) {
+    loaded_initial_state.resize(state_size);
+    input.read(reinterpret_cast<char*>(loaded_initial_state.data()),
+               std::streamsize(loaded_initial_state.size() * sizeof(double)));
+    if (!input || std::any_of(loaded_initial_state.begin(), loaded_initial_state.end(),
+        [](double value) { return !std::isfinite(value); })) {
+      error = "Replay's initial physics state is invalid.";
+      return false;
+    }
   }
   std::vector<unsigned char> loaded_model(static_cast<size_t>(model_blob_size), 0);
   input.read(reinterpret_cast<char*>(loaded_model.data()),
@@ -263,6 +362,17 @@ bool FightReplay::Load(const std::filesystem::path& path, std::string& error) {
   if (!input) {
     error = "Replay model data is incomplete.";
     return false;
+  }
+  if (current_v3) {
+    const uint64_t control_values = physics_steps * uint64_t(nu);
+    loaded_controls.resize(static_cast<size_t>(control_values));
+    input.read(reinterpret_cast<char*>(loaded_controls.data()),
+               std::streamsize(loaded_controls.size() * sizeof(double)));
+    if (!input || std::any_of(loaded_controls.begin(), loaded_controls.end(),
+        [](double value) { return !std::isfinite(value); })) {
+      error = "Replay actuator inputs are invalid or incomplete.";
+      return false;
+    }
   }
   std::vector<Frame> loaded;
   loaded.reserve(size_t(count));
@@ -288,8 +398,18 @@ bool FightReplay::Load(const std::filesystem::path& path, std::string& error) {
     return false;
   }
   model_blob_ = std::move(loaded_model);
+  initial_state_ = std::move(loaded_initial_state);
+  controls_ = std::move(loaded_controls);
+  physics_steps_ = static_cast<size_t>(physics_steps);
   frames_ = std::move(loaded);
+  resimulation_frames_.clear();
+  resimulation_step_ = 0;
+  resimulating_ = false;
+  resimulation_ready_ = false;
   nq_ = int(nq);
+  nv_ = int(nv);
+  nu_ = int(nu);
+  state_size_ = int(state_size);
   timestep_ = timestep;
   model_signature_ = signature;
   recording_ = false;
@@ -323,19 +443,21 @@ mjModel* FightReplay::CreateModel(std::string& error) const {
 bool FightReplay::Apply(const mjModel* model, mjData* data, double elapsed_seconds,
                         std::string& error) const {
   error.clear();
-  if (!model || !data || frames_.empty() || model->nq != nq_) {
+  const std::vector<Frame>& playback_frames = resimulation_ready_
+    ? resimulation_frames_ : frames_;
+  if (!model || !data || playback_frames.empty() || model->nq != nq_) {
     error = "The loaded replay does not match the active model.";
     return false;
   }
   const double time = std::clamp(elapsed_seconds, 0.0, Duration());
-  auto upper = std::upper_bound(frames_.begin(), frames_.end(), time,
+  auto upper = std::upper_bound(playback_frames.begin(), playback_frames.end(), time,
       [](double value, const Frame& frame) { return value < frame.time; });
-  if (upper == frames_.begin()) {
-    std::copy(frames_.front().qpos.begin(), frames_.front().qpos.end(), data->qpos);
+  if (upper == playback_frames.begin()) {
+    std::copy(playback_frames.front().qpos.begin(), playback_frames.front().qpos.end(), data->qpos);
     data->time = 0.0;
-  } else if (upper == frames_.end()) {
-    std::copy(frames_.back().qpos.begin(), frames_.back().qpos.end(), data->qpos);
-    data->time = frames_.back().time;
+  } else if (upper == playback_frames.end()) {
+    std::copy(playback_frames.back().qpos.begin(), playback_frames.back().qpos.end(), data->qpos);
+    data->time = playback_frames.back().time;
   } else {
     const Frame& next = *upper;
     const Frame& previous = *(upper - 1);
@@ -351,17 +473,105 @@ bool FightReplay::Apply(const mjModel* model, mjData* data, double elapsed_secon
   return true;
 }
 
+bool FightReplay::BeginResimulation(const mjModel* model, mjData* data,
+                                   std::string& error) {
+  error.clear();
+  if (!CanResimulate() || !model || !data || model->nq != nq_ ||
+      model->nv != nv_ || model->nu != nu_ || model_signature(model) != model_signature_ ||
+      mj_stateSize(model, mjSTATE_INTEGRATION) != state_size_ ||
+      controls_.size() != physics_steps_ * size_t(nu_)) {
+    error = "This replay does not contain compatible physics inputs for re-simulation.";
+    return false;
+  }
+  std::vector<mjtNum> state(initial_state_.size());
+  for (size_t i = 0; i < initial_state_.size(); ++i)
+    state[i] = static_cast<mjtNum>(initial_state_[i]);
+  mj_setState(model, data, state.data(), mjSTATE_INTEGRATION);
+  resimulation_frames_.clear();
+  Frame initial;
+  initial.time = 0.0;
+  initial.qpos.reserve(nq_);
+  for (int i = 0; i < nq_; ++i) initial.qpos.push_back(float(data->qpos[i]));
+  resimulation_frames_.push_back(std::move(initial));
+  resimulation_step_ = 0;
+  resimulation_next_sample_ = 1.0 / sample_rate_hz_;
+  resimulation_ready_ = false;
+  resimulating_ = true;
+  return true;
+}
+
+bool FightReplay::AdvanceResimulation(const mjModel* model, mjData* data,
+                                      size_t max_steps, std::string& error) {
+  error.clear();
+  if (!resimulating_) return true;
+  if (!model || !data || model->nq != nq_ || model->nv != nv_ || model->nu != nu_) {
+    resimulating_ = false;
+    error = "Re-simulation stopped because its model changed.";
+    return false;
+  }
+  const double initial_time = initial_state_.empty() ? 0.0 : initial_state_.front();
+  const size_t stop = std::min(physics_steps_, resimulation_step_ + std::max<size_t>(1, max_steps));
+  while (resimulation_step_ < stop) {
+    const size_t control_offset = resimulation_step_ * size_t(nu_);
+    for (int i = 0; i < nu_; ++i)
+      data->ctrl[i] = static_cast<mjtNum>(controls_[control_offset + size_t(i)]);
+    mj_step(model, data);
+    ++resimulation_step_;
+    const double elapsed = data->time - initial_time;
+    if (elapsed + timestep_ * 1e-6 >= resimulation_next_sample_) {
+      Frame frame;
+      frame.time = elapsed;
+      frame.qpos.reserve(nq_);
+      for (int i = 0; i < nq_; ++i) frame.qpos.push_back(float(data->qpos[i]));
+      resimulation_frames_.push_back(std::move(frame));
+      resimulation_next_sample_ += 1.0 / sample_rate_hz_;
+    }
+  }
+  if (resimulation_step_ >= physics_steps_) {
+    const double elapsed = data->time - initial_time;
+    if (resimulation_frames_.empty() ||
+        elapsed - resimulation_frames_.back().time > timestep_ * 0.25) {
+      Frame frame;
+      frame.time = elapsed;
+      frame.qpos.reserve(nq_);
+      for (int i = 0; i < nq_; ++i) frame.qpos.push_back(float(data->qpos[i]));
+      resimulation_frames_.push_back(std::move(frame));
+    }
+    resimulating_ = false;
+    resimulation_ready_ = true;
+  }
+  return true;
+}
+
+double FightReplay::ResimulationProgress() const {
+  if (!CanResimulate()) return 0.0;
+  if (resimulation_ready_) return 1.0;
+  return std::clamp(double(resimulation_step_) / double(physics_steps_), 0.0, 1.0);
+}
+
 void FightReplay::Clear() {
   recording_ = false;
   nq_ = 0;
   timestep_ = 0.0;
   model_signature_ = 0;
+  nv_ = 0;
+  nu_ = 0;
+  state_size_ = 0;
   start_time_ = 0.0;
   model_blob_.clear();
+  initial_state_.clear();
+  controls_.clear();
+  physics_steps_ = 0;
   frames_.clear();
+  resimulation_frames_.clear();
+  resimulation_step_ = 0;
+  resimulation_next_sample_ = 0.0;
+  resimulating_ = false;
+  resimulation_ready_ = false;
   error_.clear();
 }
 
 double FightReplay::Duration() const {
-  return frames_.empty() ? 0.0 : frames_.back().time;
+  const auto& active_frames = resimulation_ready_ ? resimulation_frames_ : frames_;
+  return active_frames.empty() ? 0.0 : active_frames.back().time;
 }

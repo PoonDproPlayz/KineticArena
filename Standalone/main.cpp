@@ -16,6 +16,7 @@
 #include "LanSession.h"
 #include "AppSettings.h"
 #include "Replay.h"
+#include "StlMeshSdf.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -26,11 +27,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <numeric>
 #include <set>
 #include <string>
 #include <sstream>
@@ -64,6 +69,38 @@ std::filesystem::path executable_directory() {
   if (length == 0 || length >= path.size()) return {};
   path.resize(length);
   return std::filesystem::path(path).parent_path();
+}
+
+// Locate the optional Cloudflare Worker project in either a source checkout or
+// a packaged release, then open its one-time account sign-in/deploy wizard.
+bool launch_signaling_service_setup(std::string& error) {
+  auto directory = executable_directory();
+  std::filesystem::path deploy_script;
+  for (int depth = 0; depth < 9 && !directory.empty(); ++depth) {
+    const auto candidate = directory / "services" / "cloudflare-signaling" / "deploy.ps1";
+    if (std::filesystem::exists(candidate)) {
+      deploy_script = candidate;
+      break;
+    }
+    const auto parent = directory.parent_path();
+    if (parent == directory) break;
+    directory = parent;
+  }
+  if (deploy_script.empty()) {
+    error = "The online setup files are missing. Reinstall the full KineticArena release ZIP.";
+    return false;
+  }
+
+  const std::wstring parameters = L"-NoProfile -ExecutionPolicy Bypass -NoExit -File \"" +
+    deploy_script.wstring() + L"\"";
+  const std::wstring working_directory = deploy_script.parent_path().wstring();
+  const auto launched = ShellExecuteW(nullptr, L"open", L"powershell.exe",
+    parameters.c_str(), working_directory.c_str(), SW_SHOWNORMAL);
+  if (reinterpret_cast<INT_PTR>(launched) <= 32) {
+    error = "Windows could not open the online setup window.";
+    return false;
+  }
+  return true;
 }
 
 std::filesystem::path replay_storage_directory() {
@@ -105,6 +142,35 @@ std::filesystem::path stock_model_path() {
   return std::filesystem::path("Standalone/models/CombatRobot500g.xml");
 }
 
+bool write_arena_scene_file(const std::filesystem::path& base_model,
+                            FusionBundle& arena_bundle,
+                            std::filesystem::path& output_model,
+                            std::string& error) {
+  if (!arena_bundle.HasBundle()) {
+    output_model = base_model;
+    return true;
+  }
+  try {
+    std::ifstream input(base_model, std::ios::binary);
+    if (!input) throw std::runtime_error("Cannot open base model: " + base_model.string());
+    std::string xml{std::istreambuf_iterator<char>(input),
+                    std::istreambuf_iterator<char>()};
+    if (!arena_bundle.InjectArenaIntoMjcf(xml))
+      throw std::runtime_error(arena_bundle.Error());
+    output_model = base_model.parent_path() /
+      ("KineticArena_imported_arena_" + std::to_string(GetCurrentProcessId()) + ".xml");
+    std::ofstream output(output_model, std::ios::binary | std::ios::trunc);
+    if (!output) throw std::runtime_error("Cannot write combined arena model beside the base model.");
+    output.write(xml.data(), std::streamsize(xml.size()));
+    if (!output) throw std::runtime_error("Failed writing the combined arena model.");
+    error.clear();
+    return true;
+  } catch (const std::exception& exception) {
+    error = exception.what();
+    return false;
+  }
+}
+
 std::filesystem::path renderer_executable(int renderer_id) {
   const auto source_dir = standalone_source_dir();
   if (source_dir.empty()) return {};
@@ -116,7 +182,9 @@ std::filesystem::path renderer_executable(int renderer_id) {
 bool launch_renderer_build(int renderer_id, const std::filesystem::path& model_path,
                            std::string& error,
                            const std::filesystem::path& player_manifest = {},
-                           const std::filesystem::path& opponent_manifest = {}) {
+                           const std::filesystem::path& opponent_manifest = {},
+                           const std::filesystem::path& arena_manifest = {},
+                           const std::filesystem::path& base_model = {}) {
   const auto target = renderer_executable(renderer_id);
   if (target.empty()) {
     error = "Could not locate the CombatSim Standalone source folder.";
@@ -138,9 +206,12 @@ bool launch_renderer_build(int renderer_id, const std::filesystem::path& model_p
     return L"\"" + path.wstring() + L"\"";
   };
   std::wstring parameters;
-  if (!player_manifest.empty()) {
-    parameters = L"--renderer-resume " + quote(player_manifest) + L" " +
-      (opponent_manifest.empty() ? L"\"\"" : quote(opponent_manifest));
+  if (!player_manifest.empty() || !opponent_manifest.empty() || !arena_manifest.empty()) {
+    parameters = L"--renderer-resume " +
+      (player_manifest.empty() ? L"\"\"" : quote(player_manifest)) + L" " +
+      (opponent_manifest.empty() ? L"\"\"" : quote(opponent_manifest)) + L" " +
+      (arena_manifest.empty() ? L"\"\"" : quote(arena_manifest)) + L" " +
+      (base_model.empty() ? L"\"\"" : quote(base_model));
   } else {
     parameters = quote(absolute_model);
   }
@@ -311,8 +382,38 @@ struct Controls {
   std::map<int, double> filtered_wheel_speeds;
   std::map<int, int> manual_velocity_actuators;
   double battery_voltage = 0.0;
+  double battery_internal_resistance_ohm = 0.0;
+  double battery_operating_voltage = 0.0;
+  double battery_last_current_a = 0.0;
   double weapon_sign = -1.0;
+  std::map<int, double> impact_thresholds_by_geom;
+  std::map<int, int> impact_actuator_by_geom;
+  std::set<int> impact_disabled_actuators;
+  std::map<int, double> impact_failures;
 };
+
+void monitor_impact_failures(const mjModel* model, const mjData* data,
+                             Controls& controls) {
+  for (int contact = 0; contact < data->ncon; ++contact) {
+    mjtNum wrench[6]{};
+    mj_contactForce(model, data, contact, wrench);
+    const mjContact& pair = data->contact[contact];
+    for (int geom : {pair.geom[0], pair.geom[1]}) {
+      const auto threshold = controls.impact_thresholds_by_geom.find(geom);
+      const auto actuator = controls.impact_actuator_by_geom.find(geom);
+      if (threshold == controls.impact_thresholds_by_geom.end() ||
+          actuator == controls.impact_actuator_by_geom.end() ||
+          wrench[0] < threshold->second) continue;
+      const int id = actuator->second;
+      auto& peak_force = controls.impact_failures[id];
+      peak_force = std::max(peak_force, double(wrench[0]));
+      controls.impact_disabled_actuators.insert(id);
+      const auto manual = controls.manual_velocity_actuators.find(id);
+      if (manual != controls.manual_velocity_actuators.end())
+        controls.impact_disabled_actuators.insert(manual->second);
+    }
+  }
+}
 
 int actuator(const mjModel* model, const char* name) {
   return mj_name2id(model, mjOBJ_ACTUATOR, name);
@@ -367,12 +468,51 @@ std::string weapon_output_key() { return "weapon"; }
 int CadPartIndexFromGeom(const mjModel* model, int geom_id) {
   if (!model || geom_id < 0) return -1;
   const char* name = mj_id2name(model, mjOBJ_GEOM, geom_id);
-  if (!name || std::string(name).rfind("cad_part_", 0) != 0) return -1;
-  const std::string index_text = std::string(name).substr(9);
+  if (!name) return -1;
+  const std::string geom_name(name);
+  size_t prefix_length = 0;
+  for (const char* prefix : {"cad_part_", "cad_visual_", "opponent_part_", "opponent_visual_"}) {
+    if (geom_name.rfind(prefix, 0) == 0) {
+      prefix_length = std::strlen(prefix);
+      break;
+    }
+  }
+  if (prefix_length == 0) return -1;
+  const std::string index_text = geom_name.substr(prefix_length);
   if (index_text.empty() || !std::all_of(index_text.begin(), index_text.end(),
       [](unsigned char c) { return c >= '0' && c <= '9'; })) return -1;
   try { return std::stoi(index_text); }
   catch (...) { return -1; }
+}
+
+void SetFusionPreviewGeomGroups(mjModel* model, const FusionBundle& bundle,
+                                bool show_collision_shape) {
+  if (!model) return;
+  for (int geom = 0; geom < model->ngeom; ++geom) {
+    const int part = CadPartIndexFromGeom(model, geom);
+    if (part < 0) {
+      model->geom_group[geom] = 4;
+      continue;
+    }
+    const char* name = mj_id2name(model, mjOBJ_GEOM, geom);
+    const bool collision_mesh = name &&
+      (std::string(name).rfind("cad_part_", 0) == 0 ||
+       std::string(name).rfind("opponent_part_", 0) == 0);
+    const bool visual_mesh = name &&
+      (std::string(name).rfind("cad_visual_", 0) == 0 ||
+       std::string(name).rfind("opponent_visual_", 0) == 0);
+    if (collision_mesh) {
+      const bool collision_visible = bundle.PreviewVisible(part) && show_collision_shape;
+      model->geom_group[geom] = collision_visible ? 5 : 4;
+      // MuJoCo applies mjVIS_CONVEXHULL only to geoms with collision masks.
+      // The preview model never steps, so enable masks here solely to make
+      // the viewer select the exact hull data used by mesh collision.
+      model->geom_contype[geom] = collision_visible ? 1 : 0;
+      model->geom_conaffinity[geom] = collision_visible ? 1 : 0;
+    } else if (visual_mesh) {
+      model->geom_group[geom] = bundle.PreviewVisible(part) && !show_collision_shape ? 0 : 4;
+    }
+  }
 }
 
 int SelectPreviewPartForHover(const mjModel* model, const mjData* data,
@@ -608,9 +748,12 @@ double motor_group_torque_per_wheel(const MotorSpec& motor, double battery_volta
                              actual_output_speed) / static_cast<double>(wheel_count);
 }
 
-void apply_wheel_drive_targets(const mjModel* model, mjData* data, Controls& controls,
-                               double left_speed, double right_speed,
-                               const std::map<int, double>* custom_speeds = nullptr) {
+double apply_wheel_drive_targets(const mjModel* model, mjData* data, Controls& controls,
+                                 double left_speed, double right_speed,
+                                 const std::map<int, double>* custom_speeds = nullptr) {
+  const double voltage = controls.battery_operating_voltage > 0.0
+    ? controls.battery_operating_voltage : controls.battery_voltage;
+  double battery_current = 0.0;
   struct PendingMotorGroup {
     MotorSpec motor;
     std::vector<std::pair<int, double>> members;
@@ -621,6 +764,12 @@ void apply_wheel_drive_targets(const mjModel* model, mjData* data, Controls& con
   auto set_wheel_actuator = [&](int id, double forward_sign, double desired_forward_speed) {
     const auto motor = controls.motor_models.find(id);
     const auto manual_actuator = controls.manual_velocity_actuators.find(id);
+    if (controls.impact_disabled_actuators.count(id)) {
+      data->ctrl[id] = 0.0;
+      if (manual_actuator != controls.manual_velocity_actuators.end())
+        data->ctrl[manual_actuator->second] = 0.0;
+      return;
+    }
     if (motor == controls.motor_models.end()) {
       controls.filtered_wheel_speeds.erase(id);
       const double desired_joint_speed = forward_sign * desired_forward_speed;
@@ -635,7 +784,7 @@ void apply_wheel_drive_targets(const mjModel* model, mjData* data, Controls& con
       data->ctrl[manual_actuator->second] = desired_joint_speed;
       return;
     }
-    const double no_load_rpm = MotorNoLoadOutputRpm(motor->second, controls.battery_voltage);
+    const double no_load_rpm = MotorNoLoadOutputRpm(motor->second, voltage);
     const double reference_speed = std::max(std::abs(desired_forward_speed),
       no_load_rpm * 2.0 * pi / 60.0);
     const double max_speed_step = reference_speed * model->opt.timestep /
@@ -690,12 +839,21 @@ void apply_wheel_drive_targets(const mjModel* model, mjData* data, Controls& con
     if (motor_group.members.empty()) continue;
     const double member_count = static_cast<double>(motor_group.members.size());
     const double group_torque = motor_group_torque_per_wheel(
-      motor_group.motor, controls.battery_voltage,
+      motor_group.motor, voltage,
       motor_group.desired_speed_sum / member_count,
       motor_group.actual_speed_sum / member_count, motor_group.members.size());
+    const double desired_speed = motor_group.desired_speed_sum / member_count;
+    const double actual_speed = motor_group.actual_speed_sum / member_count;
+    const double current = MotorPhaseCurrent(motor_group.motor, voltage,
+                                              desired_speed, actual_speed);
+    const double free_speed = MotorNoLoadOutputRpm(motor_group.motor, voltage) * 2.0 * pi / 60.0;
+    const double duty = free_speed > 1e-9
+      ? std::clamp(desired_speed / free_speed, -1.0, 1.0) : 0.0;
+    battery_current += std::max(0.0, current * duty) * motor_group.motor.motor_count;
     for (const auto& [id, forward_sign] : motor_group.members)
       data->ctrl[id] = forward_sign * group_torque;
   }
+  return battery_current;
 }
 
 bool weapon_uses_torque_model(const Controls& controls) {
@@ -707,19 +865,24 @@ bool weapon_uses_torque_model(const Controls& controls) {
 
 double weapon_no_load_rpm(const Controls& controls) {
   if (controls.weapon.empty()) return 0.0;
+  const double voltage = controls.battery_operating_voltage > 0.0
+    ? controls.battery_operating_voltage : controls.battery_voltage;
   double estimate = std::numeric_limits<double>::infinity();
   for (const int id : controls.weapon) {
     const auto motor = controls.weapon_motor_models.find(id);
     if (motor == controls.weapon_motor_models.end()) return 0.0;
     estimate = std::min(estimate,
-      MotorNoLoadOutputRpm(motor->second, controls.battery_voltage));
+      MotorNoLoadOutputRpm(motor->second, voltage));
   }
   return std::isfinite(estimate) ? estimate : 0.0;
 }
 
-void apply_weapon_drive_targets(const mjModel* model, mjData* data,
-                                Controls& controls, float weapon_throttle) {
+double apply_weapon_drive_targets(const mjModel* model, mjData* data,
+                                  Controls& controls, float weapon_throttle) {
   weapon_throttle = std::clamp(weapon_throttle, 0.0f, 1.0f);
+  const double voltage = controls.battery_operating_voltage > 0.0
+    ? controls.battery_operating_voltage : controls.battery_voltage;
+  double battery_current = 0.0;
   const bool all_motorized = weapon_uses_torque_model(controls);
   const double max_weapon_speed = controls.weapon_rpm * 2.0 * pi / 60.0;
   if (all_motorized) {
@@ -732,14 +895,12 @@ void apply_weapon_drive_targets(const mjModel* model, mjData* data,
   }
 
   for (const int id : controls.weapon) {
+    if (controls.impact_disabled_actuators.count(id)) {
+      data->ctrl[id] = 0.0;
+      continue;
+    }
     const auto motor = controls.weapon_motor_models.find(id);
     if (motor != controls.weapon_motor_models.end()) {
-      if (weapon_throttle <= 1e-4f) {
-        // Zero commanded motor voltage lets the weapon coast down under its
-        // simulated inertia and mechanical losses.
-        data->ctrl[id] = 0.0;
-        continue;
-      }
       if ((model->actuator_trntype[id] != mjTRN_JOINT &&
            model->actuator_trntype[id] != mjTRN_JOINTINPARENT)) {
         data->ctrl[id] = 0.0;
@@ -752,15 +913,30 @@ void apply_weapon_drive_targets(const mjModel* model, mjData* data,
       }
       const int dof = model->jnt_dofadr[joint];
       const double free_speed = MotorNoLoadOutputRpm(motor->second,
-        controls.battery_voltage) * 2.0 * pi / 60.0;
+        voltage) * 2.0 * pi / 60.0;
       const double actual_speed = controls.weapon_sign * data->qvel[dof];
-      const double torque = MotorOutputTorque(motor->second,
-        controls.battery_voltage, free_speed * weapon_throttle, actual_speed);
-      data->ctrl[id] = controls.weapon_sign * torque;
+      const double desired_speed = free_speed * weapon_throttle;
+      double motor_torque = 0.0;
+      if (weapon_throttle > 1e-4f) {
+        const double current = MotorPhaseCurrent(motor->second, voltage,
+          desired_speed, actual_speed);
+        const double duty = free_speed > 1e-9
+          ? std::clamp(desired_speed / free_speed, -1.0, 1.0) : 0.0;
+        battery_current += std::max(0.0, current * duty) * motor->second.motor_count;
+        motor_torque = MotorOutputTorque(motor->second,
+          voltage, desired_speed, actual_speed);
+      }
+      const double bearing_drag = motor->second.bearing_drag_torque_nm *
+        std::tanh(actual_speed / 0.5);
+      const double aerodynamic_drag = motor->second.aerodynamic_drag_nm_per_rad2 *
+        actual_speed * std::abs(actual_speed);
+      data->ctrl[id] = controls.weapon_sign *
+        (motor_torque - bearing_drag - aerodynamic_drag);
     } else {
       data->ctrl[id] = controls.weapon_sign * controls.weapon_command;
     }
   }
+  return battery_current;
 }
 
 double actuator_rpm(const mjModel* model, const mjData* data, int actuator_id,
@@ -780,6 +956,10 @@ struct WheelSlip {
   bool valid = false;
   bool has_ground_contact = false;
   double speed = 0.0;
+  double longitudinal_speed = 0.0;
+  double lateral_speed = 0.0;
+  double tread_speed = 0.0;
+  double ratio = 0.0;
 };
 
 bool body_is_in_subtree(const mjModel* model, int body, int root) {
@@ -1008,18 +1188,26 @@ void apply_arena_size(mjModel* model, double size_m) {
 }
 
 void apply_arena_spawn_layout(const mjModel* model, mjData* data, int layout,
-                              double arena_size_m) {
+                              double arena_size_m,
+                              const AppSettings* settings = nullptr) {
   if (!model || !data) return;
   mj_resetData(model, data);
   mj_forward(model, data);
   const int roots[2] = {mj_name2id(model, mjOBJ_BODY, "Player_Robot"),
                         mj_name2id(model, mjOBJ_BODY, "Target_Robot")};
-  const double diagonal_turn = layout == 1 ? pi / 4.0 : 0.0;
-  for (int root : roots) {
+  const bool use_custom_spawn = settings && settings->custom_spawn_enabled;
+  const double diagonal_turn = !use_custom_spawn && layout == 1 ? pi / 4.0 : 0.0;
+  const double yaw_offsets[2] = {
+    use_custom_spawn
+      ? settings->player_spawn_yaw_offset_deg * pi / 180.0 : 0.0,
+    use_custom_spawn
+      ? settings->opponent_spawn_yaw_offset_deg * pi / 180.0 : 0.0};
+  for (int index = 0; index < 2; ++index) {
+    const int root = roots[index];
     const int joint = free_joint_for_body(model, root);
     if (joint < 0) continue;
     const int qpos = model->jnt_qposadr[joint];
-    const double half = diagonal_turn * 0.5;
+    const double half = (diagonal_turn + yaw_offsets[index]) * 0.5;
     const mjtNum delta[4] = {std::cos(half), 0.0, 0.0, std::sin(half)};
     mjtNum rotated[4];
     mju_mulQuat(rotated, delta, data->qpos + qpos + 3);
@@ -1038,20 +1226,40 @@ void apply_arena_spawn_layout(const mjModel* model, mjData* data, int layout,
                (highs[i][1] - lows[i][1]) * 0.5));
   }
   constexpr double wall_clearance = 0.01;
-  const double arena_inner_half_extent = clamp_arena_size_m(arena_size_m) * 0.5;
-  const double safe_offset = std::max(0.0, arena_inner_half_extent - wall_clearance - maximum_half_extent);
-  const double preferred_offset = arena_inner_half_extent * (layout == 1 ? 0.42 : 0.55);
-  const double offset = std::min(preferred_offset, safe_offset);
-  const double targets[2][2] = {{-offset, layout == 1 ? -offset : 0.0},
-                                 { offset, layout == 1 ?  offset : 0.0}};
+  const double arena_half_x = settings
+    ? std::max(0.0, double(settings->arena_width_m) * 0.5)
+    : clamp_arena_size_m(arena_size_m) * 0.5;
+  const double arena_half_y = settings
+    ? std::max(0.0, double(settings->arena_depth_m) * 0.5)
+    : clamp_arena_size_m(arena_size_m) * 0.5;
+  const double safe_offset = std::max(0.0,
+    std::min(arena_half_x, arena_half_y) - wall_clearance - maximum_half_extent);
+  const double preferred_offset_x = arena_half_x * (layout == 1 ? 0.42 : 0.55);
+  const double preferred_offset_y = arena_half_y * 0.42;
+  const double offset_x = std::min(preferred_offset_x, safe_offset);
+  const double offset_y = std::min(preferred_offset_y, safe_offset);
+  const double default_targets[2][2] = {{-offset_x, layout == 1 ? -offset_y : 0.0},
+                                         { offset_x, layout == 1 ?  offset_y : 0.0}};
   for (int i = 0; i < 2; ++i) {
     const int root = roots[i];
     const int joint = free_joint_for_body(model, root);
     if (joint < 0) continue;
     const int qpos = model->jnt_qposadr[joint];
     const Vec3 center = robot_geometry_center(model, data, root);
-    data->qpos[qpos] += targets[i][0] - center[0];
-    data->qpos[qpos + 1] += targets[i][1] - center[1];
+    double target_x = default_targets[i][0];
+    double target_y = default_targets[i][1];
+    if (use_custom_spawn) {
+      const auto& configured = i == 0 ? settings->player_spawn_xy_m :
+                                        settings->opponent_spawn_xy_m;
+      const double half_x = (highs[i][0] - lows[i][0]) * 0.5;
+      const double half_y = (highs[i][1] - lows[i][1]) * 0.5;
+      const double safe_x = std::max(0.0, arena_half_x - wall_clearance - half_x);
+      const double safe_y = std::max(0.0, arena_half_y - wall_clearance - half_y);
+      target_x = std::clamp(double(configured[0]), -safe_x, safe_x);
+      target_y = std::clamp(double(configured[1]), -safe_y, safe_y);
+    }
+    data->qpos[qpos] += target_x - center[0];
+    data->qpos[qpos + 1] += target_y - center[1];
   }
   mj_forward(model, data);
 }
@@ -1239,15 +1447,19 @@ WheelSlip wheel_slip(const mjModel* model, const mjData* data, int actuator_id) 
   const int joint = model->actuator_trnid[2 * actuator_id];
   if (joint < 0 || joint >= model->njnt || model->jnt_type[joint] != mjJNT_HINGE)
     return result;
+  const int dof = model->jnt_dofadr[joint];
   const int wheel_root = model->jnt_bodyid[joint];
   std::vector<mjtNum> jacp(3 * model->nv), jacr(3 * model->nv);
   for (int i = 0; i < data->ncon; ++i) {
     const mjContact& contact = data->contact[i];
     if (contact.dist > 0.003) continue;
     const int geom0 = contact.geom[0], geom1 = contact.geom[1];
-    const bool ground0 = model->geom_type[geom0] == mjGEOM_PLANE;
-    const bool ground1 = model->geom_type[geom1] == mjGEOM_PLANE;
+    const bool ground0 = model->geom_bodyid[geom0] == 0;
+    const bool ground1 = model->geom_bodyid[geom1] == 0;
     if (ground0 == ground1) continue;
+    // The imported arena is a collection of static mesh geoms rather than a
+    // plane. Ignore side-wall contacts; this telemetry estimates wheel/floor grip.
+    if (std::abs(contact.frame[2]) < 0.5) continue;
     const int wheel_geom = ground0 ? geom1 : geom0;
     const int ground_geom = ground0 ? geom0 : geom1;
     const int wheel_body = model->geom_bodyid[wheel_geom];
@@ -1271,14 +1483,52 @@ WheelSlip wheel_slip(const mjModel* model, const mjData* data, int actuator_id) 
       relative[axis] = wheel_velocity[axis] - ground_velocity[axis];
       normal_velocity += relative[axis] * contact.frame[axis];
     }
+    Vec3 tangent_velocity{};
     double tangent_speed_squared = 0.0;
     for (int axis = 0; axis < 3; ++axis) {
-      const double tangent = relative[axis] - normal_velocity * contact.frame[axis];
-      tangent_speed_squared += tangent * tangent;
+      tangent_velocity[axis] = relative[axis] - normal_velocity * contact.frame[axis];
+      tangent_speed_squared += tangent_velocity[axis] * tangent_velocity[axis];
     }
     result.speed = std::max(result.speed, std::sqrt(tangent_speed_squared));
+    const Vec3 anchor{data->xanchor[3 * joint], data->xanchor[3 * joint + 1],
+                      data->xanchor[3 * joint + 2]};
+    const Vec3 axis{data->xaxis[3 * joint], data->xaxis[3 * joint + 1],
+                    data->xaxis[3 * joint + 2]};
+    const Vec3 normal{contact.frame[0], contact.frame[1], contact.frame[2]};
+    Vec3 rolling_direction{
+      axis[1] * normal[2] - axis[2] * normal[1],
+      axis[2] * normal[0] - axis[0] * normal[2],
+      axis[0] * normal[1] - axis[1] * normal[0]};
+    const double rolling_direction_length = std::sqrt(dot3(rolling_direction, rolling_direction));
+    if (rolling_direction_length > 1e-9) {
+      for (double& component : rolling_direction) component /= rolling_direction_length;
+      result.longitudinal_speed = std::max(result.longitudinal_speed,
+        std::abs(dot3(tangent_velocity, rolling_direction)));
+    }
+    Vec3 lateral_direction = axis;
+    const double axis_normal = dot3(axis, normal);
+    for (int component = 0; component < 3; ++component)
+      lateral_direction[component] -= axis_normal * normal[component];
+    const double lateral_length = std::sqrt(dot3(lateral_direction, lateral_direction));
+    if (lateral_length > 1e-9) {
+      for (double& component : lateral_direction) component /= lateral_length;
+      result.lateral_speed = std::max(result.lateral_speed,
+        std::abs(dot3(tangent_velocity, lateral_direction)));
+    }
+    const Vec3 contact_offset{contact.pos[0] - anchor[0],
+                              contact.pos[1] - anchor[1],
+                              contact.pos[2] - anchor[2]};
+    const double axial_distance = dot3(contact_offset, axis);
+    const Vec3 radial{contact_offset[0] - axial_distance * axis[0],
+                      contact_offset[1] - axial_distance * axis[1],
+                      contact_offset[2] - axial_distance * axis[2]};
+    const double radius = std::sqrt(dot3(radial, radial));
+    result.tread_speed = std::max(result.tread_speed,
+                                  std::abs(data->qvel[dof]) * radius);
   }
   result.valid = true;
+  result.ratio = result.longitudinal_speed /
+    std::max({result.longitudinal_speed, result.tread_speed, 0.1});
   return result;
 }
 
@@ -1984,6 +2234,9 @@ KeyboardControls opponent_ram_ai(const mjModel* model, const mjData* data,
 void drive(const mjModel* model, mjData* data, Controls& c, SDL_Gamepad* pad,
            SDL_Joystick* joystick, const InputMixer& mixer,
            const KeyboardControls& keyboard, bool external_inputs_enabled) {
+  const double voltage_for_step = c.battery_operating_voltage > 0.0
+    ? c.battery_operating_voltage : c.battery_voltage;
+  double estimated_battery_current = 0.0;
   float throttle = keyboard.throttle;
   float turn = keyboard.turn;
   const bool custom_input = external_inputs_enabled && mixer.enabled && joystick;
@@ -2004,9 +2257,9 @@ void drive(const mjModel* model, mjData* data, Controls& c, SDL_Gamepad* pad,
   }
 
   const auto left_estimate = side_motor_speed_estimate(c.left, c.motor_models,
-                                                       c.battery_voltage);
+                                                       voltage_for_step);
   const auto right_estimate = side_motor_speed_estimate(c.right, c.motor_models,
-                                                        c.battery_voltage);
+                                                        voltage_for_step);
   const double left_rpm = c.manual_wheel_rpm_override ? c.wheel_rpm : left_estimate.rpm;
   const double right_rpm = c.manual_wheel_rpm_override ? c.wheel_rpm : right_estimate.rpm;
   if (custom_input) {
@@ -2033,22 +2286,68 @@ void drive(const mjModel* model, mjData* data, Controls& c, SDL_Gamepad* pad,
       return output.weapon;
     });
     if (weapon != outputs.end()) weapon_throttle = output_value(mixer, *weapon, channels);
-    apply_wheel_drive_targets(model, data, c, 0.0, 0.0, &custom_speeds);
+    estimated_battery_current += apply_wheel_drive_targets(
+      model, data, c, 0.0, 0.0, &custom_speeds);
   } else {
     const auto [left, right] = mix_drive(throttle, turn,
       left_rpm * 2.0 * pi / 60.0, right_rpm * 2.0 * pi / 60.0);
-    apply_wheel_drive_targets(model, data, c, left, right);
+    estimated_battery_current += apply_wheel_drive_targets(model, data, c, left, right);
   }
-  apply_weapon_drive_targets(model, data, c, weapon_throttle);
+  estimated_battery_current += apply_weapon_drive_targets(model, data, c, weapon_throttle);
+  for (const int actuator_id : c.impact_disabled_actuators)
+    if (actuator_id >= 0 && actuator_id < model->nu) data->ctrl[actuator_id] = 0.0;
+  c.battery_last_current_a = estimated_battery_current;
+  c.battery_operating_voltage = c.battery_internal_resistance_ohm > 0.0
+    ? BatteryLoadedVoltage(c.battery_voltage, c.battery_internal_resistance_ohm,
+                           estimated_battery_current)
+    : c.battery_voltage;
 }
 }
 
 // Command-line checks are handled before the interactive app is initialized;
 // they share the same model builders so diagnostics exercise production paths.
 int main(int argc, char** argv) {
+  if (!RegisterStlMeshSdfPlugin()) {
+    std::fprintf(stderr, "Failed to register the STL collision SDF plugin.\n");
+    return 1;
+  }
   FusionBundle bundle;
   FusionBundle opponent_bundle;
   LanSession lan;
+  if (argc >= 3 && std::string(argv[1]) == "--test-stl-mesh-collision") {
+    if (!bundle.Load(argv[2])) {
+      std::fprintf(stderr, "STL collision test bundle load failed: %s\n", bundle.Error().c_str());
+      return 1;
+    }
+    std::filesystem::path generated;
+    if (!bundle.Generate(generated)) {
+      std::fprintf(stderr, "STL collision test model generation failed: %s\n", bundle.Error().c_str());
+      return 1;
+    }
+    std::array<char, 8192> diagnostic{};
+    mjModel* test_model = mj_loadXML(generated.string().c_str(), nullptr,
+                                     diagnostic.data(), diagnostic.size());
+    if (!test_model) {
+      std::fprintf(stderr, "STL collision test model did not load: %s\n", diagnostic.data());
+      return 1;
+    }
+    const int collision_geom = mj_name2id(test_model, mjOBJ_GEOM, "cad_part_0");
+    const int convex_geom = mj_name2id(test_model, mjOBJ_GEOM, "cad_part_1");
+    if (collision_geom < 0 || convex_geom < 0 ||
+        test_model->geom_type[collision_geom] != mjGEOM_MESH ||
+        test_model->geom_type[convex_geom] != mjGEOM_MESH ||
+        test_model->geom_dataid[collision_geom] == test_model->geom_dataid[convex_geom] ||
+        test_model->geom_contype[collision_geom] == 0 ||
+        test_model->geom_contype[convex_geom] == 0) {
+      std::fprintf(stderr,
+        "Weapon and frame CAD bodies did not retain separate convex collision meshes.\n");
+      mj_deleteModel(test_model);
+      return 1;
+    }
+    std::printf("Weapon and frame CAD bodies use separate convex collision meshes.\n");
+    mj_deleteModel(test_model);
+    return 0;
+  }
   if (argc >= 3 && std::string(argv[1]) == "--test-memory-bundle") {
     if (!bundle.Load(argv[2])) {
       std::fprintf(stderr, "Source bundle load failed: %s\n", bundle.Error().c_str());
@@ -2890,7 +3189,16 @@ int main(int argc, char** argv) {
   if (argc >= 3 && std::string(argv[1]) == "--test-straight-drive-bundle") {
     if (!bundle.Load(argv[2])) { std::fprintf(stderr, "%s\n", bundle.Error().c_str()); return 1; }
     std::filesystem::path generated;
-    if (!bundle.Generate(generated)) { std::fprintf(stderr, "%s\n", bundle.Error().c_str()); return 1; }
+    if (argc >= 4 && std::string(argv[3]) == "--existing-generated-model") {
+      generated = std::filesystem::path(argv[2]).parent_path() / "combatsim_generated.xml";
+      if (!std::filesystem::exists(generated)) {
+        std::fprintf(stderr, "Existing generated model not found: %s\n", generated.string().c_str());
+        return 1;
+      }
+    } else if (!bundle.Generate(generated)) {
+      std::fprintf(stderr, "%s\n", bundle.Error().c_str());
+      return 1;
+    }
     std::array<char, 8192> diagnostic{};
     mjModel* checked = mj_loadXML(generated.string().c_str(), nullptr,
                                   diagnostic.data(), diagnostic.size());
@@ -2926,6 +3234,8 @@ int main(int argc, char** argv) {
     int scrape_floor_contact_steps = 0;
     int max_scrape_floor_contacts = 0;
     double max_scrape_floor_normal = 0.0;
+    double max_scrape_floor_tangent = 0.0;
+    std::string max_scrape_normal_geom, max_scrape_tangent_geom;
     auto record_scrape_floor_contacts = [&]() {
       int contact_count = 0;
       for (int contact = 0; contact < checked_data->ncon; ++contact) {
@@ -2936,7 +3246,16 @@ int main(int argc, char** argv) {
         ++contact_count;
         mjtNum wrench[6]{};
         mj_contactForce(checked, checked_data, contact, wrench);
-        max_scrape_floor_normal = std::max(max_scrape_floor_normal, double(wrench[0]));
+        const char* geom_name = mj_id2name(checked, mjOBJ_GEOM, other);
+        if (wrench[0] > max_scrape_floor_normal) {
+          max_scrape_floor_normal = wrench[0];
+          max_scrape_normal_geom = geom_name ? geom_name : "unnamed";
+        }
+        const double tangent_force = std::hypot(double(wrench[1]), double(wrench[2]));
+        if (tangent_force > max_scrape_floor_tangent) {
+          max_scrape_floor_tangent = tangent_force;
+          max_scrape_tangent_geom = geom_name ? geom_name : "unnamed";
+        }
       }
       if (contact_count > 0) ++scrape_floor_contact_steps;
       max_scrape_floor_contacts = std::max(max_scrape_floor_contacts, contact_count);
@@ -2957,9 +3276,47 @@ int main(int argc, char** argv) {
     const int settle_scrape_contact_steps = scrape_floor_contact_steps;
     const int settle_max_scrape_contacts = max_scrape_floor_contacts;
     const double settle_max_scrape_normal = max_scrape_floor_normal;
+    const double settle_max_scrape_tangent = max_scrape_floor_tangent;
+    const std::string settle_max_scrape_normal_geom = max_scrape_normal_geom;
+    const std::string settle_max_scrape_tangent_geom = max_scrape_tangent_geom;
     scrape_floor_contact_steps = 0;
     max_scrape_floor_contacts = 0;
     max_scrape_floor_normal = 0.0;
+    max_scrape_floor_tangent = 0.0;
+    max_scrape_normal_geom.clear();
+    max_scrape_tangent_geom.clear();
+    auto print_wheel_contact_counts = [&](const char* phase) {
+      std::printf("Wheel-ground contacts %s:", phase);
+      auto print_side = [&](const char* label,
+                            const std::vector<std::pair<int, double>>& wheels) {
+        std::printf(" %s=[", label);
+        for (size_t i = 0; i < wheels.size(); ++i) {
+          if (i) std::printf(",");
+          const int joint = checked->actuator_trnid[2 * wheels[i].first];
+          const int wheel_root = joint >= 0 && joint < checked->njnt
+            ? checked->jnt_bodyid[joint] : -1;
+          int contacts = 0;
+          for (int contact = 0; contact < checked_data->ncon; ++contact) {
+            const mjContact& item = checked_data->contact[contact];
+            if (item.geom[0] != floor_geom && item.geom[1] != floor_geom) continue;
+            const int other = item.geom[0] == floor_geom ? item.geom[1] : item.geom[0];
+            if (wheel_root >= 0 && body_is_in_subtree(
+                  checked, checked->geom_bodyid[other], wheel_root)) ++contacts;
+          }
+          std::printf("%s:%d", mj_id2name(checked, mjOBJ_ACTUATOR, wheels[i].first), contacts);
+        }
+        std::printf("]");
+      };
+      print_side("L", test_controls.left);
+      print_side("R", test_controls.right);
+      std::printf("\n");
+    };
+    const int root_dof = checked->jnt_dofadr[player_joint];
+    std::printf("After settle: root linear velocity=(%.4f,%.4f,%.4f) m/s; angular speed=(%.4f,%.4f,%.4f) rad/s\n",
+      checked_data->qvel[root_dof], checked_data->qvel[root_dof + 1],
+      checked_data->qvel[root_dof + 2], checked_data->qvel[root_dof + 3],
+      checked_data->qvel[root_dof + 4], checked_data->qvel[root_dof + 5]);
+    print_wheel_contact_counts("after settle");
     const double start_x = checked_data->qpos[root_qpos];
     const double start_y = checked_data->qpos[root_qpos + 1];
     const double start_z = checked_data->xipos[3 * player_body + 2];
@@ -3007,9 +3364,13 @@ int main(int argc, char** argv) {
     std::printf("Bot COM height during drive: start=%.4f m end=%.4f m range=%.4f..%.4f m (%.1f mm span)\n",
       start_z, checked_data->xipos[3 * player_body + 2], min_com_z, max_com_z,
       (max_com_z - min_com_z) * 1000.0);
-    std::printf("Chassis/fork-floor contact during settle: %d steps, up to %d contacts, max normal %.3f N; during drive: %d steps, up to %d contacts, max normal %.3f N\n",
+    std::printf("Chassis/fork-floor contacts: settle %d steps, up to %d contacts, peak N %.3f (%s), Ft %.3f (%s); drive %d steps, up to %d contacts, peak N %.3f (%s), Ft %.3f (%s)\n",
       settle_scrape_contact_steps, settle_max_scrape_contacts, settle_max_scrape_normal,
-      scrape_floor_contact_steps, max_scrape_floor_contacts, max_scrape_floor_normal);
+      settle_max_scrape_normal_geom.c_str(), settle_max_scrape_tangent,
+      settle_max_scrape_tangent_geom.c_str(), scrape_floor_contact_steps,
+      max_scrape_floor_contacts, max_scrape_floor_normal,
+      max_scrape_normal_geom.c_str(), max_scrape_floor_tangent,
+      max_scrape_tangent_geom.c_str());
     auto print_wheels = [&](const char* side,
                             const std::vector<std::pair<int, double>>& wheels) {
       std::printf("%s wheels:", side);
@@ -3022,27 +3383,40 @@ int main(int argc, char** argv) {
         std::printf(" %s[z=%.3f m]=%+.1f RPM/%s", mj_id2name(checked, mjOBJ_ACTUATOR, id),
           checked_data->xpos[3 * body + 2], rpm,
           !slip.valid ? "unknown" : !slip.has_ground_contact ? "airborne" :
-          slip.speed > 0.18 ? "slipping" : "grip");
-        if (slip.valid && slip.has_ground_contact) std::printf("(%.2f m/s)", slip.speed);
+          slip.ratio > 0.15 ? "slipping" : "grip");
+        if (slip.valid && slip.has_ground_contact)
+          std::printf("(%.0f%%, %.2f m/s)", slip.ratio * 100.0, slip.speed);
       }
       std::printf("\n");
     };
     print_wheels("Left", test_controls.left);
     print_wheels("Right", test_controls.right);
+    std::printf("After drive: root linear velocity=(%.4f,%.4f,%.4f) m/s; angular speed=(%.4f,%.4f,%.4f) rad/s\n",
+      checked_data->qvel[root_dof], checked_data->qvel[root_dof + 1],
+      checked_data->qvel[root_dof + 2], checked_data->qvel[root_dof + 3],
+      checked_data->qvel[root_dof + 4], checked_data->qvel[root_dof + 5]);
+    print_wheel_contact_counts("after drive");
     if (floor_geom >= 0) {
       mj_forward(checked, checked_data);
+      Vec3 total_floor_force{};
       std::printf("Floor contacts (body, geom, z, normal N):");
       for (int contact = 0; contact < checked_data->ncon; ++contact) {
         const mjContact& c = checked_data->contact[contact];
         if (c.geom[0] != floor_geom && c.geom[1] != floor_geom) continue;
         const int other = c.geom[0] == floor_geom ? c.geom[1] : c.geom[0];
+        if (!body_is_in_subtree(checked, checked->geom_bodyid[other], player_body)) continue;
         mjtNum wrench[6]{};
         mj_contactForce(checked, checked_data, contact, wrench);
-        std::printf(" [%s/%s z=%.4f F=%.3f]",
+        for (int axis = 0; axis < 3; ++axis)
+          for (int basis = 0; basis < 3; ++basis)
+            total_floor_force[axis] += wrench[basis] * c.frame[3 * basis + axis];
+        std::printf(" [%s/%s z=%.4f F=(%.3f,%.3f,%.3f)]",
           mj_id2name(checked, mjOBJ_BODY, checked->geom_bodyid[other]),
-          mj_id2name(checked, mjOBJ_GEOM, other), c.pos[2], wrench[0]);
+          mj_id2name(checked, mjOBJ_GEOM, other), c.pos[2],
+          wrench[0], wrench[1], wrench[2]);
       }
-      std::printf("\n");
+      std::printf(" net player floor force=(%.3f,%.3f,%.3f) N\n",
+        total_floor_force[0], total_floor_force[1], total_floor_force[2]);
     }
     const bool finite = std::isfinite(yaw_change) &&
       std::isfinite(checked_data->qpos[root_qpos]) &&
@@ -3106,6 +3480,8 @@ int main(int argc, char** argv) {
     const double estimated_no_load_rpm = MotorNoLoadOutputRpm(motor, voltage);
     const double ideal_stall = MotorOutputTorque(motor, voltage, free_speed, 0.0);
     const double ideal_free = MotorOutputTorque(motor, voltage, free_speed, free_speed);
+    const double ideal_phase_current = MotorPhaseCurrent(motor, voltage, free_speed, 0.0);
+    const double free_phase_current = MotorPhaseCurrent(motor, voltage, free_speed, free_speed);
     const double shared_wheel_torque = motor_group_torque_per_wheel(
       motor, voltage, free_speed, 0.0, 2);
     motor.phase_resistance_ohm = voltage / motor.peak_current_a;
@@ -3130,6 +3506,10 @@ int main(int argc, char** argv) {
         std::abs(2.0 * shared_wheel_torque - expected_stall) > 1e-8 ||
         std::abs(estimated_no_load_rpm - 1110.0) > 1e-8 ||
         std::abs(ideal_free) > 1e-8 || std::abs(resistive_free) > 1e-8 ||
+        std::abs(ideal_phase_current - 10.0) > 1e-8 ||
+        std::abs(free_phase_current) > 1e-8 ||
+        std::abs(BatteryLoadedVoltage(voltage, 0.02, 10.0) - 10.9) > 1e-8 ||
+        std::abs(BatteryLoadedVoltage(voltage, 0.0, 10.0) - voltage) > 1e-8 ||
         std::abs(MotorKvRpmPerVolt(brushed) - brushed_kv) > 1e-8 ||
         std::abs(MotorNoLoadOutputRpm(brushed, voltage) - brushed_free_rpm) > 1e-8 ||
         std::abs(brushed_stall_torque - expected_brushed_stall) > 1e-8 ||
@@ -3143,7 +3523,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "Brushed Kv and rated-RPM speed inputs disagree.\n");
       return 1;
     }
-    std::printf("Motor torque/RPM passed: %.4f Nm brushless stall, %.0f RPM brushless no-load; brushed rated-RPM input and optional resistance passed.\n",
+    std::printf("Motor torque/RPM passed: %.4f Nm brushless stall, %.0f RPM brushless no-load; pack sag, phase current, brushed rated-RPM, and optional resistance passed.\n",
                 expected_stall, estimated_no_load_rpm);
     return 0;
   }
@@ -3377,6 +3757,113 @@ int main(int argc, char** argv) {
     }
     std::printf("Weapon torque spin-up passed: %.0f RPM at 0.1 s, %.0f RPM final of %.0f RPM no-load; estimated 0-to-90%% time %.2f s.\n",
                   early_rpm, final_rpm, free_rpm, estimated_spinup_seconds);
+    return 0;
+  }
+  if (argc >= 3 && std::string(argv[1]) == "--profile-impact") {
+    const std::filesystem::path profile_model = argv[2];
+    const double impact_speed = argc >= 4 ? std::strtod(argv[3], nullptr) : 24.0;
+    const int sdf_initpoints = argc >= 5 ? std::atoi(argv[4]) : 0;
+    const int sdf_iterations = argc >= 6 ? std::atoi(argv[5]) : 0;
+    const int requested_steps = argc >= 7 ? std::atoi(argv[6]) : 0;
+    std::array<char, 8192> diagnostic{};
+    mjModel* checked = mj_loadXML(profile_model.string().c_str(), nullptr,
+                                  diagnostic.data(), diagnostic.size());
+    if (!checked) {
+      std::fprintf(stderr, "Impact profile model load failed: %s\n", diagnostic.data());
+      return 1;
+    }
+    if (sdf_initpoints > 0) checked->opt.sdf_initpoints = sdf_initpoints;
+    if (sdf_iterations > 0) checked->opt.sdf_iterations = sdf_iterations;
+    mjData* checked_data = mj_makeData(checked);
+    const int player_joint = mj_name2id(checked, mjOBJ_JOINT, "robot_free");
+    if (!checked_data || player_joint < 0) {
+      std::fprintf(stderr, "Impact profile needs a robot_free joint and MuJoCo data.\n");
+      if (checked_data) mj_deleteData(checked_data);
+      mj_deleteModel(checked);
+      return 1;
+    }
+
+    const int player_qpos = checked->jnt_qposadr[player_joint];
+    const int player_dof = checked->jnt_dofadr[player_joint];
+    // Keep the generated model's real spawn poses. Hard-coded stock-bot
+    // coordinates can place a larger imported CAD bot inside the target.
+    checked_data->qvel[player_dof] = impact_speed;
+    mj_forward(checked, checked_data);
+
+    const int steps = requested_steps > 0 ? requested_steps :
+      std::max(1, int(std::ceil(0.12 / checked->opt.timestep)));
+    std::vector<double> step_times_ms;
+    step_times_ms.reserve(size_t(steps));
+    double max_step_ms = 0.0;
+    int max_step_index = 0;
+    int max_contacts = checked_data->ncon;
+    int max_sdf_contacts = 0;
+    int max_constraints = checked_data->nefc;
+    auto sdf_contact_pairs = [&]() {
+      std::map<std::pair<int, int>, int> pairs;
+      for (int contact = 0; contact < checked_data->ncon; ++contact) {
+        const mjContact& pair = checked_data->contact[contact];
+        if (checked->geom_type[pair.geom[0]] == mjGEOM_SDF ||
+            checked->geom_type[pair.geom[1]] == mjGEOM_SDF) {
+          int first = pair.geom[0];
+          int second = pair.geom[1];
+          if (first > second) std::swap(first, second);
+          ++pairs[{first, second}];
+        }
+      }
+      return pairs;
+    };
+    auto peak_sdf_pairs = sdf_contact_pairs();
+    auto count_pairs = [](const auto& pairs) {
+      int count = 0;
+      for (const auto& item : pairs) count += item.second;
+      return count;
+    };
+    max_sdf_contacts = count_pairs(peak_sdf_pairs);
+    for (int step = 0; step < steps; ++step) {
+      const auto start = std::chrono::steady_clock::now();
+      mj_step(checked, checked_data);
+      const double elapsed_ms = 1000.0 * std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+      step_times_ms.push_back(elapsed_ms);
+      if (elapsed_ms > max_step_ms) {
+        max_step_ms = elapsed_ms;
+        max_step_index = step;
+      }
+      max_contacts = std::max(max_contacts, checked_data->ncon);
+      auto current_sdf_pairs = sdf_contact_pairs();
+      const int current_sdf_contacts = count_pairs(current_sdf_pairs);
+      if (current_sdf_contacts > max_sdf_contacts) {
+        max_sdf_contacts = current_sdf_contacts;
+        peak_sdf_pairs = std::move(current_sdf_pairs);
+      }
+      max_constraints = std::max(max_constraints, checked_data->nefc);
+    }
+    std::sort(step_times_ms.begin(), step_times_ms.end());
+    const double average_step_ms = std::accumulate(step_times_ms.begin(),
+      step_times_ms.end(), 0.0) / step_times_ms.size();
+    const double p95_step_ms = step_times_ms[size_t(0.95 * (step_times_ms.size() - 1))];
+    std::fprintf(stderr,
+      "Impact profile: %.1f m/s, %d steps at %.0f Hz, %d SDF starts x %d iterations; average %.2f ms, p95 %.2f ms, peak %.2f ms at step %d; max contacts %d (%d SDF pairs), max constraints %d, final x %.3f m.\n",
+      impact_speed, steps, 1.0 / checked->opt.timestep,
+      checked->opt.sdf_initpoints, checked->opt.sdf_iterations, average_step_ms,
+      p95_step_ms, max_step_ms, max_step_index, max_contacts,
+      max_sdf_contacts, max_constraints, checked_data->qpos[player_qpos]);
+    std::vector<std::pair<std::pair<int, int>, int>> ranked_pairs(
+      peak_sdf_pairs.begin(), peak_sdf_pairs.end());
+    std::sort(ranked_pairs.begin(), ranked_pairs.end(), [](const auto& first,
+                                                           const auto& second) {
+      return first.second > second.second;
+    });
+    for (size_t index = 0; index < std::min<size_t>(ranked_pairs.size(), 12); ++index) {
+      const auto& item = ranked_pairs[index];
+      const char* first = mj_id2name(checked, mjOBJ_GEOM, item.first.first);
+      const char* second = mj_id2name(checked, mjOBJ_GEOM, item.first.second);
+      std::fprintf(stderr, "  SDF pair %s / %s: %d contact points\n",
+        first ? first : "unnamed", second ? second : "unnamed", item.second);
+    }
+    mj_deleteData(checked_data);
+    mj_deleteModel(checked);
     return 0;
   }
   if (argc >= 2 && std::string(argv[1]) == "--test-wall-impact") {
@@ -3722,8 +4209,8 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 3; ++i) checked_camera.lookat[i] = pivot[i];
     checked_camera.distance = 0.13;
     mjvOption checked_options; mjv_defaultOption(&checked_options);
-    for (int i = 0; i < checked->ngeom; ++i)
-      checked->geom_group[i] = bundle.PreviewVisible(i) ? 0 : 5;
+    SetFusionPreviewGeomGroups(checked, bundle, false);
+    checked_options.geomgroup[4] = 0;
     checked_options.geomgroup[5] = 0;
     mjvScene checked_scene; mjv_defaultScene(&checked_scene);
     mjv_makeScene(checked, &checked_scene, 2000);
@@ -3797,6 +4284,109 @@ int main(int argc, char** argv) {
     }
     mjv_freeScene(&checked_scene); mj_deleteData(checked_data); mj_deleteModel(checked);
     return fit ? 0 : 1;
+  }
+  if (argc >= 3 && std::string(argv[1]) == "--test-preview-collision-toggle") {
+    if (!bundle.Load(argv[2])) {
+      std::fprintf(stderr, "Preview collision test bundle load failed: %s\n",
+                   bundle.Error().c_str());
+      return 1;
+    }
+    std::filesystem::path preview_path;
+    if (!bundle.GeneratePreview(preview_path)) {
+      std::fprintf(stderr, "Preview collision model generation failed: %s\n",
+                   bundle.Error().c_str());
+      return 1;
+    }
+    std::array<char, 8192> diagnostic{};
+    mjModel* checked = mj_loadXML(preview_path.string().c_str(), nullptr,
+                                  diagnostic.data(), diagnostic.size());
+    if (!checked) {
+      std::fprintf(stderr, "Preview collision model did not load: %s\n",
+                   diagnostic.data());
+      return 1;
+    }
+    mjData* checked_data = mj_makeData(checked);
+    mjvScene checked_scene; mjv_defaultScene(&checked_scene);
+    mjv_makeScene(checked, &checked_scene, 2000);
+    mjvCamera checked_camera; mjv_defaultCamera(&checked_camera);
+    checked_camera.distance = std::max(0.25, bundle.PreviewDistance());
+    mjvOption checked_options; mjv_defaultOption(&checked_options);
+    int visible_hulls = 0;
+    int missing_hulls = 0;
+    int visible_originals = 0;
+    int hulls_with_original_colors = 0;
+    bool valid = checked_data != nullptr;
+    if (valid) {
+      mj_forward(checked, checked_data);
+      SetFusionPreviewGeomGroups(checked, bundle, true);
+      checked_options.geomgroup[0] = 0;
+      checked_options.geomgroup[4] = 0;
+      checked_options.geomgroup[5] = 1;
+      checked_options.flags[mjVIS_CONVEXHULL] = 1;
+      mjv_updateScene(checked, checked_data, &checked_options, nullptr,
+                      &checked_camera, mjCAT_ALL, &checked_scene);
+      for (int i = 0; i < checked_scene.ngeom; ++i) {
+        const mjvGeom& scene_geom = checked_scene.geoms[i];
+        if (scene_geom.objtype != mjOBJ_GEOM || scene_geom.objid < 0 ||
+            scene_geom.objid >= checked->ngeom) continue;
+        const int geom = scene_geom.objid;
+        if (checked->geom_group[geom] != 5 || checked->geom_type[geom] != mjGEOM_MESH)
+          continue;
+        const int expected_hull_dataid = 2 * checked->geom_dataid[geom] + 1;
+        if (scene_geom.dataid == expected_hull_dataid && scene_geom.rgba[3] > 0.0f) {
+          ++visible_hulls;
+          const int part = CadPartIndexFromGeom(checked, geom);
+          const std::string visual_name = "cad_visual_" + std::to_string(part);
+          const int visual_geom = mj_name2id(checked, mjOBJ_GEOM, visual_name.c_str());
+          bool same_color = visual_geom >= 0 &&
+            checked->geom_matid[geom] == checked->geom_matid[visual_geom];
+          for (int component = 0; component < 4 && same_color; ++component)
+            same_color = std::abs(checked->geom_rgba[4 * geom + component] -
+              checked->geom_rgba[4 * visual_geom + component]) < 1e-6f;
+          if (same_color) ++hulls_with_original_colors;
+        } else {
+          ++missing_hulls;
+          if (missing_hulls == 1) {
+            std::fprintf(stderr,
+                "  First collision scene geom: %s mesh=%d graph=%d masks=%d/%d dataid=%d expected=%d hull_flag=%d\n",
+                mj_id2name(checked, mjOBJ_GEOM, geom), checked->geom_dataid[geom],
+                checked->mesh_graphadr[checked->geom_dataid[geom]],
+                checked->geom_contype[geom], checked->geom_conaffinity[geom],
+                scene_geom.dataid, expected_hull_dataid,
+                checked_options.flags[mjVIS_CONVEXHULL]);
+          }
+        }
+      }
+      SetFusionPreviewGeomGroups(checked, bundle, false);
+      checked_options.geomgroup[0] = 1;
+      checked_options.geomgroup[5] = 0;
+      checked_options.flags[mjVIS_CONVEXHULL] = 0;
+      mjv_updateScene(checked, checked_data, &checked_options, nullptr,
+                      &checked_camera, mjCAT_ALL, &checked_scene);
+      for (int i = 0; i < checked_scene.ngeom; ++i) {
+        const mjvGeom& scene_geom = checked_scene.geoms[i];
+        if (scene_geom.objtype != mjOBJ_GEOM || scene_geom.objid < 0 ||
+            scene_geom.objid >= checked->ngeom) continue;
+        if (checked->geom_group[scene_geom.objid] == 0 &&
+            checked->geom_type[scene_geom.objid] == mjGEOM_MESH &&
+            scene_geom.rgba[3] > 0.0f)
+          ++visible_originals;
+      }
+      valid = visible_hulls > 0 && missing_hulls == 0 &&
+        hulls_with_original_colors == visible_hulls && visible_originals > 0;
+    }
+    if (valid) {
+      std::printf("CAD collision preview toggle passed: %d visible hull meshes retain their body colors; original CAD preview restores with %d visible meshes.\n",
+                  visible_hulls, visible_originals);
+    } else {
+      std::fprintf(stderr,
+          "CAD collision preview toggle failed (visible hulls=%d, bad hull refs=%d, original colors=%d, original meshes=%d).\n",
+          visible_hulls, missing_hulls, hulls_with_original_colors, visible_originals);
+    }
+    mjv_freeScene(&checked_scene);
+    if (checked_data) mj_deleteData(checked_data);
+    mj_deleteModel(checked);
+    return valid ? 0 : 1;
   }
   if (argc >= 2 && std::string(argv[1]) == "--test-arena-spawns") {
     const std::filesystem::path test_path = argc >= 3 ? argv[2] :
@@ -4133,6 +4723,64 @@ int main(int argc, char** argv) {
     mj_deleteModel(checked);
     return 0;
   }
+  if (argc >= 3 && std::string(argv[1]) == "--test-impact-failure-binding") {
+    const std::filesystem::path manifest = argv[2];
+    if (!bundle.Load(manifest)) {
+      std::fprintf(stderr, "Impact test bundle load failed: %s\n", bundle.Error().c_str());
+      return 1;
+    }
+    std::filesystem::path generated;
+    if (!bundle.Generate(generated)) {
+      std::fprintf(stderr, "Impact test model generation failed: %s\n", bundle.Error().c_str());
+      return 1;
+    }
+    std::array<char, 4096> diagnostic{};
+    mjModel* checked = mj_loadXML(generated.string().c_str(), nullptr,
+                                  diagnostic.data(), int(diagnostic.size()));
+    if (!checked) {
+      std::fprintf(stderr, "Impact test model load failed: %s\n", diagnostic.data());
+      return 1;
+    }
+    std::map<int, double> thresholds;
+    std::map<int, int> actuators;
+    bundle.BindImpactFailures(checked, thresholds, actuators);
+    bool valid = thresholds.size() == actuators.size();
+    for (const auto& [geom, threshold] : thresholds) {
+      valid = valid && geom >= 0 && geom < checked->ngeom &&
+        threshold > 0.0 && std::isfinite(threshold) &&
+        actuators.count(geom) && actuators.at(geom) >= 0 &&
+        actuators.at(geom) < checked->nu;
+    }
+    if (argc >= 4) valid = valid && thresholds.size() == size_t(std::stoul(argv[3]));
+    valid = valid && bundle.Save();
+    if (valid && !thresholds.empty()) {
+      Controls impact_controls;
+      bundle.BindControls(checked, impact_controls.left, impact_controls.right,
+        impact_controls.weapon, impact_controls.motor_models,
+        impact_controls.weapon_motor_models,
+        impact_controls.manual_velocity_actuators, impact_controls.battery_voltage);
+      impact_controls.impact_thresholds_by_geom = thresholds;
+      impact_controls.impact_actuator_by_geom = actuators;
+      mjData* impact_data = mj_makeData(checked);
+      if (!impact_data) {
+        valid = false;
+      } else {
+        for (int step = 0; step < 5000 && impact_controls.impact_failures.empty(); ++step) {
+          mj_step(checked, impact_data);
+          monitor_impact_failures(checked, impact_data, impact_controls);
+        }
+        valid = !impact_controls.impact_failures.empty();
+        mj_deleteData(impact_data);
+      }
+    }
+    if (valid)
+      std::printf("Impact failure threshold passed: %zu collision geoms mapped to drive actuators and the configured trip fired; unconfigured assemblies remain off.\n",
+                  thresholds.size());
+    else
+      std::fprintf(stderr, "Impact failure bindings did not match the configured thresholds.\n");
+    mj_deleteModel(checked);
+    return valid ? 0 : 1;
+  }
 #if defined(COMBATSIM_USE_FILAMENT)
   const bool filament_render_smoke = argc >= 2 &&
     std::string(argv[1]) == "--test-filament-render";
@@ -4147,9 +4795,27 @@ int main(int argc, char** argv) {
     std::string(argv[1]) == "--test-renderer-resume";
   const bool renderer_resume = argc >= 3 &&
     (std::string(argv[1]) == "--renderer-resume" || renderer_resume_test);
+  AppSettings app_settings;
+  load_app_settings(app_settings);
+  FusionBundle arena_bundle;
+  std::string arena_status;
+  if (renderer_resume && !renderer_resume_test && argc >= 5 && argv[4][0] != '\0')
+    app_settings.arena_manifest_path = argv[4];
+  if (!renderer_resume_test && !app_settings.arena_manifest_path.empty()) {
+    if (!arena_bundle.Load(app_settings.arena_manifest_path)) {
+      arena_status = "Arena import: " + arena_bundle.Error();
+      app_settings.arena_width_m = app_settings.arena_depth_m = app_settings.arena_size_m;
+    } else {
+      const auto size = arena_bundle.PreviewSize();
+      app_settings.arena_width_m = float(std::clamp(size[0], 0.1, 100.0));
+      app_settings.arena_depth_m = float(std::clamp(size[1], 0.1, 100.0));
+      app_settings.arena_size_m = std::max(app_settings.arena_width_m,
+                                           app_settings.arena_depth_m);
+    }
+  }
   std::filesystem::path model_path;
   if (renderer_resume) {
-    if (!bundle.Load(argv[2])) {
+    if (argv[2][0] != '\0' && !bundle.Load(argv[2])) {
       std::fprintf(stderr, "Could not restore player CAD bundle: %s\n", bundle.Error().c_str());
       return 1;
     }
@@ -4158,10 +4824,15 @@ int main(int argc, char** argv) {
                    opponent_bundle.Error().c_str());
       return 1;
     }
-    if (!bundle.Generate(model_path, opponent_bundle.HasBundle() ? &opponent_bundle : nullptr)) {
-      std::fprintf(stderr, "Could not rebuild CAD model after renderer switch: %s\n",
-                   bundle.Error().c_str());
-      return 1;
+    if (bundle.HasBundle()) {
+      if (!bundle.Generate(model_path, opponent_bundle.HasBundle() ? &opponent_bundle : nullptr)) {
+        std::fprintf(stderr, "Could not rebuild CAD model after renderer switch: %s\n",
+                     bundle.Error().c_str());
+        return 1;
+      }
+    } else {
+      model_path = argc >= 6 && argv[5][0] != '\0' ?
+        std::filesystem::path(argv[5]) : stock_model_path();
     }
   } else if (filament_render_smoke) {
     model_path = argv[2];
@@ -4170,6 +4841,12 @@ int main(int argc, char** argv) {
   } else {
     model_path = argc > 1 ? argv[1] :
       stock_model_path();
+  }
+  const std::filesystem::path base_model_path = model_path;
+  if (arena_bundle.HasBundle()) {
+    std::filesystem::path with_arena;
+    if (write_arena_scene_file(base_model_path, arena_bundle, with_arena, arena_status))
+      model_path = with_arena;
   }
   std::array<char, 4096> load_error{};
   mjModel* model = mj_loadXML(model_path.string().c_str(), nullptr, load_error.data(), load_error.size());
@@ -4211,6 +4888,13 @@ int main(int argc, char** argv) {
       const double seek_time = loaded.Duration() * 0.5;
       valid = loaded.Apply(replay_test_model, replay_test_data, seek_time, error) &&
         std::abs(replay_test_data->time - seek_time) < 1e-5;
+      if (valid) valid = loaded.BeginResimulation(replay_test_model, replay_test_data, error);
+      while (valid && loaded.IsResimulating())
+        valid = loaded.AdvanceResimulation(replay_test_model, replay_test_data, 1024, error);
+      if (valid) valid = loaded.Apply(replay_test_model, replay_test_data,
+                                      loaded.Duration(), error);
+      for (int i = 0; valid && i < model->nq; ++i)
+        valid = std::abs(replay_test_data->qpos[i] - test_data->qpos[i]) < 1e-4;
     } else if (valid) {
       valid = false;
       error = "Could not instantiate the replay's embedded model.";
@@ -4218,7 +4902,7 @@ int main(int argc, char** argv) {
     std::error_code remove_error;
     std::filesystem::remove(replay_path, remove_error);
     if (valid)
-      std::printf("Replay record/save/load/scrub check passed (%zu poses, %.3f s).\n",
+      std::printf("Replay record/save/load/scrub/re-simulation check passed (%zu poses, %.3f s).\n",
                   loaded.FrameCount(), loaded.Duration());
     else
       std::fprintf(stderr, "Replay check failed: %s\n", error.c_str());
@@ -4237,18 +4921,32 @@ int main(int argc, char** argv) {
   if (bundle.HasBundle()) {
     controls.left.clear(); controls.right.clear(); controls.weapon.clear();
     controls.filtered_wheel_speeds.clear();
+    controls.impact_disabled_actuators.clear();
+    controls.impact_failures.clear();
     bundle.BindControls(model, controls.left, controls.right, controls.weapon,
       controls.motor_models, controls.weapon_motor_models,
       controls.manual_velocity_actuators, controls.battery_voltage);
+    bundle.BindImpactFailures(model, controls.impact_thresholds_by_geom,
+                              controls.impact_actuator_by_geom);
+    controls.battery_internal_resistance_ohm = bundle.BatteryInternalResistanceOhm();
+    controls.battery_operating_voltage = controls.battery_voltage;
   }
   if (opponent_bundle.HasBundle()) {
     opponent_controls.left.clear(); opponent_controls.right.clear();
     opponent_controls.weapon.clear(); opponent_controls.filtered_wheel_speeds.clear();
+    opponent_controls.impact_disabled_actuators.clear();
+    opponent_controls.impact_failures.clear();
     opponent_bundle.BindControls(model, opponent_controls.left,
       opponent_controls.right, opponent_controls.weapon,
       opponent_controls.motor_models, opponent_controls.weapon_motor_models,
       opponent_controls.manual_velocity_actuators,
       opponent_controls.battery_voltage, true);
+    opponent_bundle.BindImpactFailures(model,
+      opponent_controls.impact_thresholds_by_geom,
+      opponent_controls.impact_actuator_by_geom, true);
+    opponent_controls.battery_internal_resistance_ohm =
+      opponent_bundle.BatteryInternalResistanceOhm();
+    opponent_controls.battery_operating_voltage = opponent_controls.battery_voltage;
   }
   mjData* data = mj_makeData(model);
   if (!data || !SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK)) {
@@ -4279,8 +4977,6 @@ int main(int argc, char** argv) {
   load_mixer_settings(input_mixer, active_mixer_profile_key);
   if (migrate_legacy_drive_mixes(input_mixer, controls))
     save_mixer_settings(input_mixer, active_mixer_profile_key);
-  AppSettings app_settings;
-  load_app_settings(app_settings);
   std::string graphics_status;
   if (app_settings.renderer != default_renderer_id) {
     const std::filesystem::path player_manifest = bundle.HasBundle() &&
@@ -4300,10 +4996,13 @@ int main(int argc, char** argv) {
     save_app_settings(app_settings);
   }
   char arena_preset_name[65]{};
+  char arena_manifest_path_field[1024]{};
+  std::snprintf(arena_manifest_path_field, sizeof(arena_manifest_path_field), "%s",
+                app_settings.arena_manifest_path.c_str());
   std::string arena_preset_status;
   apply_arena_size(model, app_settings.arena_size_m);
   apply_arena_spawn_layout(model, data, app_settings.spawn_layout,
-                           app_settings.arena_size_m);
+                           app_settings.arena_size_m, &app_settings);
   apply_arena_lighting(model, app_settings);
   SDL_Joystick* joystick = nullptr;
   SDL_JoystickID joystick_id = 0;
@@ -4318,10 +5017,13 @@ int main(int argc, char** argv) {
   mjvCamera setup_camera; mjv_defaultCamera(&setup_camera);
   setup_camera.distance = 1.0; setup_camera.elevation = -45; setup_camera.azimuth = 45;
   mjvOption options; mjv_defaultOption(&options);
+  options.geomgroup[4] = arena_bundle.HasBundle() ? 0 : 1;
+  options.geomgroup[5] = 0;  // Imported collision meshes are opt-in in the CAD view.
   mjvScene scene; mjv_defaultScene(&scene); mjv_makeScene(model, &scene, 2000);
   mjvScene replay_scene; mjv_defaultScene(&replay_scene);
   mjModel* replay_model = nullptr;
   mjData* replay_data = nullptr;
+  mjData* replay_resimulation_data = nullptr;
   mjrContext replay_context; mjr_defaultContext(&replay_context);
   mjModel* setup_model = nullptr;
   mjData* setup_data = nullptr;
@@ -4459,6 +5161,19 @@ int main(int argc, char** argv) {
   bool mixer_popup_open = false;
   bool lan_popup_open = false;
   std::string runtime_error;
+  if (!arena_status.empty()) runtime_error = arena_status;
+  std::mutex arena_manifest_mutex;
+  std::string pending_arena_manifest_path;
+  std::pair<std::mutex*, std::string*> arena_dialog_state{
+    &arena_manifest_mutex, &pending_arena_manifest_path};
+  bool arena_model_reload_requested = false;
+  struct PreparedModel {
+    mjModel* model = nullptr;
+    mjData* data = nullptr;
+    std::string error;
+  };
+  std::future<PreparedModel> prepared_model_future;
+  bool prepared_model_pending = false;
   std::string replay_status;
   FightReplay fight_replay;
   const std::filesystem::path replay_folder = replay_storage_directory();
@@ -4533,6 +5248,7 @@ int main(int argc, char** argv) {
     mjr_freeContext(&replay_context);
     mjv_freeScene(&replay_scene);
     if (replay_data) mj_deleteData(replay_data);
+    if (replay_resimulation_data) mj_deleteData(replay_resimulation_data);
     if (replay_model) mj_deleteModel(replay_model);
     fight_replay = std::move(candidate);
     replay_model = next_model;
@@ -4574,6 +5290,15 @@ int main(int argc, char** argv) {
   bool lan_match_started = false;
   double accumulator = 0.0;
   auto last = std::chrono::steady_clock::now();
+  auto performance_window_start = last;
+  double performance_window_sim_time = data->time;
+  double measured_simulation_rate = 0.0;
+  double measured_frame_rate = 0.0;
+  double measured_step_milliseconds = 0.0;
+  double performance_window_step_seconds = 0.0;
+  unsigned int performance_window_steps = 0;
+  unsigned int performance_window_frames = 0;
+  bool performance_sample_ready = false;
   auto wipe_package = [](std::vector<unsigned char>& bytes) {
     volatile unsigned char* data = bytes.empty() ? nullptr : bytes.data();
     for (size_t i = 0; i < bytes.size(); ++i) data[i] = 0;
@@ -4598,11 +5323,13 @@ int main(int argc, char** argv) {
     if (!save_mixer_settings(input_mixer, active_mixer_profile_key))
       runtime_error = "Could not save this model's joystick setup.";
   };
-  auto install_model = [&](mjModel* next_model) {
-    mjData* next_data = next_model ? mj_makeData(next_model) : nullptr;
+  auto install_model = [&](mjModel* next_model, mjData* prepared_data) {
+    mjData* next_data = prepared_data ? prepared_data :
+      next_model ? mj_makeData(next_model) : nullptr;
     if (!next_data) {
       runtime_error = next_model ? "MuJoCo could not allocate model data." :
         "MuJoCo could not compile the generated model.";
+      if (prepared_data) mj_deleteData(prepared_data);
       if (next_model) mj_deleteModel(next_model);
       return false;
     }
@@ -4612,8 +5339,9 @@ int main(int argc, char** argv) {
 #endif
     apply_arena_size(next_model, app_settings.arena_size_m);
     apply_arena_spawn_layout(next_model, next_data, app_settings.spawn_layout,
-                             app_settings.arena_size_m);
+                             app_settings.arena_size_m, &app_settings);
     apply_arena_lighting(next_model, app_settings);
+    options.geomgroup[4] = arena_bundle.HasBundle() ? 0 : 1;
     mjr_freeContext(&context); mjv_freeScene(&scene);
     mj_deleteData(data); mj_deleteModel(model);
     model = next_model; data = next_data;
@@ -4622,18 +5350,43 @@ int main(int argc, char** argv) {
     mjv_makeScene(model, &scene, 2000); make_render_context(model, &context);
     controls.left.clear(); controls.right.clear(); controls.weapon.clear();
     controls.filtered_wheel_speeds.clear();
+    controls.impact_disabled_actuators.clear();
+    controls.impact_failures.clear();
     bundle.BindControls(model, controls.left, controls.right, controls.weapon,
                         controls.motor_models, controls.weapon_motor_models,
                         controls.manual_velocity_actuators, controls.battery_voltage);
+    bundle.BindImpactFailures(model, controls.impact_thresholds_by_geom,
+                              controls.impact_actuator_by_geom);
+    controls.battery_internal_resistance_ohm = bundle.BatteryInternalResistanceOhm();
+    controls.battery_operating_voltage = controls.battery_voltage;
     controls.weapon_sign = 1.0; controls.weapon_command = 0.0;
     opponent_controls.left.clear(); opponent_controls.right.clear();
     opponent_controls.weapon.clear(); opponent_controls.filtered_wheel_speeds.clear();
+    opponent_controls.impact_disabled_actuators.clear();
+    opponent_controls.impact_failures.clear();
     opponent_bundle.BindControls(model, opponent_controls.left, opponent_controls.right,
       opponent_controls.weapon, opponent_controls.motor_models,
       opponent_controls.weapon_motor_models, opponent_controls.manual_velocity_actuators,
       opponent_controls.battery_voltage, true);
+    opponent_bundle.BindImpactFailures(model,
+      opponent_controls.impact_thresholds_by_geom,
+      opponent_controls.impact_actuator_by_geom, true);
+    opponent_controls.battery_internal_resistance_ohm =
+      opponent_bundle.BatteryInternalResistanceOhm();
+    opponent_controls.battery_operating_voltage = opponent_controls.battery_voltage;
     opponent_controls.weapon_sign = 1.0; opponent_controls.weapon_command = 0.0;
-    accumulator = 0.0; paused = true; runtime_error.clear();
+    accumulator = 0.0;
+    last = std::chrono::steady_clock::now();
+    performance_window_start = last;
+    performance_window_sim_time = next_data->time;
+    measured_simulation_rate = 0.0;
+    measured_frame_rate = 0.0;
+    measured_step_milliseconds = 0.0;
+    performance_window_step_seconds = 0.0;
+    performance_window_steps = 0;
+    performance_window_frames = 0;
+    performance_sample_ready = false;
+    paused = true; runtime_error.clear();
     return true;
   };
   auto rebuild_configured_model = [&](bool in_memory) {
@@ -4643,6 +5396,11 @@ int main(int argc, char** argv) {
       if (!bundle.GenerateInMemory(xml, assets,
             opponent_bundle.HasBundle() ? &opponent_bundle : nullptr)) {
         runtime_error = bundle.Error();
+        return false;
+      }
+      if (arena_bundle.HasBundle() &&
+          !arena_bundle.InjectArenaIntoMjcf(xml, &assets)) {
+        runtime_error = arena_bundle.Error();
         return false;
       }
       std::array<char, 8192> diagnostic{};
@@ -4656,7 +5414,7 @@ int main(int argc, char** argv) {
         if (diagnostic[0]) runtime_error = diagnostic.data();
         return false;
       }
-      if (!install_model(next_model)) return false;
+      if (!install_model(next_model, nullptr)) return false;
       activate_mixer_profile_for_current_model();
       return true;
     }
@@ -4665,6 +5423,12 @@ int main(int argc, char** argv) {
       runtime_error = bundle.Error();
       return false;
     }
+    if (arena_bundle.HasBundle()) {
+      std::filesystem::path combined;
+      if (!write_arena_scene_file(generated, arena_bundle, combined, runtime_error))
+        return false;
+      generated = combined;
+    }
     std::array<char, 8192> diagnostic{};
     mjModel* next_model = mj_loadXML(generated.string().c_str(), nullptr,
                                       diagnostic.data(), int(diagnostic.size()));
@@ -4672,8 +5436,56 @@ int main(int argc, char** argv) {
       if (diagnostic[0]) runtime_error = diagnostic.data();
       return false;
     }
-    if (!install_model(next_model)) return false;
+    if (!install_model(next_model, nullptr)) return false;
     activate_mixer_profile_for_current_model();
+    return true;
+  };
+  auto start_prepared_model_build = [&](const std::filesystem::path& generated) {
+    if (prepared_model_pending) return false;
+    try {
+      prepared_model_pending = true;
+      // STL SDF plugin setup builds a triangle BVH in mj_makeData; keep that
+      // CPU work off the UI thread. Renderer and OpenGL setup stays on main.
+      prepared_model_future = std::async(std::launch::async, [generated] {
+        PreparedModel result;
+        std::array<char, 8192> diagnostic{};
+        result.model = mj_loadXML(generated.string().c_str(), nullptr,
+                                  diagnostic.data(), int(diagnostic.size()));
+        if (!result.model) {
+          result.error = diagnostic[0] ? diagnostic.data() :
+            "MuJoCo could not compile the generated model.";
+          return result;
+        }
+        result.data = mj_makeData(result.model);
+        if (!result.data) {
+          result.error = "MuJoCo could not allocate model data.";
+          mj_deleteModel(result.model);
+          result.model = nullptr;
+        }
+        return result;
+      });
+      return true;
+    } catch (const std::exception& error) {
+      prepared_model_pending = false;
+      runtime_error = std::string("Could not start model compilation: ") + error.what();
+      return false;
+    }
+  };
+  auto schedule_active_scene_rebuild = [&] {
+    if (prepared_model_pending) {
+      runtime_error = "Wait for the current model build to finish before changing the arena.";
+      return false;
+    }
+    std::filesystem::path base = base_model_path;
+    if (bundle.HasBundle()) {
+      if (!bundle.Generate(base, opponent_bundle.HasBundle() ? &opponent_bundle : nullptr)) {
+        runtime_error = bundle.Error();
+        return false;
+      }
+    }
+    std::filesystem::path combined;
+    if (!write_arena_scene_file(base, arena_bundle, combined, runtime_error)) return false;
+    if (!start_prepared_model_build(combined)) return false;
     return true;
   };
   auto end_lan_session = [&] {
@@ -4705,6 +5517,22 @@ int main(int argc, char** argv) {
   // Each frame samples input, applies controls, advances MuJoCo at its fixed
   // timestep, refreshes render state, and draws the current navigation page.
   while (running) {
+    if (prepared_model_pending && prepared_model_future.wait_for(
+          std::chrono::milliseconds(0)) == std::future_status::ready) {
+      prepared_model_pending = false;
+      try {
+        PreparedModel prepared = prepared_model_future.get();
+        if (prepared.model && prepared.data) {
+          if (install_model(prepared.model, prepared.data))
+            activate_mixer_profile_for_current_model();
+        } else {
+          runtime_error = prepared.error.empty()
+            ? "MuJoCo could not compile the generated model." : prepared.error;
+        }
+      } catch (const std::exception& error) {
+        runtime_error = std::string("Model compilation failed: ") + error.what();
+      }
+    }
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
       ImGui_ImplSDL3_ProcessEvent(&event);
@@ -4930,14 +5758,37 @@ int main(int argc, char** argv) {
     }
 
     const auto now = std::chrono::steady_clock::now();
+    ++performance_window_frames;
+    const double performance_window_seconds =
+      std::chrono::duration<double>(now - performance_window_start).count();
+    if (performance_window_seconds >= 0.5) {
+      const double simulated_seconds = data->time - performance_window_sim_time;
+      measured_simulation_rate = std::isfinite(simulated_seconds)
+        ? std::max(0.0, simulated_seconds / performance_window_seconds) : 0.0;
+      measured_frame_rate = performance_window_frames / performance_window_seconds;
+      measured_step_milliseconds = performance_window_steps > 0
+        ? 1000.0 * performance_window_step_seconds / performance_window_steps : 0.0;
+      performance_window_start = now;
+      performance_window_sim_time = data->time;
+      performance_window_step_seconds = 0.0;
+      performance_window_steps = 0;
+      performance_window_frames = 0;
+      performance_sample_ready = true;
+    }
     const double frame_seconds = std::min(0.1,
         std::chrono::duration<double>(now - last).count());
     accumulator += frame_seconds;
     last = now;
     if (paused || screen != AppScreen::Drive) accumulator = 0.0;
     int steps = 0;
+    // Do not let a slow exact-mesh collision step turn catch-up into a long
+    // UI stall. If overloaded, retain only the substep remainder and let sim
+    // time fall behind real time instead of blocking input and rendering.
+    const auto simulation_deadline = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(8);
     while (!lan_client && !paused && screen == AppScreen::Drive &&
-           accumulator >= model->opt.timestep && steps++ < 250) {
+           accumulator >= model->opt.timestep && steps < 250 &&
+           (steps == 0 || std::chrono::steady_clock::now() < simulation_deadline)) {
       const bool keyboard_enabled = window_has_input_focus &&
         !ImGui::GetIO().WantCaptureKeyboard;
       const bool* keys = SDL_GetKeyboardState(nullptr);
@@ -4962,7 +5813,14 @@ int main(int argc, char** argv) {
           : opponent_keyboard;
       drive(model, data, opponent_controls, nullptr, nullptr, input_mixer,
             opponent_command, false);
+      const auto physics_step_start = std::chrono::steady_clock::now();
       mj_step(model, data);
+      performance_window_step_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      physics_step_start).count();
+      ++performance_window_steps;
+      monitor_impact_failures(model, data, controls);
+      monitor_impact_failures(model, data, opponent_controls);
       if (fight_replay.IsRecording()) {
         std::string capture_error;
         if (!fight_replay.Capture(model, data, capture_error)) {
@@ -4971,12 +5829,28 @@ int main(int argc, char** argv) {
         }
       }
       accumulator -= model->opt.timestep;
+      ++steps;
     }
-    if (steps >= 250) accumulator = 0.0;
+    if (accumulator >= model->opt.timestep &&
+        (steps >= 250 || std::chrono::steady_clock::now() >= simulation_deadline))
+      accumulator = std::fmod(accumulator, model->opt.timestep);
     if (lan_host)
       lan.SendSnapshot(data->time, data->qpos, model->nq, data->qvel, model->nv);
 
     if (screen == AppScreen::Replay && fight_replay.HasReplay() && replay_data) {
+      if (fight_replay.IsResimulating()) {
+        std::string resimulation_error;
+        if (!fight_replay.AdvanceResimulation(replay_model, replay_resimulation_data, 1024,
+                                               resimulation_error)) {
+          replay_status = resimulation_error;
+          replay_playing = false;
+        } else if (!fight_replay.IsResimulating()) {
+          replay_position = 0.0f;
+          replay_status = "Re-simulation complete. Review uses the re-simulated physics trajectory.";
+          if (replay_resimulation_data) mj_deleteData(replay_resimulation_data);
+          replay_resimulation_data = nullptr;
+        }
+      }
       if (replay_playing) {
         replay_position += float(frame_seconds * replay_speed);
         if (replay_position >= fight_replay.Duration()) {
@@ -5127,13 +6001,53 @@ int main(int argc, char** argv) {
     nav_button("Workshop", AppScreen::Configure);
     nav_button("Settings", AppScreen::Settings);
     const bool input_ready = joystick || pad;
-    const ImVec2 status_pos(std::max(nav_x + 8.0f, display.x - 246.0f), 23.0f);
-    nav_draw->AddCircleFilled(ImVec2(status_pos.x, status_pos.y + 6.0f), 4.0f,
-      ImGui::GetColorU32(input_ready ? ui_green : ImVec4(0.62f, 0.64f, 0.67f, 1.0f)));
-    ImGui::SetCursorScreenPos(ImVec2(status_pos.x + 13.0f, status_pos.y));
-    ImGui::TextColored(input_ready ? ui_green : ImVec4(0.67f, 0.68f, 0.70f, 1.0f),
-      "%s", joystick ? "JOYSTICK CONNECTED" :
-        pad ? "GAMEPAD CONNECTED" : "KEYBOARD READY");
+    const bool compact_status = display.x - nav_x < 300.0f;
+    const bool simulation_active = screen == AppScreen::Drive && (!paused || lan_client);
+    ImVec4 simulation_color = ImVec4(0.63f, 0.65f, 0.68f, 1.0f);
+    if (simulation_active && performance_sample_ready) {
+      simulation_color = measured_simulation_rate >= 0.95 ? ui_green :
+        measured_simulation_rate >= 0.70 ? ui_amber : ui_coral;
+    }
+    char simulation_status[96]{};
+    if (!performance_sample_ready) {
+      std::snprintf(simulation_status, sizeof(simulation_status), "SIM -- | -- FPS");
+    } else if (!simulation_active) {
+      std::snprintf(simulation_status, sizeof(simulation_status),
+                    "SIM PAUSED | %.0f FPS", measured_frame_rate);
+    } else {
+      std::snprintf(simulation_status, sizeof(simulation_status),
+                    "SIM %.2fx | %.0f FPS | %.1fms STEP", measured_simulation_rate,
+                    measured_frame_rate, measured_step_milliseconds);
+    }
+    if (compact_status) {
+      const float compact_x = nav_x + 8.0f;
+      if (display.x - compact_x > 54.0f) {
+        char compact_rate[24]{};
+        if (performance_sample_ready && simulation_active)
+          std::snprintf(compact_rate, sizeof(compact_rate), "%.1fx", measured_simulation_rate);
+        else
+          std::snprintf(compact_rate, sizeof(compact_rate), "SIM");
+        ImGui::SetCursorScreenPos(ImVec2(compact_x, 23.0f));
+        ImGui::TextColored(simulation_color, "%s", compact_rate);
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Simulation speed is simulated seconds per real second. FPS is the rendered frame rate.");
+      }
+      const float input_x = display.x - 20.0f;
+      nav_draw->AddCircleFilled(ImVec2(input_x, 29.0f), 4.0f,
+        ImGui::GetColorU32(input_ready ? ui_green : ImVec4(0.62f, 0.64f, 0.67f, 1.0f)));
+    } else {
+      const float status_x = display.x - 225.0f;
+      nav_draw->AddCircleFilled(ImVec2(status_x, 20.0f), 4.0f,
+        ImGui::GetColorU32(input_ready ? ui_green : ImVec4(0.62f, 0.64f, 0.67f, 1.0f)));
+      ImGui::SetCursorScreenPos(ImVec2(status_x + 13.0f, 11.0f));
+      ImGui::TextColored(input_ready ? ui_green : ImVec4(0.67f, 0.68f, 0.70f, 1.0f),
+        "%s", joystick ? "JOYSTICK CONNECTED" :
+          pad ? "GAMEPAD CONNECTED" : "KEYBOARD READY");
+      ImGui::SetCursorScreenPos(ImVec2(status_x + 13.0f, 34.0f));
+      ImGui::TextColored(simulation_color, "%s", simulation_status);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Simulation speed is simulated seconds per real second. Below 1.00x means physics is running slower than wall time. FPS is the rendered frame rate.");
+    }
     ImGui::End();
     ImGui::PopStyleColor(3);
 
@@ -5359,7 +6273,84 @@ int main(int argc, char** argv) {
       ImGui::TextColored(ui_amber, "ARENA SETTINGS");
       ImGui::TextDisabled("Changes are saved on this computer and applied to the current arena.");
       const bool spawn_locked = lan_bundle_swapped || lan_connected;
+      ImGui::SeparatorText("Arena CAD");
+      ImGui::TextWrapped("Export the arena from Fusion with a separate solid body for the floor and each wall, then load its manifest.json.");
+      {
+        std::lock_guard<std::mutex> lock(arena_manifest_mutex);
+        if (!pending_arena_manifest_path.empty()) {
+          std::snprintf(arena_manifest_path_field, sizeof(arena_manifest_path_field), "%s",
+                        pending_arena_manifest_path.c_str());
+          pending_arena_manifest_path.clear();
+        }
+      }
+      ImGui::SetNextItemWidth(std::min(520.0f, panel_width - 40.0f));
+      ImGui::InputText("Arena manifest.json", arena_manifest_path_field,
+                       sizeof(arena_manifest_path_field));
+      if (spawn_locked) ImGui::BeginDisabled();
+      if (ImGui::Button("Browse arena CAD...")) {
+        static const SDL_DialogFileFilter filters[] = {{"Fusion manifest", "json"}};
+        SDL_ShowOpenFileDialog([](void* user, const char* const* paths, int) {
+          if (!paths || !paths[0]) return;
+          auto* state = static_cast<std::pair<std::mutex*, std::string*>*>(user);
+          std::lock_guard<std::mutex> lock(*state->first);
+          *state->second = paths[0];
+        }, &arena_dialog_state, window, filters, 1, nullptr, false);
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Load arena")) {
+        if (arena_bundle.Load(arena_manifest_path_field)) {
+          app_settings.arena_manifest_path = arena_bundle.ManifestPath().string();
+          const auto size = arena_bundle.PreviewSize();
+          app_settings.arena_width_m = float(std::clamp(size[0], 0.1, 100.0));
+          app_settings.arena_depth_m = float(std::clamp(size[1], 0.1, 100.0));
+          app_settings.arena_size_m = std::max(app_settings.arena_width_m,
+                                               app_settings.arena_depth_m);
+          save_app_settings(app_settings);
+          arena_status = "Loaded " + arena_bundle.DesignName() + " from Fusion.";
+          arena_model_reload_requested = true;
+        } else {
+          arena_status = "Arena import: " + arena_bundle.Error();
+        }
+      }
+      if (arena_bundle.HasBundle()) {
+        ImGui::SameLine();
+        if (ImGui::Button("Use built-in arena")) {
+          arena_bundle.Clear();
+          app_settings.arena_manifest_path.clear();
+          app_settings.arena_width_m = app_settings.arena_depth_m = app_settings.arena_size_m;
+          arena_manifest_path_field[0] = '\0';
+          save_app_settings(app_settings);
+          arena_status = "Using the built-in arena.";
+          arena_model_reload_requested = true;
+        }
+      }
+      if (spawn_locked) ImGui::EndDisabled();
+      if (arena_bundle.HasBundle()) {
+        ImGui::TextWrapped("%s: %d CAD bodies; each body becomes a static arena collider.",
+                           arena_bundle.DesignName().c_str(), arena_bundle.PartCount());
+        if (ImGui::TreeNode("Fusion material friction estimates")) {
+          for (int part_index = 0; part_index < arena_bundle.PartCount(); ++part_index) {
+            const CadPart* part = arena_bundle.PartAt(part_index);
+            if (part)
+              ImGui::BulletText("%s | %s | mu %.2f | %s", part->name.c_str(),
+                                part->material.c_str(), part->friction,
+                                part->friction_source.c_str());
+          }
+          ImGui::TreePop();
+        }
+        ImGui::TextDisabled("Mesh collision uses a convex hull per body. Keep floor and wall panels as separate solid bodies.");
+        ImGui::TextDisabled("Pair friction = sqrt(robot surface estimate x arena surface estimate).");
+      }
+      if (!arena_status.empty())
+        ImGui::TextColored(arena_bundle.HasBundle() ? ui_green : ui_amber,
+                           "%s", arena_status.c_str());
       ImGui::SeparatorText("Arena size");
+      if (arena_bundle.HasBundle()) {
+        ImGui::Text("CAD bounds: %.2f m wide × %.2f m deep",
+                    app_settings.arena_width_m, app_settings.arena_depth_m);
+        ImGui::TextDisabled("Imported geometry keeps its Fusion dimensions. The size preset applies to the built-in arena.");
+        ImGui::BeginDisabled();
+      }
       ImGui::TextWrapped("The arena is square. This sets the inside floor and wall-to-wall side length in meters.");
       const float previous_arena_size_m = app_settings.arena_size_m;
       bool arena_size_changed = false;
@@ -5422,16 +6413,18 @@ int main(int argc, char** argv) {
       }
       ImGui::EndDisabled();
       if (!arena_preset_status.empty()) ImGui::TextColored(ui_green, "%s", arena_preset_status.c_str());
+      if (arena_bundle.HasBundle()) ImGui::EndDisabled();
       if (spawn_locked) ImGui::EndDisabled();
       if (spawn_locked)
         ImGui::TextDisabled("Arena settings are locked while a LAN match is connected.");
       if (arena_size_changed) {
         app_settings.arena_size_m = float(clamp_arena_size_m(app_settings.arena_size_m));
+        app_settings.arena_width_m = app_settings.arena_depth_m = app_settings.arena_size_m;
         apply_arena_size(model, app_settings.arena_size_m);
         // The visible floor and arena boundaries use primitive boxes, so the next
         // scene update picks up their new dimensions without rebuilding renderer resources.
         apply_arena_spawn_layout(model, data, app_settings.spawn_layout,
-                                 app_settings.arena_size_m);
+                                 app_settings.arena_size_m, &app_settings);
         if (previous_arena_size_m > 0.0f)
           camera.distance = std::clamp(camera.distance * app_settings.arena_size_m /
                                         previous_arena_size_m, 0.5, 15.0);
@@ -5447,7 +6440,8 @@ int main(int argc, char** argv) {
         ? "Opposite ends of center line" : "Opposite arena diagonals";
       ImGui::SetNextItemWidth(std::min(480.0f, panel_width - 40.0f));
       bool spawn_changed = false;
-      if (spawn_locked) ImGui::BeginDisabled();
+      const bool layout_locked = spawn_locked || app_settings.custom_spawn_enabled;
+      if (layout_locked) ImGui::BeginDisabled();
       if (ImGui::BeginCombo("Spawn layout", spawn_label)) {
         if (ImGui::Selectable("Opposite ends of center line", app_settings.spawn_layout == 0)) {
           spawn_changed = app_settings.spawn_layout != 0;
@@ -5459,21 +6453,74 @@ int main(int argc, char** argv) {
         }
         ImGui::EndCombo();
       }
-      if (spawn_locked) ImGui::EndDisabled();
+      if (layout_locked) ImGui::EndDisabled();
       if (spawn_locked)
         ImGui::TextDisabled("Spawn layout is locked while a LAN model is loaded.");
       if (spawn_changed) {
         save_app_settings(app_settings);
         apply_arena_spawn_layout(model, data, app_settings.spawn_layout,
-                                 app_settings.arena_size_m);
+                                 app_settings.arena_size_m, &app_settings);
         controls.weapon_command = 0.0;
         opponent_controls.weapon_command = 0.0;
         controls.filtered_wheel_speeds.clear();
         opponent_controls.filtered_wheel_speeds.clear();
       }
-      ImGui::TextWrapped(app_settings.spawn_layout == 0
-        ? "Bots start on opposite ends of the arena's center line, facing each other."
-        : "Bots start at opposite diagonal positions and turn together to face across the arena.");
+      bool custom_spawn_changed = false;
+      if (spawn_locked) ImGui::BeginDisabled();
+      custom_spawn_changed = ImGui::Checkbox("Use custom bot starting poses",
+                                             &app_settings.custom_spawn_enabled);
+      if (spawn_locked) ImGui::EndDisabled();
+      if (app_settings.custom_spawn_enabled) {
+        ImGui::TextDisabled("Positions are bot footprint centers in arena meters. Heading is added to each bot's normal facing direction.");
+        float player_xy[2] = {app_settings.player_spawn_xy_m[0],
+                              app_settings.player_spawn_xy_m[1]};
+        float opponent_xy[2] = {app_settings.opponent_spawn_xy_m[0],
+                                app_settings.opponent_spawn_xy_m[1]};
+        bool pose_changed = custom_spawn_changed;
+        bool apply_spawn_now = custom_spawn_changed;
+        if (spawn_locked) ImGui::BeginDisabled();
+        pose_changed |= ImGui::InputFloat2("Player X / Y (m)", player_xy, "%.2f");
+        pose_changed |= ImGui::SliderFloat("Player heading offset (deg)",
+          &app_settings.player_spawn_yaw_offset_deg, -180.0f, 180.0f, "%.0f deg");
+        pose_changed |= ImGui::InputFloat2("Opponent X / Y (m)", opponent_xy, "%.2f");
+        pose_changed |= ImGui::SliderFloat("Opponent heading offset (deg)",
+          &app_settings.opponent_spawn_yaw_offset_deg, -180.0f, 180.0f, "%.0f deg");
+        if (spawn_locked) ImGui::EndDisabled();
+        if (pose_changed) {
+          app_settings.player_spawn_xy_m = {
+            std::clamp(player_xy[0], -100.0f, 100.0f),
+            std::clamp(player_xy[1], -100.0f, 100.0f)};
+          app_settings.opponent_spawn_xy_m = {
+            std::clamp(opponent_xy[0], -100.0f, 100.0f),
+            std::clamp(opponent_xy[1], -100.0f, 100.0f)};
+          app_settings.player_spawn_yaw_offset_deg = std::clamp(
+            app_settings.player_spawn_yaw_offset_deg, -360.0f, 360.0f);
+          app_settings.opponent_spawn_yaw_offset_deg = std::clamp(
+            app_settings.opponent_spawn_yaw_offset_deg, -360.0f, 360.0f);
+          save_app_settings(app_settings);
+        }
+        if (spawn_locked) ImGui::BeginDisabled();
+        apply_spawn_now |= ImGui::Button("Apply starting positions and reset", ImVec2(280.0f, 34.0f));
+        if (spawn_locked) ImGui::EndDisabled();
+        if (apply_spawn_now) {
+          apply_arena_spawn_layout(model, data, app_settings.spawn_layout,
+                                   app_settings.arena_size_m, &app_settings);
+          paused = true;
+          controls.weapon_command = 0.0;
+          opponent_controls.weapon_command = 0.0;
+          controls.filtered_wheel_speeds.clear();
+          opponent_controls.filtered_wheel_speeds.clear();
+        }
+      } else {
+        ImGui::TextWrapped(app_settings.spawn_layout == 0
+          ? "Bots start on opposite ends of the arena's center line, facing each other."
+          : "Bots start at opposite diagonal positions and turn together to face across the arena.");
+        if (custom_spawn_changed) {
+          save_app_settings(app_settings);
+          apply_arena_spawn_layout(model, data, app_settings.spawn_layout,
+                                   app_settings.arena_size_m, &app_settings);
+        }
+      }
       } else {
       ImGui::TextColored(ui_blue, "GRAPHICS SETTINGS");
       ImGui::TextDisabled("Renderer changes restart CombatSim and reopen the current model.");
@@ -5523,7 +6570,9 @@ int main(int argc, char** argv) {
             app_settings.renderer = default_renderer_id;
           } else if (!launch_renderer_build(app_settings.renderer, model_path,
                                              graphics_status, player_manifest,
-                                             opponent_manifest)) {
+                                             opponent_manifest,
+                                             arena_bundle.ManifestPath(),
+                                             base_model_path)) {
             app_settings.renderer = default_renderer_id;
             save_app_settings(app_settings);
           } else {
@@ -5620,7 +6669,7 @@ int main(int argc, char** argv) {
       if (lan_client) ImGui::BeginDisabled();
       if (ImGui::Button("Reset robot", ImVec2(132, 40))) {
         apply_arena_spawn_layout(model, data, app_settings.spawn_layout,
-                                 app_settings.arena_size_m);
+                                 app_settings.arena_size_m, &app_settings);
         controls.weapon_command = 0.0;
         controls.filtered_wheel_speeds.clear();
         opponent_controls.filtered_wheel_speeds.clear();
@@ -5742,6 +6791,20 @@ int main(int argc, char** argv) {
       const bool weapon_torque_enabled = weapon_uses_torque_model(telemetry_controls);
       const double weapon_rpm_limit = weapon_torque_enabled
         ? weapon_no_load_rpm(telemetry_controls) : telemetry_controls.weapon_rpm;
+      auto draw_impact_failures = [&](const char* owner, const Controls& monitored) {
+        for (const auto& [actuator_id, peak_force] : monitored.impact_failures) {
+          const char* actuator_name = mj_id2name(model, mjOBJ_ACTUATOR, actuator_id);
+          ImGui::TextColored(ui_red, "%s DISABLED  %s  |  peak contact %.0f N",
+            owner, actuator_name ? actuator_name : "assembly actuator", peak_force);
+        }
+      };
+      draw_impact_failures(local_bot_is_guest ? "YOUR BOT" : "PLAYER BOT",
+                           telemetry_controls);
+      if (!local_bot_is_guest) draw_impact_failures("OPPONENT", opponent_controls);
+      if (telemetry_controls.battery_voltage > 0.0)
+        ImGui::Text("Estimated pack: %.2f / %.2f V  |  %.1f A",
+          telemetry_controls.battery_operating_voltage,
+          telemetry_controls.battery_voltage, telemetry_controls.battery_last_current_a);
       if (local_bot_is_guest) {
         ImGui::TextDisabled("Host runs physics; these live RPMs are for your bot.");
         if (weapon_torque_enabled) {
@@ -5762,9 +6825,9 @@ int main(int argc, char** argv) {
           ImGui::TextWrapped("Override uses a speed servo and bypasses drive motor torque. Set 4000 RPM here for a forced-speed check.");
         } else {
           const auto left_estimate = side_motor_speed_estimate(telemetry_controls.left,
-            telemetry_controls.motor_models, telemetry_controls.battery_voltage);
+            telemetry_controls.motor_models, telemetry_controls.battery_operating_voltage);
           const auto right_estimate = side_motor_speed_estimate(telemetry_controls.right,
-            telemetry_controls.motor_models, telemetry_controls.battery_voltage);
+            telemetry_controls.motor_models, telemetry_controls.battery_operating_voltage);
           ImGui::Text("Motor no-load estimate  L %.0f | R %.0f RPM",
                       left_estimate.rpm, right_estimate.rpm);
           if (left_estimate.modeled_wheels == 0 || right_estimate.modeled_wheels == 0)
@@ -5824,10 +6887,12 @@ int main(int argc, char** argv) {
             ImGui::TextDisabled("SLIP UNKNOWN");
           } else if (!slip.has_ground_contact) {
             ImGui::TextColored(ui_amber, "AIRBORNE");
-          } else if (slip.speed > 0.18) {
-            ImGui::TextColored(ui_red, "SLIPPING  %.2f m/s", slip.speed);
+          } else if (slip.ratio > 0.15) {
+            ImGui::TextColored(ui_red, "LONG SLIP %.0f%% | SIDE %.2f m/s",
+                               slip.ratio * 100.0, slip.lateral_speed);
           } else {
-            ImGui::TextColored(ui_green, "GRIP  %.2f m/s", slip.speed);
+            ImGui::TextColored(ui_green, "GRIP %.0f%% | SIDE %.2f m/s",
+                               (1.0 - slip.ratio) * 100.0, slip.lateral_speed);
           }
         }
         if (valid) ImGui::TextColored(ui_ink,
@@ -5835,7 +6900,7 @@ int main(int argc, char** argv) {
       };
       draw_wheel_telemetry("Left", telemetry_controls.left);
       draw_wheel_telemetry("Right", telemetry_controls.right);
-      ImGui::TextWrapped("Wheel slip compares tread motion with the floor at each contact patch. Slip is flagged above 0.18 m/s.");
+      ImGui::TextWrapped("Longitudinal slip compares forward contact-patch speed with wheel tread speed; above 15%% is flagged. Side speed is shown separately, so ordinary skid-steer turning is not labeled as longitudinal wheelspin. This is telemetry only; MuJoCo's contact model determines tire forces.");
       ImGui::SeparatorText("Controls");
       ImGui::TextWrapped("W / S drive forward and reverse. A / D steer; with no throttle, both sides counter-rotate for a spot turn. Hold Space to spin the weapon.");
       ImGui::TextWrapped("Open Controller mixer to map USB joystick channels and tune motor/weapon mixes.");
@@ -5905,6 +6970,32 @@ int main(int argc, char** argv) {
         ImGui::TextWrapped("%s", replay_label.c_str());
         ImGui::TextDisabled("%.2f s  |  %zu poses  |  up to %.0f samples/s",
           fight_replay.Duration(), fight_replay.FrameCount(), fight_replay.SampleRate());
+        if (fight_replay.CanResimulate() && !fight_replay.IsResimulating()) {
+          if (ImGui::Button("Re-simulate recorded inputs", ImVec2(240.0f, 34.0f))) {
+            std::string error;
+            if (replay_resimulation_data) mj_deleteData(replay_resimulation_data);
+            replay_resimulation_data = mj_makeData(replay_model);
+            if (replay_resimulation_data &&
+                fight_replay.BeginResimulation(replay_model, replay_resimulation_data, error)) {
+              replay_position = 0.0f;
+              replay_playing = false;
+              replay_status = "Re-running the recorded actuator inputs through MuJoCo...";
+            } else {
+              if (replay_resimulation_data) mj_deleteData(replay_resimulation_data);
+              replay_resimulation_data = nullptr;
+              if (error.empty()) error = "Could not allocate a temporary physics state.";
+              replay_status = error;
+            }
+          }
+          if (fight_replay.IsResimulated())
+            ImGui::TextColored(ui_green, "Re-simulated physics trajectory active.");
+        }
+        if (fight_replay.IsResimulating()) {
+          ImGui::ProgressBar(float(fight_replay.ResimulationProgress()),
+                             ImVec2(-1.0f, 12.0f), "Re-simulating recorded controls");
+        } else if (!fight_replay.CanResimulate()) {
+          ImGui::TextDisabled("This replay contains poses only; its format has no input trace.");
+        }
         if (ImGui::Button(replay_playing ? "Pause" : "Play", ImVec2(92.0f, 34.0f)))
           replay_playing = !replay_playing && replay_position < fight_replay.Duration();
         ImGui::SameLine();
@@ -6044,11 +7135,14 @@ int main(int argc, char** argv) {
         ImGui::TextWrapped("Opponent modules use their own saved setup and actuators. In Drive, I/K move it forward/back, J/L turn it, and M spins its weapon.");
       }
       ImGui::Separator();
-      setup_bundle->Draw(window, load_requested, apply_requested);
+      setup_bundle->Draw(window, load_requested, apply_requested,
+                         prepared_model_pending);
       if (config_bot == 1 && load_requested && opponent_bundle.HasBundle())
         apply_requested = true;
       if (!runtime_error.empty()) ImGui::TextColored(ui_red,
                                                        "Model message: %s", runtime_error.c_str());
+      if (prepared_model_pending)
+        ImGui::TextColored(ui_accent, "Building model in background; the arena remains responsive.");
       ImGui::PopTextWrapPos();
       ImGui::EndChild();
       ImGui::PopStyleColor();
@@ -6124,11 +7218,17 @@ int main(int argc, char** argv) {
           glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, preview_width, preview_height, 0,
                        GL_RGB, GL_UNSIGNED_BYTE, nullptr);
         }
-        for (int i = 0; i < setup_model->ngeom; ++i)
-          setup_model->geom_group[i] = setup_bundle->PreviewVisible(i) ? 0 : 5;
-        options.geomgroup[5] = 0;
+        const bool show_collision_shape = setup_bundle->ShowCollisionHulls();
+        SetFusionPreviewGeomGroups(setup_model, *setup_bundle, show_collision_shape);
         apply_arena_lighting(setup_model, app_settings);
-        mjv_updateScene(setup_model, setup_data, &options, nullptr, &setup_camera, mjCAT_ALL, &setup_scene);
+        mjvOption setup_options = options;
+        setup_options.geomgroup[4] = 0;
+        setup_options.geomgroup[5] = show_collision_shape ? 1 : 0;
+        // Let MuJoCo choose the hull mesh data for these scene geoms. Editing
+        // mjvGeom::dataid after scene creation can point the renderer at an
+        // uninitialized hull buffer and make the whole CAD preview disappear.
+        setup_options.flags[mjVIS_CONVEXHULL] = show_collision_shape;
+        mjv_updateScene(setup_model, setup_data, &setup_options, nullptr, &setup_camera, mjCAT_ALL, &setup_scene);
         const ImVec2 canvas_min = ImGui::GetCursorScreenPos();
         const ImVec2 mouse = ImGui::GetIO().MousePos;
         const bool mouse_on_canvas = ImGui::IsWindowHovered() &&
@@ -6137,7 +7237,7 @@ int main(int argc, char** argv) {
         if (mouse_on_canvas && !ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
             !ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
           mjtNum hit[3];
-          const int part = SelectPreviewPartForHover(setup_model, setup_data, &options,
+          const int part = SelectPreviewPartForHover(setup_model, setup_data, &setup_options,
             double(preview_width)/preview_height,
             (mouse.x-canvas_min.x)/preview_width,
             1.0-(mouse.y-canvas_min.y)/preview_height,
@@ -6147,7 +7247,8 @@ int main(int argc, char** argv) {
         if (!setup_bundle->AxisPicking()) {
           const int selected = setup_bundle->SelectedPart();
           for (int highlight : {setup_bundle->HoveredPart(), selected}) if (highlight >= 0) {
-            const std::string name = "cad_part_" + std::to_string(highlight);
+            const std::string name = std::string(show_collision_shape ? "cad_part_" : "cad_visual_") +
+                                     std::to_string(highlight);
             const int geom_id = mj_name2id(setup_model, mjOBJ_GEOM, name.c_str());
             for (int i = 0; i < setup_scene.ngeom; ++i)
               if (setup_scene.geoms[i].objtype == mjOBJ_GEOM && setup_scene.geoms[i].objid == geom_id) {
@@ -6363,6 +7464,15 @@ int main(int argc, char** argv) {
             end_lan_session();
         }
         ImGui::Separator();
+        if (ImGui::Button("Set up online service", ImVec2(210.0f, 34.0f))) {
+          std::string setup_error;
+          if (!launch_signaling_service_setup(setup_error)) runtime_error = setup_error;
+          else runtime_error.clear();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("One-time owner setup; opens browser sign-in and deploy.");
+        ImGui::TextWrapped("Online matches are not available yet: this build's match transport is still LAN TCP. The setup service only coordinates peers; the direct internet data-channel transport still needs to be added.");
+        ImGui::Separator();
         ImGui::TextWrapped("CAD packages are encrypted in transit and received meshes are loaded in RAM without extracting files. This prevents ordinary bundle-file browsing; a determined peer can still inspect geometry from process memory or the rendered model, so it is not copy-proof or anti-cheat.");
         ImGui::TextDisabled("For the first LAN version, both PCs must be on a reachable network. It does not relay through the internet or configure router port forwarding.");
         if (!runtime_error.empty())
@@ -6436,16 +7546,55 @@ int main(int argc, char** argv) {
         }
       } else if (setup_bundle->HasBundle()) runtime_error = setup_bundle->Error();
     }
+    if (arena_model_reload_requested) {
+      arena_model_reload_requested = false;
+      if (lan_bundle_swapped || lan_connected) {
+        runtime_error = "End the LAN match before changing the arena.";
+      } else if (schedule_active_scene_rebuild()) {
+        arena_status = arena_bundle.HasBundle()
+          ? "Building the imported CAD arena..."
+          : "Restoring the built-in arena...";
+        runtime_error.clear();
+      } else {
+        arena_status = "Arena update failed: " + runtime_error;
+      }
+    }
     if (apply_requested) {
       if (lan_bundle_swapped)
         runtime_error = "End the LAN match before changing the shared bot model.";
-      else
-        rebuild_configured_model(false);
+      else if (prepared_model_pending)
+        runtime_error = "A model build is already in progress.";
+      else {
+        runtime_error.clear();
+        std::filesystem::path generated;
+        if (!bundle.Generate(generated,
+              opponent_bundle.HasBundle() ? &opponent_bundle : nullptr)) {
+          runtime_error = bundle.Error();
+        } else {
+          if (arena_bundle.HasBundle()) {
+            std::filesystem::path combined;
+            if (write_arena_scene_file(generated, arena_bundle, combined, runtime_error))
+              generated = combined;
+          }
+          if (runtime_error.empty() && start_prepared_model_build(generated))
+            runtime_error.clear();
+        }
+      }
     }
     ImGui::Render(); ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     SDL_GL_SwapWindow(window);
   }
 
+  if (prepared_model_future.valid()) {
+    try {
+      PreparedModel unfinished = prepared_model_future.get();
+      if (unfinished.data) mj_deleteData(unfinished.data);
+      if (unfinished.model) mj_deleteModel(unfinished.model);
+    } catch (const std::exception& error) {
+      std::fprintf(stderr, "Background model compilation failed during shutdown: %s\n",
+                   error.what());
+    }
+  }
   finish_recording();
   if (fight_replay.HasReplay() && loaded_replay_path.empty())
     std::fprintf(stderr, "Could not save the active fight replay: %s\n",
@@ -6465,6 +7614,7 @@ int main(int argc, char** argv) {
   }
   mjr_freeContext(&replay_context); mjv_freeScene(&replay_scene);
   if (replay_data) mj_deleteData(replay_data);
+  if (replay_resimulation_data) mj_deleteData(replay_resimulation_data);
   if (replay_model) mj_deleteModel(replay_model);
   mjr_freeContext(&context); mjv_freeScene(&scene);
   SDL_GL_DestroyContext(gl); SDL_DestroyWindow(window); SDL_Quit();

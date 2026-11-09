@@ -45,10 +45,10 @@ visibility. It does not replace or modify the original CAD design.
 
 ## Mesh and appearance notes
 
-- The STL is used for physics collision and picking. MuJoCo evaluates its
-  triangle surface through a signed-distance collider so concave details and
-  holes are retained. The OBJ carries render normals and UVs for smoother
-  appearance and texture mapping.
+- The STL is used for physics collision and picking. Each body gets a convex
+  collision hull; holes and deep recesses fill in that hull, so keep separate
+  CAD bodies for surfaces that need independent contact. The OBJ carries render
+  normals and UVs for smoother appearance and texture mapping.
 - Fusion color, normal, and roughness maps are copied when the exporter can
   resolve them. Face-level appearances within one body are not all preserved.
 - Older STL-only bundles with Fusion-native transforms can still load, but do
@@ -64,3 +64,40 @@ The robot mass readout combines the imported CAD bodies and configured
 mechanisms. If the same physical wheel or weapon is present both in the CAD
 assembly and as a stock mechanism, exclude the duplicate CAD bodies before
 applying the model.
+
+## Import a custom arena
+
+1. Build the arena as separate solid bodies in Fusion: a floor slab, individual
+   wall panels, and any other physical surfaces. Set the design origin at the
+   center of the floor and place the floor top at **Z = 0**.
+2. Run **CombatSimExport** for that design and keep its complete output folder.
+3. Open **Settings > Arena settings**, choose **Browse arena CAD...**, select the
+   exported `manifest.json`, and load it. Every exported solid becomes a static
+   arena surface. The CAD bounds set the arena dimensions.
+4. Set player and opponent X/Y spawn centers and heading offsets under **Bot
+   starting positions**. Positions are meters from the arena origin. Enter
+   centers inside the walkable area; the simulator clamps them to the arena
+   bounds and each robot's footprint. These values are saved with the other
+   application settings.
+
+Arena mesh collisions use one convex hull per Fusion body, so model each wall
+and the floor as its own body. The imported arena replaces the built-in floor,
+walls, and roof; include a roof body if the custom arena should have one. The
+exporter checks a custom Fusion physical material property whose name contains
+“friction” first. Fusion's standard
+physical properties do not include a friction coefficient, so otherwise the
+exporter estimates one from the material name (for example plywood/laminate
+0.75 and polycarbonate/acrylic 0.40). The arena settings show whether each
+value came from a custom Fusion property or a material-name estimate. The
+arena and robot surface estimates combine by geometric mean for each contact.
+
+## Weapon collision proxies
+
+MuJoCo uses a convex hull for each STL body. To approximate a concave weapon,
+add several simple convex solid bodies to the Fusion design and name each one
+with the prefix `CollisionProxy_` (for example `CollisionProxy_BladeA`). Export
+them with the rest of the robot, then assign each proxy to the same rigid
+assembly as the weapon in KineticArena. Proxy bodies contribute no mass and do
+not appear in the fight render. Disable collision on the detailed weapon bodies
+that the proxies replace; otherwise both shapes collide. Use enough proxies to
+follow the blade or drum outline without creating many tiny collision pieces.

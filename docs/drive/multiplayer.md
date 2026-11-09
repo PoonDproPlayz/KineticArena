@@ -54,3 +54,17 @@ anti-cheat system.
 There is no internet relay, NAT traversal, router port-forwarding setup, or host
 migration. The two computers must be able to connect directly over the LAN or
 another network with a route between them.
+
+## Online service setup status
+
+The multiplayer window includes **Set up online service**. It opens the bundled
+one-time Cloudflare Worker deployment flow; the project owner creates or signs
+in to a free Cloudflare account in the browser and approves deployment. Node.js
+is installed through WinGet if it is missing. Players will not need Cloudflare
+accounts once an online transport is available.
+
+This setup currently deploys only the signaling Worker. KineticArena's match
+connection is still TCP and only works when the computers can reach each other
+directly. Internet host/join codes are not available until the WebRTC data
+channel transport is implemented. The in-app message calls this out so deploying
+the service is not mistaken for enabling WAN matches.

@@ -46,12 +46,11 @@ voltage recovery, wiring, winding heating, or thermal derating. Estimated
 current is approximate, so use measured pack data for calibration.
 
 Each imported part can be excluded from collision while remaining visible and
-mass-bearing. Fusion-imported collisions use an STL-backed signed-distance
-shape, preserving the mesh's concave cuts and holes instead of replacing the
-part with one convex hull. The contact solver approximates contact points from
-that surface; watertight STL bodies give the most reliable inside/outside
-classification. **Show STL collision shape** temporarily shows the collision
-mesh in place of the smoother render mesh.
+mass-bearing. MuJoCo uses a convex hull for each imported collision body, so
+holes and deep concave cuts are filled. A weapon can use several
+`CollisionProxy_` helper bodies to approximate its shape with multiple convex
+pieces; see [Fusion import](fusion-import.md#weapon-collision-proxies).
+**Show STL collision shape** displays the collision hulls in the CAD preview.
 
 ## What the motor model changes
 

@@ -41,6 +41,9 @@ struct MotorSpec {
   MotorType type = MotorType::Brushless;
   MotorSpeedInput speed_input = MotorSpeedInput::Kv;
   int drive_group = 0;                // Wheel assemblies sharing one motor bank.
+  bool couple_wheels = true;          // Constrain wheels sharing this physical drivetrain.
+  double bearing_drag_torque_nm = 0.0;
+  double aerodynamic_drag_nm_per_rad2 = 0.0;
   int motor_count = 1;
   double kv_rpm_per_volt = 0.0;
   double rated_rpm = 0.0;
@@ -57,6 +60,10 @@ double MotorNoLoadOutputRpm(const MotorSpec& motor, double battery_voltage);
 double MotorKvRpmPerVolt(const MotorSpec& motor);
 double MotorOutputTorque(const MotorSpec& motor, double battery_voltage,
                          double desired_output_speed, double actual_output_speed);
+double MotorPhaseCurrent(const MotorSpec& motor, double battery_voltage,
+                         double desired_output_speed, double actual_output_speed);
+double BatteryLoadedVoltage(double nominal_voltage, double internal_resistance_ohm,
+                            double estimated_pack_current_a);
 double EstimateMotorSpinupSeconds(const MotorSpec& motor, double battery_voltage,
                                   double axis_inertia, double target_fraction = 0.9);
 
@@ -77,6 +84,7 @@ struct CadPart {
   std::vector<Texture> textures;
   std::vector<std::string> occurrence_path;
   std::string material;
+  std::string friction_source = "material estimate";
   std::string appearance;
   std::vector<std::string> material_properties;
   double density = 0.0;
@@ -111,6 +119,7 @@ struct CadPart {
   int assembly = 0;  // -1 excludes this body.
   bool preview_visible = true;
   bool collision_enabled = true;
+  bool collision_only = false;  // Helper proxy contributes no mass or rendered geometry.
 };
 
 struct MemoryBundleAsset {
@@ -126,6 +135,8 @@ struct CadAssembly {
   // Passive fork hinge limits relative to the imported CAD pose.
   std::array<double, 2> fork_range_degrees{-90, 90};
   bool fork_collides_with_frame = true;
+  // Zero disables the optional actuator failure trigger for this assembly.
+  double impact_failure_threshold_n = 0.0;
   std::string wheel_position;
   MotorSpec motor;
 };
@@ -141,15 +152,20 @@ class FusionBundle {
   bool GenerateInMemory(std::string& xml, std::vector<MemoryBundleAsset>& assets,
                         FusionBundle* opponent = nullptr);
   bool GeneratePreview(std::filesystem::path& output);
+  bool InjectArenaIntoMjcf(std::string& model_xml,
+                           std::vector<MemoryBundleAsset>* assets = nullptr);
   bool SetForkCount(int count);
   bool AssemblyEnabled(int assembly) const;
   bool PartIncludedInSimulation(int part_index) const;
   DriveLayout WheelDriveLayout() const { return drive_layout_; }
   void SetWheelDriveLayout(DriveLayout layout);
   bool ShowAxisMarkers() const { return show_axis_markers_; }
+  bool ShowCollisionHulls() const { return show_collision_hulls_; }
+  void SetShowCollisionHulls(bool show) { show_collision_hulls_ = show; }
   const std::string& TwoWheelDriveAxle() const { return two_wd_axle_; }
   void SetTwoWheelDriveAxle(const std::string& axle);
-  void Draw(SDL_Window* window, bool& load_requested, bool& apply_requested);
+  void Draw(SDL_Window* window, bool& load_requested, bool& apply_requested,
+            bool model_build_busy = false);
   void DrawImporter(SDL_Window* window, bool& changed);
   void Clear();
   void DrawAxisSelectionControls();
@@ -179,6 +195,9 @@ class FusionBundle {
   bool IsForkPart(int part_index) const;
   double EstimatedWeaponSpinupSeconds() const;
   const CadAssembly& Assembly(int index) const { return assemblies_.at(index); }
+  const CadPart* PartAt(int part_index) const {
+    return part_index >= 0 && part_index < int(parts_.size()) ? &parts_[part_index] : nullptr;
+  }
   void PickEdge(int part_index, const std::array<double, 3>& cad_point);
   int SelectedPart() const { return selected_part_; }
   int HoveredPart() const { return hovered_part_; }
@@ -187,6 +206,7 @@ class FusionBundle {
   }
   size_t HoveredLoopPoints() const { return hovered_loop_.size(); }
   std::array<double, 3> PreviewCenter() const;
+  std::array<double, 3> PreviewSize() const;
   double PreviewDistance() const;
   void BindControls(const mjModel* model, std::vector<std::pair<int, double>>& left,
                     std::vector<std::pair<int, double>>& right,
@@ -194,6 +214,10 @@ class FusionBundle {
                     std::map<int, MotorSpec>& weapon_motor_models,
                     std::map<int, int>& manual_velocity_actuators,
                     double& battery_voltage, bool opponent = false) const;
+  void BindImpactFailures(const mjModel* model,
+                          std::map<int, double>& geom_thresholds,
+                          std::map<int, int>& geom_actuators,
+                          bool opponent = false) const;
   void PickFace(int part_index, const std::array<double, 3>& cad_point);
   void AddAxisMarkers(const mjModel* model, const mjData* data, mjvScene& scene,
                       bool opponent = false) const;
@@ -208,6 +232,7 @@ class FusionBundle {
   void DiscardSessionMeshBuffers();
   const std::string& PickMessage() const { return pick_message_; }
   double& BatteryVoltage() { return battery_voltage_; }
+  double BatteryInternalResistanceOhm() const { return battery_internal_resistance_ohm_; }
   double BotRotationDegrees() const { return bot_rotation_degrees_; }
 
  private:
@@ -222,10 +247,12 @@ class FusionBundle {
   std::vector<CadPart> parts_;
   std::vector<CadAssembly> assemblies_;
   double battery_voltage_ = 0.0;
+  double battery_internal_resistance_ohm_ = 0.0;
   double bot_rotation_degrees_ = 0.0;
   DriveLayout drive_layout_ = DriveLayout::FourWheel;
   std::string two_wd_axle_ = "front";
   bool show_axis_markers_ = true;
+  bool show_collision_hulls_ = false;
   char path_buffer_[1024]{};
   int selected_part_ = -1;
   int focus_part_request_ = -1;

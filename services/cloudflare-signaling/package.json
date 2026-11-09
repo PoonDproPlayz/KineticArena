@@ -1,0 +1,13 @@
+{
+  "name": "kineticarena-signaling",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Short-lived WebRTC signaling rooms for KineticArena peer-to-peer matches.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

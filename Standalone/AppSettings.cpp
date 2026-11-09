@@ -35,6 +35,32 @@ void load_app_settings(AppSettings& settings) {
     settings.spawn_layout = std::clamp(saved.value("spawnLayout", settings.spawn_layout), 0, 1);
     settings.arena_size_m = std::clamp(saved.value("arenaSizeM", settings.arena_size_m),
                                        min_arena_size_m, max_arena_size_m);
+    settings.arena_manifest_path = saved.value("arenaManifestPath", std::string());
+    settings.arena_width_m = std::clamp(
+      saved.value("arenaWidthM", settings.arena_size_m), 0.1f, 100.0f);
+    settings.arena_depth_m = std::clamp(
+      saved.value("arenaDepthM", settings.arena_size_m), 0.1f, 100.0f);
+    if (settings.arena_manifest_path.empty())
+      settings.arena_width_m = settings.arena_depth_m = settings.arena_size_m;
+    settings.custom_spawn_enabled = saved.value("customSpawnEnabled", false);
+    auto read_xy = [&](const char* key, std::array<float, 2>& xy) {
+      const auto value = saved.find(key);
+      if (value == saved.end() || !value->is_array() || value->size() != 2) return;
+      for (size_t axis = 0; axis < 2; ++axis) {
+        if (!(*value)[axis].is_number()) return;
+        const float coordinate = (*value)[axis].get<float>();
+        if (!std::isfinite(coordinate)) return;
+        xy[axis] = std::clamp(coordinate, -100.0f, 100.0f);
+      }
+    };
+    read_xy("playerSpawnXYM", settings.player_spawn_xy_m);
+    read_xy("opponentSpawnXYM", settings.opponent_spawn_xy_m);
+    settings.player_spawn_yaw_offset_deg = std::clamp(
+      saved.value("playerSpawnYawOffsetDeg", settings.player_spawn_yaw_offset_deg),
+      -360.0f, 360.0f);
+    settings.opponent_spawn_yaw_offset_deg = std::clamp(
+      saved.value("opponentSpawnYawOffsetDeg", settings.opponent_spawn_yaw_offset_deg),
+      -360.0f, 360.0f);
 
     const auto presets = saved.find("arenaPresets");
     if (presets != saved.end() && presets->is_array()) {
@@ -81,6 +107,14 @@ bool save_app_settings(const AppSettings& settings) {
     const json saved{{"lightingVersion", 1}, {"renderer", settings.renderer},
       {"spawnLayout", settings.spawn_layout},
       {"arenaSizeM", settings.arena_size_m},
+      {"arenaWidthM", settings.arena_width_m},
+      {"arenaDepthM", settings.arena_depth_m},
+      {"arenaManifestPath", settings.arena_manifest_path},
+      {"customSpawnEnabled", settings.custom_spawn_enabled},
+      {"playerSpawnXYM", settings.player_spawn_xy_m},
+      {"opponentSpawnXYM", settings.opponent_spawn_xy_m},
+      {"playerSpawnYawOffsetDeg", settings.player_spawn_yaw_offset_deg},
+      {"opponentSpawnYawOffsetDeg", settings.opponent_spawn_yaw_offset_deg},
       {"arenaPresets", std::move(arena_presets)},
       {"ambientLight", settings.ambient_light}, {"keyLight", settings.key_light},
       {"fillLight", settings.fill_light}, {"cameraFill", settings.camera_fill}};

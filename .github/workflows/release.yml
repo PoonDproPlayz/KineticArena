@@ -65,7 +65,7 @@ jobs:
             -OutputDirectory .\Standalone\release-output `
             -MujocoRoot $env:MUJOCO_ROOT
 
-      - name: Create GitHub Release and upload ZIP
+      - name: Create GitHub Release and upload ZIP assets
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

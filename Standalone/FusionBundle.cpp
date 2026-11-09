@@ -28,6 +28,13 @@ using Vec3 = std::array<double, 3>;
 using Quat = std::array<double, 4>;
 using Mat3 = std::array<double, 9>;
 
+// Generic arena defaults from available material tests: rubber against a
+// fabric-backed laminate/plywood measured about 0.70 dynamic / 0.78 static;
+// steel/polycarbonate measurements were about 0.35-0.45 in one direction.
+// Use a single midpoint estimate because imported robot contact materials vary.
+constexpr double kArenaFloorFriction = 0.75;
+constexpr double kArenaWallFriction = 0.40;
+
 bool RefreshPrintEstimate(CadPart& part);
 
 void Wipe(std::vector<unsigned char>& bytes) {
@@ -115,7 +122,7 @@ bool HasTransparentAppearanceHint(const CadPart& part) {
 }
 
 void RepairInvisibleOpaquePartColor(CadPart& part) {
-  if (part.color[3] <= 0.0 && part.mass > 0.0 &&
+  if (part.color[3] <= 0.0 && (part.mass > 0.0 || part.collision_only) &&
       !HasTransparentAppearanceHint(part))
     part.color[3] = 1.0;
 }
@@ -1462,7 +1469,7 @@ double MotorNoLoadOutputRpm(const MotorSpec& motor, double battery_voltage) {
   return kv * battery_voltage / motor.gear_ratio;
 }
 
-double MotorOutputTorque(const MotorSpec& motor, double battery_voltage,
+double MotorPhaseCurrent(const MotorSpec& motor, double battery_voltage,
                          double desired_output_speed, double actual_output_speed) {
   const double kv = MotorKvRpmPerVolt(motor);
   if (!motor.enabled || !std::isfinite(battery_voltage) || battery_voltage <= 0.0 ||
@@ -1493,9 +1500,33 @@ double MotorOutputTorque(const MotorSpec& motor, double battery_voltage,
     const double normalized_speed = motor_speed / motor_no_load_speed;
     current = std::clamp(duty - normalized_speed, -1.0, 1.0) * current_limit;
   }
-  const double torque_constant = 1.0 / motor_speed_constant;
+  return current;
+}
+
+double MotorOutputTorque(const MotorSpec& motor, double battery_voltage,
+                         double desired_output_speed, double actual_output_speed) {
+  const double kv = MotorKvRpmPerVolt(motor);
+  const double current = MotorPhaseCurrent(motor, battery_voltage,
+    desired_output_speed, actual_output_speed);
+  if (!motor.enabled || kv <= 0.0 || !std::isfinite(motor.gear_ratio) ||
+      motor.gear_ratio <= 0.0 || !std::isfinite(motor.gearbox_efficiency) ||
+      motor.gearbox_efficiency <= 0.0 || motor.gearbox_efficiency > 1.0 ||
+      motor.motor_count <= 0) return 0.0;
+  constexpr double pi = 3.14159265358979323846;
+  const double torque_constant = 60.0 / (kv * 2.0 * pi);
   return torque_constant * current * motor.gear_ratio *
     motor.gearbox_efficiency * motor.motor_count;
+}
+
+double BatteryLoadedVoltage(double nominal_voltage, double internal_resistance_ohm,
+                            double estimated_pack_current_a) {
+  if (!std::isfinite(nominal_voltage) || nominal_voltage <= 0.0 ||
+      !std::isfinite(internal_resistance_ohm) || internal_resistance_ohm < 0.0 ||
+      !std::isfinite(estimated_pack_current_a) || estimated_pack_current_a < 0.0)
+    return 0.0;
+  return std::clamp(nominal_voltage -
+    internal_resistance_ohm * estimated_pack_current_a,
+    std::min(0.1, nominal_voltage), nominal_voltage);
 }
 
 double EstimateMotorSpinupSeconds(const MotorSpec& motor, double battery_voltage,
@@ -1658,13 +1689,15 @@ bool FusionBundle::LoadContent(
       if (item.contains("occurrencePath") && item.at("occurrencePath").is_array())
         part.occurrence_path = item.at("occurrencePath").get<std::vector<std::string>>();
       else part.occurrence_path = {item.value("bodyName", std::string("Root"))};
-      // Flexible wire/cable STLs are poor rigid collision shapes. Their convex
-      // hulls can extend below the chassis and act like unintended floor feet.
+      // Flexible wire/cable STLs are poor rigid collision shapes. Their detailed
+      // surfaces can snag other parts or the floor, so leave them visual-only.
       part.collision_enabled = !FlexiblePartPath(part);
+      part.collision_only = item.value("collisionOnly", false);
       part.density = item.value("densityKgPerM3", 0.0);
       part.mass = item.value("massKg", 0.0);
       if (part.mass <= 0 && item.contains("volumeM3") && part.density > 0)
         part.mass = item.at("volumeM3").get<double>() * part.density;
+      if (part.collision_only) part.mass = 0.0;
       part.fusion_mass = part.mass;
       part.manual_mass = part.mass;
       part.volume_m3 = item.value("volumeM3", 0.0);
@@ -1673,8 +1706,18 @@ bool FusionBundle::LoadContent(
         part.density = part.fusion_mass / part.volume_m3;
       const auto& print_profiles = PrintProfiles();
       if (!print_profiles.empty()) part.print_profile = print_profiles.front();
-      part.friction = item.value("frictionEstimate", 0.0);
-      if (part.friction <= 0) part.friction = 0.6;
+      part.friction = item.value("frictionEstimate", 0.6);
+      const auto friction_source = item.find("frictionEstimateSource");
+      const bool has_friction_source = friction_source != item.end() &&
+                                       friction_source->is_string();
+      // Older exporters wrote zero as "unknown". Current exports include a
+      // source so a deliberate custom zero-friction value remains valid.
+      if (!std::isfinite(part.friction) || part.friction < 0.0 ||
+          (part.friction == 0.0 && !has_friction_source))
+        part.friction = 0.6;
+      part.friction = std::clamp(part.friction, 0.0, 5.0);
+      part.friction_source = has_friction_source
+        ? friction_source->get<std::string>() : "legacy material estimate";
       part.scale = item.value("unitToMeters", default_scale);
       if (!std::isfinite(part.scale) || part.scale <= 0) throw std::runtime_error("Invalid STL unit scale: " + part.file);
       if (!item.contains("positionFusionMeters") ||
@@ -1751,11 +1794,13 @@ bool FusionBundle::LoadContent(
     }
     const auto saved = folder / "combatsim_setup.json";
     battery_voltage_ = 0.0;
+    battery_internal_resistance_ohm_ = 0.0;
     bot_rotation_degrees_ = 0.0;
     drive_layout_ = DriveLayout::FourWheel;
     two_wd_axle_ = "front";
     int saved_axis_assembly = 1;
     bool saved_show_axis_markers = true;
+    bool saved_show_collision_hulls = false;
     bool saved_drive_layout_defined = false;
     std::ifstream disk_state_stream;
     std::istringstream memory_state_stream(setup_json);
@@ -1769,7 +1814,12 @@ bool FusionBundle::LoadContent(
       const json state = json::parse(*state_stream);
       saved_axis_assembly = state.value("axisAssembly", 1);
       saved_show_axis_markers = state.value("showAxisMarkers", true);
+      saved_show_collision_hulls = state.value("showCollisionHulls", false);
       battery_voltage_ = state.value("batteryVoltage", 0.0);
+      battery_internal_resistance_ohm_ = state.value("batteryInternalResistanceOhm", 0.0);
+      if (!std::isfinite(battery_internal_resistance_ohm_) ||
+          battery_internal_resistance_ohm_ < 0.0)
+        battery_internal_resistance_ohm_ = 0.0;
       bot_rotation_degrees_ = state.value("botRotationDegrees", 0.0);
       if (!std::isfinite(bot_rotation_degrees_)) bot_rotation_degrees_ = 0.0;
       bot_rotation_degrees_ = std::clamp(bot_rotation_degrees_, -3600.0, 3600.0);
@@ -1789,11 +1839,25 @@ bool FusionBundle::LoadContent(
           group.axis = ReadArray<3>(node, "axis", {0, 1, 0});
           group.fork_range_degrees = ReadArray<2>(node, "forkRangeDegrees", {-90, 90});
           group.fork_collides_with_frame = node.value("forkCollidesWithFrame", true);
+          group.impact_failure_threshold_n = node.value("impactFailureThresholdN", 0.0);
+          if (!std::isfinite(group.impact_failure_threshold_n) ||
+              group.impact_failure_threshold_n < 0.0)
+            group.impact_failure_threshold_n = 0.0;
           group.wheel_position = node.value("wheelPosition", std::string());
           bool has_saved_drive_group = false;
           if (node.contains("motor") && node.at("motor").is_object()) {
             const auto& motor = node.at("motor");
             group.motor.enabled = motor.value("enabled", false);
+            group.motor.couple_wheels = motor.value("coupleWheels", true);
+            group.motor.bearing_drag_torque_nm = motor.value("bearingDragTorqueNm", 0.0);
+            group.motor.aerodynamic_drag_nm_per_rad2 =
+              motor.value("aerodynamicDragNmPerRad2", 0.0);
+            if (!std::isfinite(group.motor.bearing_drag_torque_nm) ||
+                group.motor.bearing_drag_torque_nm < 0.0)
+              group.motor.bearing_drag_torque_nm = 0.0;
+            if (!std::isfinite(group.motor.aerodynamic_drag_nm_per_rad2) ||
+                group.motor.aerodynamic_drag_nm_per_rad2 < 0.0)
+              group.motor.aerodynamic_drag_nm_per_rad2 = 0.0;
             group.motor.type = ParseMotorType(motor.value("motorType", std::string("brushless")));
             group.motor.speed_input = ParseMotorSpeedInput(
               motor.value("speedInput", std::string("kv")));
@@ -1871,6 +1935,11 @@ bool FusionBundle::LoadContent(
         if (part.mass_mode == PartMassMode::Printed) RefreshPrintEstimate(part);
         else if (part.mass_mode == PartMassMode::Manual) part.mass = part.manual_mass;
         else part.mass = part.fusion_mass;
+        if (part.collision_only) {
+          part.mass_mode = PartMassMode::Fusion;
+          part.fusion_mass = part.manual_mass = part.mass = 0.0;
+          part.print_estimate_valid = false;
+        }
       }
     }
     // Keep legacy wheel sets usable: infer axle position from old assembly names,
@@ -1910,6 +1979,7 @@ bool FusionBundle::LoadContent(
     assemblies_ = std::move(groups);
     memory_loaded_ = from_memory;
     show_axis_markers_ = saved_show_axis_markers;
+    show_collision_hulls_ = saved_show_collision_hulls;
     const auto path = manifest_.string();
     std::snprintf(path_buffer_, sizeof(path_buffer_), "%s", path.c_str());
     error_.clear();
@@ -2273,7 +2343,9 @@ std::string FusionBundle::SetupJson() const {
   state["twoWdAxle"] = two_wd_axle_;
   state["axisAssembly"] = axis_assembly_;
   state["showAxisMarkers"] = show_axis_markers_;
+  state["showCollisionHulls"] = show_collision_hulls_;
   state["batteryVoltage"] = battery_voltage_;
+  state["batteryInternalResistanceOhm"] = battery_internal_resistance_ohm_;
   state["botRotationDegrees"] = bot_rotation_degrees_;
   state["assemblies"] = json::array();
   for (size_t i = 1; i < assemblies_.size(); ++i) {
@@ -2282,9 +2354,13 @@ std::string FusionBundle::SetupJson() const {
                                     {"pivotMeters", g.pivot}, {"axis", g.axis},
                                     {"forkRangeDegrees", g.fork_range_degrees},
                                     {"forkCollidesWithFrame", g.fork_collides_with_frame},
+                                    {"impactFailureThresholdN", g.impact_failure_threshold_n},
                                     {"wheelPosition", g.wheel_position},
                                     {"motor", {
                                       {"enabled", g.motor.enabled},
+                                      {"coupleWheels", g.motor.couple_wheels},
+                                      {"bearingDragTorqueNm", g.motor.bearing_drag_torque_nm},
+                                      {"aerodynamicDragNmPerRad2", g.motor.aerodynamic_drag_nm_per_rad2},
                                       {"motorType", MotorTypeKey(g.motor.type)},
                                       {"speedInput", MotorSpeedInputKey(g.motor.speed_input)},
                                       {"driveGroup", g.motor.drive_group},
@@ -2428,6 +2504,16 @@ std::array<double, 3> FusionBundle::PreviewCenter() const {
   return std::isfinite(low[0]) ? Mul(Add(low, high), 0.5) : Vec3{};
 }
 
+std::array<double, 3> FusionBundle::PreviewSize() const {
+  Vec3 low, high;
+  low.fill(std::numeric_limits<double>::infinity());
+  high.fill(-std::numeric_limits<double>::infinity());
+  for (const auto& part : parts_) {
+    Include(part.min_bound, low, high); Include(part.max_bound, low, high);
+  }
+  return std::isfinite(low[0]) ? Sub(high, low) : Vec3{};
+}
+
 double FusionBundle::PreviewDistance() const {
   Vec3 low, high;
   low.fill(std::numeric_limits<double>::infinity());
@@ -2451,6 +2537,12 @@ bool FusionBundle::GeneratePreview(std::filesystem::path& output) {
           << Escape(AssetReference(part.absolute_render_file, manifest_.parent_path()))
           << "\" scale=\"" << Text({part.scale, part.scale, part.scale})
           << "\" smoothnormal=\"true\"/>\n";
+      if (part.collision_enabled && part.render_file != part.file) {
+        xml << "<mesh name=\"cad_collision_mesh_" << i << "\" file=\""
+            << Escape(AssetReference(part.absolute_file, manifest_.parent_path()))
+            << "\" scale=\"" << Text({part.scale, part.scale, part.scale})
+            << "\"/>\n";
+      }
       for (const auto& texture : part.textures) {
         xml << "<texture name=\"preview_tex_" << i << '_' << Escape(texture.role)
             << "\" type=\"2d\" file=\""
@@ -2482,10 +2574,20 @@ bool FusionBundle::GeneratePreview(std::filesystem::path& output) {
     xml << "</asset><worldbody><body name=\"CAD_Preview\">\n";
     for (size_t i = 0; i < parts_.size(); ++i) {
       const auto& part = parts_[i];
-      xml << "<geom name=\"cad_part_" << i << "\" type=\"mesh\" mesh=\"cad_mesh_" << i
+      if (part.collision_enabled) {
+        const bool separate_collision_mesh = part.render_file != part.file;
+        xml << "<geom name=\"cad_part_" << i << "\" type=\"mesh\" mesh=\""
+            << (separate_collision_mesh ? "cad_collision_mesh_" : "cad_mesh_") << i
+            << "\" pos=\"" << Text(part.position) << "\" quat=\"" << Text4(part.rotation)
+            // The preview is never stepped, but nonzero masks at compile time
+            // make MuJoCo build the mesh hull data that mjVIS_CONVEXHULL uses.
+            << "\" material=\"preview_surface_" << i << "\" rgba=\""
+            << Text4(part.color) << "\" group=\"5\" contype=\"1\" conaffinity=\"1\"/>\n";
+      }
+      xml << "<geom name=\"cad_visual_" << i << "\" type=\"mesh\" mesh=\"cad_mesh_" << i
           << "\" pos=\"" << Text(part.position) << "\" quat=\"" << Text4(part.rotation)
           << "\" material=\"preview_surface_" << i << "\" rgba=\""
-          << Text4(part.color) << "\"/>\n";
+          << Text4(part.color) << "\" group=\"0\" contype=\"0\" conaffinity=\"0\"/>\n";
     }
     xml << "</body></worldbody></mujoco>\n";
     output = manifest_.parent_path() / "combatsim_preview.xml";
@@ -2524,6 +2626,10 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
                                           const std::string& extension) {
       return std::string(is_opponent ? "opponent_asset_" : "cad_asset_") +
         std::to_string(index) + extension;
+    };
+    auto collision_mesh_asset_name = [memory_output](bool is_opponent, size_t index) {
+      return std::string(is_opponent ? "opponent_collision_asset_" : "cad_collision_asset_") +
+        std::to_string(index) + ".stl";
     };
     auto texture_asset_name = [](bool is_opponent, size_t index,
                                 const CadPart::Texture& texture) {
@@ -2590,13 +2696,15 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
 #endif
     };
     for (size_t i = 0; i < parts_.size(); ++i)
-      if (PartIncludedInSimulation(int(i)) && !ValidMass(parts_[i].mass))
+      if (PartIncludedInSimulation(int(i)) && !parts_[i].collision_only &&
+          !ValidMass(parts_[i].mass))
         throw std::runtime_error("Set a positive mass for included body: " + parts_[i].name +
                                  " (" + parts_[i].file + ")");
     const bool has_opponent = opponent && opponent->HasBundle();
     if (has_opponent) {
       for (size_t i = 0; i < opponent->parts_.size(); ++i)
-        if (opponent->PartIncludedInSimulation(int(i)) && !ValidMass(opponent->parts_[i].mass))
+        if (opponent->PartIncludedInSimulation(int(i)) &&
+            !opponent->parts_[i].collision_only && !ValidMass(opponent->parts_[i].mass))
           throw std::runtime_error("Set a positive mass for included opponent body: " +
             opponent->parts_[i].name + " (" + opponent->parts_[i].file + ")");
       if (!ValidMass(GroupMass(opponent->parts_, 0, {}).mass))
@@ -2619,9 +2727,16 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
     xml.imbue(std::locale::classic());
     xml << "<mujoco model=\"" << Escape(design_name_) << "\">\n"
         << "<compiler angle=\"radian\" autolimits=\"true\"/>\n"
+        // Give every imported body its own convex collider. Keeping weapon
+        // bodies separate follows the assembled outline without a large SDF
+        // contact search across every part.
         << "<option timestep=\"0.0004\" gravity=\"0 0 -9.80665\" integrator=\"implicitfast\"/>\n"
         << "<visual><headlight ambient=\"0.12 0.12 0.12\" diffuse=\"0.07 0.07 0.07\" specular=\"0.008 0.008 0.008\"/></visual>\n"
         << "<asset>\n";
+    const auto needs_separate_collision_mesh = [&](const FusionBundle& robot, size_t index) {
+      const auto& part = robot.parts_[index];
+      return part.render_file != part.file;
+    };
     xml << "<material name=\"arena_floor_laminate\" rgba=\"0.84 0.83 0.79 1\" specular=\"0.06\" shininess=\"0.12\" reflectance=\"0\""
 #if defined(COMBATSIM_USE_FILAMENT)
         << " metallic=\"0\" roughness=\"0.78\""
@@ -2641,6 +2756,15 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
       const auto& render_data = part.render_mesh_data.empty() && part.render_file == part.file
         ? part.mesh_data : part.render_mesh_data;
       add_asset(mesh_file, render_data, part.absolute_render_file, part.render_file);
+      if (part.collision_enabled && needs_separate_collision_mesh(*this, i)) {
+        const std::string collision_file = memory_output
+          ? collision_mesh_asset_name(false, i)
+          : AssetReference(part.absolute_file, manifest_.parent_path());
+        xml << "<mesh name=\"cad_collision_mesh_" << i << "\" file=\""
+            << Escape(collision_file) << "\" scale=\""
+            << Text({part.scale, part.scale, part.scale}) << "\"/>\n";
+        add_asset(collision_file, part.mesh_data, part.absolute_file, part.file);
+      }
     }
     if (has_opponent) for (size_t i = 0; i < opponent->parts_.size(); ++i)
       if (opponent->PartIncludedInSimulation(int(i))) {
@@ -2658,22 +2782,37 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
         const auto& render_data = part.render_mesh_data.empty() && part.render_file == part.file
           ? part.mesh_data : part.render_mesh_data;
         add_asset(mesh_file, render_data, part.absolute_render_file, part.render_file);
+        if (part.collision_enabled && needs_separate_collision_mesh(*opponent, i)) {
+          const std::string collision_file = memory_output
+            ? collision_mesh_asset_name(true, i)
+            : AssetPath(part.absolute_file);
+          xml << "<mesh name=\"opponent_collision_mesh_" << i << "\" file=\""
+              << Escape(collision_file) << "\" scale=\""
+              << Text({part.scale, part.scale, part.scale}) << "\"/>\n";
+          add_asset(collision_file, part.mesh_data, part.absolute_file, part.file);
+        }
       }
     xml << "</asset>\n<worldbody>\n"
         << "<light name=\"arena_key_light\" directional=\"true\" castshadow=\"false\" pos=\"0 0 2\" dir=\"0.3 -0.4 -1\" diffuse=\"0.88 0.85 0.78\" specular=\"0.18 0.18 0.18\" ambient=\"0.01 0.01 0.01\"/>\n"
         << "<light name=\"arena_fill_light\" directional=\"true\" castshadow=\"false\" pos=\"0 0 2\" dir=\"-0.5 0.3 -1\" diffuse=\"0.42 0.48 0.54\" specular=\"0.035 0.035 0.035\" ambient=\"0.005 0.005 0.005\"/>\n"
-        << "<geom name=\"floor\" type=\"plane\" size=\"0 0 0.02\" rgba=\"0 0 0 0\" friction=\"1.4 0.02 0.001\"/>\n"
+        << "<geom name=\"floor\" type=\"plane\" size=\"0 0 0.02\" rgba=\"0 0 0 0\" friction=\""
+        << Number(kArenaFloorFriction) << " 0.02 0.001\" priority=\"1\"/>\n"
         << "<geom name=\"floor_visual\" type=\"box\" pos=\"0 0 -0.001\" size=\"1 1 0.001\" material=\"arena_floor_laminate\" contype=\"0\" conaffinity=\"0\"/>\n"
         << "<!-- Hidden deep collision volumes catch fast impacts; the visible acrylic skins are 8 mm thick. -->\n"
-        << "<geom name=\"north_wall\" type=\"box\" pos=\"0 1.30 0.5\" size=\"1.62 0.30 0.55\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
-        << "<geom name=\"south_wall\" type=\"box\" pos=\"0 -1.30 0.5\" size=\"1.62 0.30 0.55\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
-        << "<geom name=\"east_wall\" type=\"box\" pos=\"1.30 0 0.5\" size=\"0.30 1.62 0.55\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
-        << "<geom name=\"west_wall\" type=\"box\" pos=\"-1.30 0 0.5\" size=\"0.30 1.62 0.55\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"north_wall\" type=\"box\" pos=\"0 1.30 0.5\" size=\"1.62 0.30 0.55\" friction=\""
+        << Number(kArenaWallFriction) << " 0.005 0.0001\" priority=\"1\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"south_wall\" type=\"box\" pos=\"0 -1.30 0.5\" size=\"1.62 0.30 0.55\" friction=\""
+        << Number(kArenaWallFriction) << " 0.005 0.0001\" priority=\"1\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"east_wall\" type=\"box\" pos=\"1.30 0 0.5\" size=\"0.30 1.62 0.55\" friction=\""
+        << Number(kArenaWallFriction) << " 0.005 0.0001\" priority=\"1\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"west_wall\" type=\"box\" pos=\"-1.30 0 0.5\" size=\"0.30 1.62 0.55\" friction=\""
+        << Number(kArenaWallFriction) << " 0.005 0.0001\" priority=\"1\" margin=\"0.01\" solref=\"0.001 1\" solimp=\"0.99 0.999 0.001\" rgba=\"0.5 0.58 0.58 0\"/>\n"
         << "<geom name=\"north_wall_acrylic\" type=\"box\" pos=\"0 1.004 0.5\" size=\"1 0.004 0.5\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.11\"/>\n"
         << "<geom name=\"south_wall_acrylic\" type=\"box\" pos=\"0 -1.004 0.5\" size=\"1 0.004 0.5\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.11\"/>\n"
         << "<geom name=\"east_wall_acrylic\" type=\"box\" pos=\"1.004 0 0.5\" size=\"0.004 1 0.5\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.11\"/>\n"
         << "<geom name=\"west_wall_acrylic\" type=\"box\" pos=\"-1.004 0 0.5\" size=\"0.004 1 0.5\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.11\"/>\n"
-        << "<geom name=\"roof\" type=\"box\" pos=\"0 0 1.125\" size=\"1.62 1.62 0.175\" rgba=\"0.5 0.58 0.58 0\"/>\n"
+        << "<geom name=\"roof\" type=\"box\" pos=\"0 0 1.125\" size=\"1.62 1.62 0.175\" friction=\""
+        << Number(kArenaWallFriction) << " 0.005 0.0001\" priority=\"1\" rgba=\"0.5 0.58 0.58 0\"/>\n"
         << "<geom name=\"roof_acrylic\" type=\"box\" pos=\"0 0 1.004\" size=\"1 1 0.004\" contype=\"0\" conaffinity=\"0\" rgba=\"0.57 0.66 0.66 0.07\"/>\n"
         << "<body name=\"Player_Robot\" pos=\"" << Text(spawn)
         << "\" quat=\"" << Text4(player_heading) << "\">\n"
@@ -2682,12 +2821,27 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
         << "\" fullinertia=\"" << TextInertia(frame.inertia) << "\"/>\n";
     auto geom = [&](size_t i, Vec3 origin) {
       const auto& p = parts_[i];
-      xml << "<geom name=\"cad_part_" << i << "\" type=\"mesh\" mesh=\"cad_mesh_" << i
+      const bool separate_collision_mesh = p.collision_enabled &&
+                                           needs_separate_collision_mesh(*this, i);
+      // Player category 1 collides with the arena and opponent category 4,
+      // but not with other player parts. Explicit floor and configured
+      // fork/frame pairs are preserved below.
+      xml << "<geom name=\"cad_part_" << i << "\" type=\"mesh\" mesh=\""
+          << (separate_collision_mesh ? "cad_collision_mesh_" : "cad_mesh_") << i
           << "\" pos=\"" << Text(Sub(p.position, origin)) << "\" quat=\"" << Text4(p.rotation)
           << "\" material=\"cad_surface_" << i << "\" mass=\"0\" friction=\"" << Number(p.friction)
-          << " 0.02 0.001\" rgba=\"" << Text4(p.color) << "\"";
-      if (!p.collision_enabled) xml << " contype=\"0\" conaffinity=\"0\"";
+          << " 0.02 0.001\" rgba=\"" << Text4(p.color)
+          << "\" group=\"5\" contype=\"" << (p.collision_enabled ? 1 : 0)
+          << "\" conaffinity=\"" << (p.collision_enabled ? 6 : 0) << "\"";
       xml << "/>\n";
+      if (p.collision_enabled && !p.collision_only) {
+        xml << "<geom name=\"cad_visual_" << i << "\" type=\"mesh\" mesh=\"cad_mesh_"
+            << i << "\" pos=\"" << Text(Sub(p.position, origin)) << "\" quat=\""
+            << Text4(p.rotation) << "\" material=\"cad_surface_" << i
+            << "\" mass=\"0\" friction=\"" << Number(p.friction)
+            << " 0.02 0.001\" rgba=\"" << Text4(p.color)
+            << "\" contype=\"0\" conaffinity=\"0\"/>\n";
+      }
     };
     for (size_t i = 0; i < parts_.size(); ++i) if (parts_[i].assembly == 0) geom(i, {});
     for (size_t group = 1; group < assemblies_.size(); ++group) {
@@ -2746,13 +2900,30 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
           << TextInertia(opponent_frame.inertia) << "\"/>\n";
       auto opponent_geom = [&](size_t i, Vec3 local_origin) {
         const auto& part = opponent->parts_[i];
-        xml << "<geom name=\"opponent_part_" << i << "\" type=\"mesh\" mesh=\"opponent_mesh_"
+        const bool separate_collision_mesh = part.collision_enabled &&
+                                             needs_separate_collision_mesh(*opponent, i);
+        // Opponent category 4 collides with the player and arena, but not
+        // with other opponent parts.
+        xml << "<geom name=\"opponent_part_" << i << "\" type=\"mesh\" mesh=\""
+            << (separate_collision_mesh ? "opponent_collision_mesh_" : "opponent_mesh_")
             << i << "\" pos=\"" << Text(Sub(part.position, local_origin)) << "\" quat=\""
             << Text4(part.rotation) << "\" material=\"opponent_surface_" << i
             << "\" mass=\"0\" friction=\"" << Number(part.friction)
-            << " 0.02 0.001\" rgba=\"" << Text4(part.color) << "\"";
-        if (!part.collision_enabled) xml << " contype=\"0\" conaffinity=\"0\"";
+            << " 0.02 0.001\" rgba=\"" << Text4(part.color)
+            << "\" group=\"5\" contype=\""
+            << (part.collision_enabled ? 4 : 0) << "\" conaffinity=\""
+            << (part.collision_enabled ? 3 : 0) << "\"";
         xml << "/>\n";
+        if (part.collision_enabled && !part.collision_only) {
+          xml << "<geom name=\"opponent_visual_" << i
+              << "\" type=\"mesh\" mesh=\"opponent_mesh_" << i
+              << "\" pos=\"" << Text(Sub(part.position, local_origin))
+              << "\" quat=\"" << Text4(part.rotation)
+              << "\" material=\"opponent_surface_" << i
+              << "\" mass=\"0\" friction=\"" << Number(part.friction)
+              << " 0.02 0.001\" rgba=\"" << Text4(part.color)
+              << "\" contype=\"0\" conaffinity=\"0\"/>\n";
+        }
       };
       for (size_t i = 0; i < opponent->parts_.size(); ++i)
         if (opponent->parts_[i].assembly == 0) opponent_geom(i, opponent_origin);
@@ -2799,29 +2970,30 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
           << "</body>\n";
     }
     xml << "</worldbody>\n<contact>\n";
-    // Chassis, fixed structural parts, and forks can all scrape the floor.
-    // Override only those floor contacts so drive wheels and weapon impacts
-    // keep their normal contact response against other robot parts.
-    auto add_floor_scrape_pairs = [&](const FusionBundle& robot, const char* prefix) {
+    // Explicit arena pairs apply the same two-surface friction estimate to
+    // floor, wall, and roof contacts. Geom priority would otherwise let the
+    // arena surface replace the robot material estimate entirely.
+    const std::array<std::pair<const char*, double>, 6> builtin_arena_surfaces{{
+      {"floor", kArenaFloorFriction}, {"north_wall", kArenaWallFriction},
+      {"south_wall", kArenaWallFriction}, {"east_wall", kArenaWallFriction},
+      {"west_wall", kArenaWallFriction}, {"roof", kArenaWallFriction}
+    }};
+    auto add_arena_surface_pairs = [&](const FusionBundle& robot, const char* prefix) {
       for (size_t i = 0; i < robot.parts_.size(); ++i) {
         const auto& part = robot.parts_[i];
         if (!robot.PartIncludedInSimulation(int(i)) || !part.collision_enabled) continue;
-        const bool is_fork = robot.IsForkPart(int(i));
-        const bool is_frame = part.assembly == 0;
-        const bool is_fixed_structure = part.assembly > 0 &&
-          size_t(part.assembly) < robot.assemblies_.size() &&
-          robot.assemblies_[part.assembly].kind == AssemblyKind::Fixed;
-        if (!is_frame && !is_fixed_structure && !is_fork) continue;
-        // Match MuJoCo's usual equal-priority floor/geom friction mix for the
-        // frame. Forks retain their explicit CAD friction estimate.
-        const double friction = is_fork ? part.friction : std::max(1.4, part.friction);
-        xml << "<pair geom1=\"floor\" geom2=\"" << prefix << i
-            << "\" condim=\"3\" friction=\"" << Number(friction)
-            << " 0.02 0.001\" solref=\"0.02 2\"/>\n";
+        for (const auto& [arena_geom, arena_friction] : builtin_arena_surfaces) {
+          const double friction = std::sqrt(
+            std::max(0.0, part.friction) * arena_friction);
+          xml << "<pair geom1=\"" << arena_geom << "\" geom2=\"" << prefix << i
+              << "\" condim=\"3\" friction=\"" << Number(friction)
+              << ' ' << Number(friction)
+              << " 0.02 0.001 0.001\" solref=\"0.02 2\"/>\n";
+        }
       }
     };
-    add_floor_scrape_pairs(*this, "cad_part_");
-    if (has_opponent) add_floor_scrape_pairs(*opponent, "opponent_part_");
+    add_arena_surface_pairs(*this, "cad_part_");
+    if (has_opponent) add_arena_surface_pairs(*opponent, "opponent_part_");
     // A fork is a child hinge of Player_Robot. MuJoCo filters parent-child
     // contacts by default, so explicitly pair each fork geom with each main-
     // frame geom to provide physical contact without changing other filters.
@@ -2840,7 +3012,8 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
                                             std::max(0.0, parts_[frame_part].friction));
           xml << "<pair geom1=\"cad_part_" << fork_part << "\" geom2=\"cad_part_"
               << frame_part << "\" condim=\"3\" friction=\"" << Number(friction)
-              << " 0.02 0.001\" solref=\"0.003 1\"/>\n";
+              << ' ' << Number(friction)
+              << " 0.02 0.001 0.001\" solref=\"0.02 2\"/>\n";
         }
       }
     }
@@ -2864,12 +3037,53 @@ bool FusionBundle::GenerateImpl(std::filesystem::path* output, std::string* xml_
             xml << "<pair geom1=\"opponent_part_" << fork_part
                 << "\" geom2=\"opponent_part_" << frame_part
                 << "\" condim=\"3\" friction=\"" << Number(friction)
-                << " 0.02 0.001\" solref=\"0.003 1\"/>\n";
+                << ' ' << Number(friction)
+                << " 0.02 0.001 0.001\" solref=\"0.02 2\"/>\n";
           }
         }
       }
     }
-    xml << "</contact>\n<actuator>\n";
+    xml << "</contact>\n<equality>\n";
+    auto add_drive_couplings = [&](const FusionBundle& robot, const char* prefix) {
+      std::map<int, size_t> group_first_assembly;
+      const Vec3 heading = NativeDriveHeading(robot.parts_, robot.assemblies_, robot);
+      auto forward_sign = [&](const CadAssembly& assembly) {
+        Vec3 axis = assembly.axis;
+        const double length = Length(axis);
+        if (length <= 1e-8) return 1.0;
+        axis = Mul(axis, 1.0 / length);
+        const double forward_speed = Dot(Cross(axis, {0, 0, -1}), heading);
+        return std::abs(forward_speed) > 1e-6 && forward_speed > 0.0 ? -1.0 : 1.0;
+      };
+      for (size_t i = 1; i < robot.assemblies_.size(); ++i) {
+        if (!robot.AssemblyEnabled(int(i))) continue;
+        const auto& assembly = robot.assemblies_[i];
+        if ((assembly.kind != AssemblyKind::LeftWheel &&
+             assembly.kind != AssemblyKind::RightWheel) ||
+            !assembly.motor.couple_wheels || assembly.motor.drive_group < 0 ||
+            GroupMass(robot.parts_, int(i), assembly.pivot).mass <= 0.0)
+          continue;
+        const auto first = group_first_assembly.find(assembly.motor.drive_group);
+        if (first == group_first_assembly.end()) {
+          group_first_assembly.emplace(assembly.motor.drive_group, i);
+          continue;
+        }
+        const auto& reference = robot.assemblies_[first->second];
+        if (!std::isfinite(assembly.motor.gear_ratio) || assembly.motor.gear_ratio <= 0.0 ||
+            !std::isfinite(reference.motor.gear_ratio) || reference.motor.gear_ratio <= 0.0)
+          throw std::runtime_error("Invalid wheel reduction ratio in coupled motor group.");
+        const double coefficient = forward_sign(reference) * forward_sign(assembly) *
+          assembly.motor.gear_ratio / reference.motor.gear_ratio;
+        xml << "<joint name=\"" << prefix << "_drive_link_" << first->second << '_' << i
+            << "\" joint1=\"" << prefix << "_joint_" << first->second
+            << "\" joint2=\"" << prefix << "_joint_" << i
+            << "\" polycoef=\"0 " << Number(coefficient)
+            << " 0 0 0\" solref=\"0.002 1\"/>\n";
+      }
+    };
+    add_drive_couplings(*this, "cad");
+    if (has_opponent) add_drive_couplings(*opponent, "opponent");
+    xml << "</equality>\n<actuator>\n";
     for (size_t group = 1; group < assemblies_.size(); ++group) {
       if (!AssemblyEnabled(int(group))) continue;
       const auto& a = assemblies_[group];
@@ -3007,6 +3221,37 @@ void FusionBundle::BindControls(const mjModel* model,
       weapon.push_back(id);
       if (assemblies_[group].motor.enabled)
         weapon_motor_models[id] = assemblies_[group].motor;
+    }
+  }
+}
+
+void FusionBundle::BindImpactFailures(const mjModel* model,
+                                     std::map<int, double>& geom_thresholds,
+                                     std::map<int, int>& geom_actuators,
+                                     bool opponent) const {
+  geom_thresholds.clear();
+  geom_actuators.clear();
+  if (!model) return;
+  const std::string body_prefix = opponent ? "opponent_assembly_" : "cad_assembly_";
+  const std::string geom_prefix = opponent ? "opponent_part_" : "cad_part_";
+  for (size_t assembly = 1; assembly < assemblies_.size(); ++assembly) {
+    const auto& group = assemblies_[assembly];
+    const bool has_actuator = group.kind == AssemblyKind::LeftWheel ||
+      group.kind == AssemblyKind::RightWheel || group.kind == AssemblyKind::Weapon;
+    if (!has_actuator || !AssemblyEnabled(int(assembly)) ||
+        !std::isfinite(group.impact_failure_threshold_n) ||
+        group.impact_failure_threshold_n <= 0.0) continue;
+    const std::string actuator_name = body_prefix + std::to_string(assembly) + "_drive";
+    const int actuator_id = mj_name2id(model, mjOBJ_ACTUATOR, actuator_name.c_str());
+    if (actuator_id < 0) continue;
+    for (size_t part_index = 0; part_index < parts_.size(); ++part_index) {
+      const auto& part = parts_[part_index];
+      if (part.assembly != int(assembly) || !part.collision_enabled) continue;
+      const std::string geom_name = geom_prefix + std::to_string(part_index);
+      const int geom_id = mj_name2id(model, mjOBJ_GEOM, geom_name.c_str());
+      if (geom_id < 0) continue;
+      geom_thresholds[geom_id] = group.impact_failure_threshold_n;
+      geom_actuators[geom_id] = actuator_id;
     }
   }
 }
@@ -3467,7 +3712,9 @@ void FusionBundle::DrawPart(size_t index) {
     ImGui::Checkbox("Show in preview", &part.preview_visible);
     ImGui::Checkbox("Use for collisions", &part.collision_enabled);
     if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Disable collision for flexible wires/cables or decorative meshes that should not push on the arena floor. The part stays visible and keeps its mass.");
+      ImGui::SetTooltip("MuJoCo uses this body's convex hull for collisions. Concave cuts and holes are filled; use multiple proxy bodies to shape the collision outline.");
+    if (part.collision_only)
+      ImGui::TextDisabled("Fusion collision proxy: mass ignored; hidden in fight rendering.");
     ImGui::TextWrapped("STL: %s", part.file.c_str());
     ImGui::TextWrapped("Fusion material: %s", part.material.c_str());
     if (!part.appearance.empty()) ImGui::TextWrapped("Appearance: %s", part.appearance.c_str());
@@ -3495,6 +3742,9 @@ void FusionBundle::DrawPart(size_t index) {
       }
       ImGui::EndCombo();
     }
+    if (part.collision_only) {
+      ImGui::TextDisabled("Assign this proxy to the same rigid assembly as the part it surrounds.");
+    } else {
     ImGui::Text("Fusion solid mass: %.2f g", part.fusion_mass * 1000.0);
     if (ImGui::BeginCombo("Mass model", MassModeLabel(part.mass_mode))) {
       for (const auto mode : {PartMassMode::Fusion, PartMassMode::Manual,
@@ -3554,6 +3804,7 @@ void FusionBundle::DrawPart(size_t index) {
       }
       if (part.print_estimate_valid) {
         ImGui::Text("Estimated printed weight: %.2f g", part.printed_mass * 1000.0);
+        ImGui::TextDisabled("Approximate mass and center of mass only; print strength and flex are not simulated.");
         if (part.has_fusion_center_of_mass) {
           const Vec3 offset_mm = Mul(
             Sub(part.printed_center_local, part.center_of_mass_local), 1000.0);
@@ -3567,9 +3818,12 @@ void FusionBundle::DrawPart(size_t index) {
     } else {
       ImGui::Text("Physics weight: %.2f g", part.fusion_mass * 1000.0);
     }
+    }
     ImGui::DragScalar("Friction estimate", ImGuiDataType_Double, &part.friction, 0.01, nullptr, nullptr, "%.2f");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Used as this body's surface estimate. Contact with the arena combines both surface estimates by geometric mean.");
     part.mass = std::max(0.0, part.mass);
-    part.friction = std::max(0.01, part.friction);
+    part.friction = std::clamp(part.friction, 0.0, 5.0);
     float color[4] = {float(part.color[0]), float(part.color[1]), float(part.color[2]), float(part.color[3])};
     if (ImGui::ColorEdit4("Color", color)) for (int i = 0; i < 4; ++i) part.color[i] = color[i];
     ImGui::TreePop();
@@ -3658,7 +3912,8 @@ void FusionBundle::DrawTree(const std::vector<std::string>& parent) {
   }
 }
 
-void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_requested) {
+void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_requested,
+                        bool model_build_busy) {
   {
     std::lock_guard<std::mutex> lock(dialog_mutex_);
     if (!pending_path_.empty()) {
@@ -3689,10 +3944,16 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
   ImGui::TextWrapped("%s: %d STL bodies", design_name_.c_str(), int(parts_.size()));
   if (ImGui::Button("Save setup")) Save();
   ImGui::SameLine();
-  if (ImGui::Button("Apply and preview")) {
+  ImGui::BeginDisabled(model_build_busy);
+  const bool apply_clicked = ImGui::Button("Apply and preview");
+  ImGui::EndDisabled();
+  if (apply_clicked) {
     if (Save()) apply_requested = true;
   }
   ImGui::Checkbox("Show wheel, weapon and fork axis markers", &show_axis_markers_);
+  ImGui::Checkbox("Show STL collision shape", &show_collision_hulls_);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Shows the convex collision hull built from each enabled STL body. Concave holes and recesses are filled in the collision hull.");
   ImGui::SeparatorText("Bot orientation");
   DrawMotorDoubleInput("Bot rotation about Z (deg)", &bot_rotation_degrees_, 1.0, 15.0, "%.1f");
   if (!std::isfinite(bot_rotation_degrees_)) bot_rotation_degrees_ = 0.0;
@@ -3711,6 +3972,18 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip("Use the battery pack's nominal voltage. For a LiPo pack, cell count x 3.7 V is a reasonable nominal value.");
   if (!std::isfinite(battery_voltage_) || battery_voltage_ < 0.0) battery_voltage_ = 0.0;
+  double battery_resistance_milliohm = battery_internal_resistance_ohm_ * 1000.0;
+  ImGui::TextWrapped("Battery internal resistance (m\u03a9)");
+  ImGui::SetNextItemWidth(std::min(180.0f, ImGui::GetContentRegionAvail().x));
+  if (ImGui::InputDouble("##battery_internal_resistance", &battery_resistance_milliohm,
+                         0.1, 1.0, "%.2f"))
+    battery_internal_resistance_ohm_ = battery_resistance_milliohm / 1000.0;
+  battery_internal_resistance_ohm_ = std::clamp(
+    std::isfinite(battery_internal_resistance_ohm_) ? battery_internal_resistance_ohm_ : 0.0,
+    0.0, 5.0);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Optional pack resistance in milliohms. Zero disables voltage sag. Sag uses motor phase-current and duty as an approximate battery-current estimate.");
+  ImGui::TextWrapped("Optional: battery resistance makes pack voltage fall under load. Zero keeps fixed pack voltage.");
   ImGui::TextWrapped("Per motor, enter either Kv or a published RPM and voltage, plus peak current. Detailed electrical specs can be left blank; the pack voltage is required.");
   const char* layout_label = drive_layout_ == DriveLayout::TwoWheel ? "2WD" : "4WD";
   if (ImGui::BeginCombo("Drive layout", layout_label)) {
@@ -3734,7 +4007,7 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
     ImGui::TextWrapped("4WD simulates the assigned front and rear left/right wheel assemblies.");
   }
   if (ImGui::TreeNodeEx("Drive motor settings", ImGuiTreeNodeFlags_DefaultOpen)) {
-    ImGui::TextWrapped("Assign wheels driven by the same physical motor to the same group. The group's available torque is shared evenly across its wheel assemblies. Wheel-speed linkages are not constrained yet, so chain/belt coupling is approximate.");
+    ImGui::TextWrapped("Assign wheels driven by the same physical motor to the same group. The group's torque is shared across its wheels, and linked wheels can be constrained to the same motor-shaft speed.");
     static const char* motor_group_labels[] = {
       "Motor A", "Motor B", "Motor C", "Motor D",
       "Motor E", "Motor F", "Motor G", "Motor H"};
@@ -3797,6 +4070,9 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
           default_open ? ImGuiTreeNodeFlags_DefaultOpen : ImGuiTreeNodeFlags_None);
         if (open) {
           ImGui::TextWrapped("Torque is shared across %d wheel assemblies.", member_count);
+          ImGui::Checkbox("Couple wheels in this motor group", &owner.motor.couple_wheels);
+          if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Constrains linked wheel joints using their motor reductions and estimated tire radii. Disable this for separate motors or independently driven outputs.");
           ImGui::Checkbox("Enable wheel torque model", &owner.motor.enabled);
           DrawMotorIntInput("Physical motors in group", &owner.motor.motor_count);
           owner.motor.motor_count = std::clamp(owner.motor.motor_count, 1, 32);
@@ -3804,7 +4080,7 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
           DrawMotorDoubleInput("Peak current per motor (A)", &owner.motor.peak_current_a,
                                0.1, 1.0, "%.2f");
           if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Used as the peak torque-producing current cap. The model does not simulate motor heating or thermal derating.");
+            ImGui::SetTooltip("Used as the peak torque-producing current cap. Pack voltage sag is estimated when battery resistance is configured; motor heating and thermal derating are not modeled yet.");
           DrawGearRatioInput(1000 + owner.motor.drive_group, owner.motor);
           if (ImGui::TreeNode("Optional motor and gearbox settings")) {
             double phase_resistance_milliohm = owner.motor.phase_resistance_ohm * 1000.0;
@@ -3865,8 +4141,21 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
       DrawMotorDoubleInput("Peak current per motor (A)", &weapon.motor.peak_current_a,
                            0.1, 1.0, "%.2f");
       if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Used as the peak torque-producing current cap. Motor heating and thermal derating are not simulated.");
+        ImGui::SetTooltip("Used as the peak torque-producing current cap. Pack voltage sag is estimated when battery resistance is configured; motor heating and thermal derating are not modeled yet.");
       DrawGearRatioInput(20000 + int(i), weapon.motor);
+      DrawMotorDoubleInput("Bearing drag torque (N m)",
+                           &weapon.motor.bearing_drag_torque_nm, 0.0001, 0.001, "%.5f");
+      DrawMotorDoubleInput("Air drag coefficient (N m / (rad/s)^2)",
+                           &weapon.motor.aerodynamic_drag_nm_per_rad2,
+                           0.000001, 0.00001, "%.7f");
+      weapon.motor.bearing_drag_torque_nm = std::clamp(
+        std::isfinite(weapon.motor.bearing_drag_torque_nm)
+          ? weapon.motor.bearing_drag_torque_nm : 0.0, 0.0, 10.0);
+      weapon.motor.aerodynamic_drag_nm_per_rad2 = std::clamp(
+        std::isfinite(weapon.motor.aerodynamic_drag_nm_per_rad2)
+          ? weapon.motor.aerodynamic_drag_nm_per_rad2 : 0.0, 0.0, 1.0);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Optional loss terms act on weapon shaft speed. Leave both at zero when the values are unknown; these do not model blade aerodynamics in detail.");
       if (ImGui::TreeNode("Optional motor and gearbox settings")) {
         double phase_resistance_milliohm = weapon.motor.phase_resistance_ohm * 1000.0;
         ImGui::TextWrapped("%s", MotorResistanceLabel(weapon.motor.type));
@@ -4009,6 +4298,21 @@ void FusionBundle::Draw(SDL_Window* window, bool& load_requested, bool& apply_re
             }
           }
         ImGui::EndCombo();
+      }
+      if (group.kind == AssemblyKind::LeftWheel ||
+          group.kind == AssemblyKind::RightWheel ||
+          group.kind == AssemblyKind::Weapon) {
+        ImGui::SetNextItemWidth(std::min(220.0f, ImGui::GetContentRegionAvail().x));
+        ImGui::InputDouble("Impact failure threshold (N)",
+                           &group.impact_failure_threshold_n, 10.0, 100.0, "%.0f");
+        group.impact_failure_threshold_n = std::isfinite(group.impact_failure_threshold_n)
+          ? std::max(0.0, group.impact_failure_threshold_n) : 0.0;
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Zero leaves damage off. Above this measured contact force, this assembly's drive actuator is disabled for the rest of the match. This is a configurable trip threshold, not a fracture or deformation model.");
+        if (group.impact_failure_threshold_n > 0.0)
+          ImGui::TextDisabled("Impact trip enabled; 0 disables it.");
+        else
+          ImGui::TextDisabled("Damage/failure is off until a threshold is configured.");
       }
       if (group.kind == AssemblyKind::LeftWheel || group.kind == AssemblyKind::RightWheel) {
         const char* wheel_position_label = group.wheel_position == "rear" ? "Rear axle" :
